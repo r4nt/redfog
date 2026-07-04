@@ -177,6 +177,19 @@ The shm fallback — where KWin reads back the GPU framebuffer to CPU memory —
 
 DMA-BUF export works reliably on modern AMD (radeonsi/RADV) and Intel (iris/ANV) with Mesa. NVIDIA requires the open kernel driver (≥ 555) and may need `nvidia-drm.modeset=1`.
 
+### NVIDIA + virtual backend (prototype finding)
+
+Prototype testing on NVIDIA RTX 2080 (driver 610.43.02) revealed a blocking issue with `KWIN_PLATFORM=virtual`:
+
+KWin's `GpuManager` scans `/dev/dri/` via udev and calls `RenderDevice::open()` → `DrmDevice::openWithAuthentication()` → `gbm_create_device()` to find GPU render devices. On NVIDIA proprietary, `gbm_create_device()` segfaults on `/dev/dri/renderD128` even though `nvidia-drm_gbm.so` is present at `/usr/lib/gbm/`. As a result, `GpuManager` finds no render devices, `VirtualBackend::supportedCompositors()` returns an empty list, and KWin falls back to software rendering. PipeWire stream caps negotiate to `BGRx` (SHM / CPU readback) rather than `DMA_DRM`.
+
+Possible remediation paths (to be investigated):
+- `nvidia-drm.modeset=1` kernel parameter — required for NVIDIA Wayland/DRM and may unblock GBM
+- Switch the virtual backend to `EGL_PLATFORM_DEVICE_EXT` (NVIDIA's preferred headless EGL path) instead of `EGL_PLATFORM_GBM_KHR`
+- Use `KWIN_PLATFORM=drm` with a virtual output, letting KWin acquire DRM master — requires being the sole compositor on the card
+
+AMD and Intel (Mesa) are the primary targets for v1 due to full GBM and DMA-BUF support.
+
 ---
 
 ## Key Design Decisions
