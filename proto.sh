@@ -71,6 +71,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── D-Bus session isolation ───────────────────────────────────────────────────
+#
+# Re-exec inside a fresh D-Bus session so the headless stack (kwin_wayland,
+# plasmashell) gets its own bus and doesn't collide with the desktop session.
+# Without this, plasmashell crashes immediately because org.kde.plasmashell is
+# already owned by the desktop, and org.kde.KWin gets stolen from the desktop
+# portal by our headless kwin_wayland.
+if [[ -z "${_REDFOG_INNER:-}" ]]; then
+    export _REDFOG_INNER=1
+    exec dbus-run-session -- bash "${BASH_SOURCE[0]}" "$@"
+fi
+
 SOCKET="redfog-proto-0"
 RUNTIME="/tmp/redfog-runtime"
 PW_SOCK="$RUNTIME/pipewire-0"
@@ -192,6 +205,9 @@ info "Video sink: $VIDEO_SINK"
 mkdir -p "$RUNTIME" "$LOG_DIR"
 chmod 700 "$RUNTIME"
 
+# Write the session bus address to a known file so external tools can reach it.
+echo "$DBUS_SESSION_BUS_ADDRESS" > "$LOG_DIR/dbus-session-address"
+
 # ── 1. PipeWire ──────────────────────────────────────────────────────────────
 #
 # Clean up any stale sockets from a previous run so PipeWire can bind fresh.
@@ -245,6 +261,14 @@ KWIN_PID=${PIDS[-1]}
 wait_path "$RUNTIME/$SOCKET" 15 \
     || die "KWin Wayland socket did not appear — see $LOG_DIR/kwin.log"
 info "KWin up"
+
+# Point D-Bus-activated services at our headless session, not the desktop.
+# xdg-desktop-portal-kde uses WAYLAND_DISPLAY to connect to KWin for screencasting;
+# without this it falls back to DISPLAY=:20 (X11) and fails.
+export XDG_RUNTIME_DIR="$RUNTIME"
+export WAYLAND_DISPLAY="$SOCKET"
+dbus-update-activation-environment \
+    XDG_RUNTIME_DIR WAYLAND_DISPLAY PIPEWIRE_REMOTE 2>/dev/null || true
 
 # ── 4. Plasmashell ───────────────────────────────────────────────────────────
 #
