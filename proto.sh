@@ -365,6 +365,7 @@ if [[ $OPT_NO_PLASMASHELL -eq 0 ]]; then
         env WAYLAND_DISPLAY="$SOCKET" \
             XDG_RUNTIME_DIR="$RUNTIME" \
             PIPEWIRE_REMOTE="$PW_SOCK" \
+            DISPLAY="${XWAYLAND_DISPLAY:-}" \
             plasmashell --no-respawn
 fi
 
