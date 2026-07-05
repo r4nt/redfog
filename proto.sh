@@ -54,6 +54,52 @@
 #   silently (empty log) before drawing anything.  It is kept as best-effort
 #   but alacritty is the primary guaranteed damage source.
 #
+# D-Bus session isolation (dbus-run-session):
+#   When proto.sh runs inside an existing desktop session it shares that
+#   session's DBUS_SESSION_BUS_ADDRESS.  This causes two problems:
+#     1. plasmashell crashes immediately because org.kde.plasmashell is already
+#        owned by the desktop session.
+#     2. kwin_wayland claims org.kde.KWin, confusing xdg-desktop-portal-kde
+#        which tries to use it for the desktop's screencasting.
+#   Fix: re-exec inside dbus-run-session to get a private bus.  The script
+#   detects this via _REDFOG_INNER and re-execs itself automatically.
+#   This mirrors how separate KDE login sessions work (each gets its own bus).
+#
+# D-Bus activation environment (dbus-update-activation-environment):
+#   Services auto-activated by D-Bus (xdg-desktop-portal, xdg-desktop-portal-kde)
+#   inherit the activation environment of the bus daemon, not the parent shell.
+#   Must call dbus-update-activation-environment AFTER KWin is up (so
+#   WAYLAND_DISPLAY is valid) and BEFORE plasmashell (so the portal backend
+#   connects to our headless KWin, not the desktop compositor).
+#   Key vars to push: XDG_RUNTIME_DIR, WAYLAND_DISPLAY, PIPEWIRE_REMOTE.
+#
+# Dynamic resize via kde_output_management_v2:
+#   kwin-capture accepts "resize WxH" lines on its stdin (via a named FIFO at
+#   $LOG_DIR/kwin-capture-cmd.fifo).  Two-phase protocol:
+#     Phase 1: create_mode_list → set_resolution/set_refresh_rate/add_mode →
+#              create_configuration → set_custom_modes → apply
+#              Wait for config.applied event.
+#     Phase 2: create_configuration → mode(output, new_mode) → apply
+#              Wait for config.applied → done.
+#   The FIFO is opened read-write (<>) in the shell to avoid blocking on open.
+#   wayland-client 0.31 dispatch_pending() does NOT read from the socket;
+#   must call prepare_read() + read() in the event loop to receive replies.
+#
+# XDG portal screencast investigation:
+#   org.freedesktop.portal.ScreenCast (AvailableSourceTypes=7) does support
+#   Virtual outputs (type=4).  With WAYLAND_DISPLAY pointing at our headless
+#   KWin, xdg-desktop-portal-kde routes to it correctly and shows the Allow
+#   dialog inside the headless session (visible through the GStreamer preview).
+#   However: the dialog requires user input to dismiss; no headless bypass
+#   exists (the restore_token mechanism requires a first interactive grant, and
+#   pre-injecting a token would require knowledge of the internal token format —
+#   deeper coupling than the protocol we already use).
+#   xdg-desktop-portal-kde uses zkde_screencast_unstable_v1 internally anyway,
+#   so using it directly (kwin-capture) is equivalent and avoids the dialog.
+#   Decision: use the protocol directly.  The "unstable" label means "not yet
+#   formally ratified by wayland-protocols", not "likely to break"; OBS, GNOME
+#   Remote Desktop, and xdg-desktop-portal-kde all depend on it.
+#
 # NVIDIA GBM (RTX 2080, driver 610.43.02):
 #   KWin's virtual backend uses GpuManager → RenderDevice::open() →
 #   gbm_create_device() to find GPU render devices.  On NVIDIA proprietary,
