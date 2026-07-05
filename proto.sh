@@ -76,6 +76,9 @@ RUNTIME="/tmp/redfog-runtime"
 PW_SOCK="$RUNTIME/pipewire-0"
 LOG_DIR="/tmp/redfog-proto"
 PIDS=()
+WIDTH=1920
+HEIGHT=1080
+SCALE=1.0
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -90,14 +93,18 @@ info() { echo "==> $*"; }
 #   --no-plasmashell   don't launch plasmashell
 #   --no-alacritty     don't launch alacritty as damage source
 #   --app <cmd>        launch <cmd> instead of alacritty as damage source
+#   --size WxH         virtual display size (default: 1920x1080)
 #   --kwin-args <a>    pass extra arguments to kwin_wayland
+#   --preview-scale N  scale preview window by 1/N (default: 2 = half size)
 #   --verbose          tail all logs to stdout instead of only printing errors
 
 OPT_SKIP_BUILD=0
 OPT_NO_PLASMASHELL=0
 OPT_NO_ALACRITTY=0
 OPT_APP=""
+OPT_SIZE=""
 OPT_KWIN_ARGS=""
+OPT_PREVIEW_SCALE=2
 OPT_VERBOSE=0
 
 while [[ $# -gt 0 ]]; do
@@ -106,12 +113,21 @@ while [[ $# -gt 0 ]]; do
         --no-plasmashell)  OPT_NO_PLASMASHELL=1 ;;
         --no-alacritty)    OPT_NO_ALACRITTY=1 ;;
         --app)             OPT_APP="$2"; shift ;;
+        --size)            OPT_SIZE="$2"; shift ;;
         --kwin-args)       OPT_KWIN_ARGS="$2"; shift ;;
+        --preview-scale)   OPT_PREVIEW_SCALE="$2"; shift ;;
         --verbose)         OPT_VERBOSE=1 ;;
         *) die "unknown argument: $1 (see script header for usage)" ;;
     esac
     shift
 done
+
+if [[ -n "$OPT_SIZE" ]]; then
+    WIDTH="${OPT_SIZE%x*}"
+    HEIGHT="${OPT_SIZE#*x}"
+    [[ "$WIDTH" =~ ^[0-9]+$ && "$HEIGHT" =~ ^[0-9]+$ ]] \
+        || die "--size must be WxH (e.g. 1280x720), got: $OPT_SIZE"
+fi
 
 # launch <logfile> <cmd> [args...] — start a background process, redirect its
 # output to logfile unless --verbose, then append its PID to PIDS.
@@ -125,7 +141,10 @@ launch() {
     PIDS+=($!)
 }
 
+CLEANED_UP=0
 cleanup() {
+    [[ $CLEANED_UP -eq 1 ]] && return
+    CLEANED_UP=1
     info "Shutting down..."
     for pid in "${PIDS[@]:-}"; do
         kill "$pid" 2>/dev/null || true
@@ -270,15 +289,23 @@ CAPTURE_BIN="$SCRIPT_DIR/target/release/kwin-capture"
 
 info "Requesting PipeWire stream from KWin..."
 NODE_FIFO="$LOG_DIR/node-id.fifo"
-rm -f "$NODE_FIFO"
-mkfifo "$NODE_FIFO"
+CMD_FIFO="$LOG_DIR/kwin-capture-cmd.fifo"
+rm -f "$NODE_FIFO" "$CMD_FIFO"
+mkfifo "$NODE_FIFO" "$CMD_FIFO"
+# Keep CMD_FIFO open in this shell so kwin-capture doesn't see EOF.
+# Open read+write (<>) so the open(2) doesn't block waiting for a reader.
+exec 4<>"$CMD_FIFO"
 
 WAYLAND_DISPLAY="$SOCKET" \
 XDG_RUNTIME_DIR="$RUNTIME" \
 PIPEWIRE_REMOTE="$PW_SOCK" \
-    "$CAPTURE_BIN" >"$NODE_FIFO" 2>"$LOG_DIR/kwin-capture.log" &
+REDFOG_WIDTH="$WIDTH" \
+REDFOG_HEIGHT="$HEIGHT" \
+REDFOG_SCALE="$SCALE" \
+    "$CAPTURE_BIN" <"$CMD_FIFO" >"$NODE_FIFO" 2>"$LOG_DIR/kwin-capture.log" &
 PIDS+=($!)
 # kwin-capture always logs to file so node ID can be read from the FIFO cleanly
+# Send resize commands: echo "resize 1280x720" > /tmp/redfog-proto/kwin-capture-cmd.fifo
 
 NODE_ID=$(head -n1 "$NODE_FIFO")
 [[ -n "$NODE_ID" ]] || die "kwin-capture did not return a node ID — see $LOG_DIR/kwin-capture.log"
@@ -301,13 +328,17 @@ done || info "Warning: node $NODE_ID not yet visible in pw-dump, proceeding anyw
 # or DMA_DRM (zero-copy DMA-BUF) depending on driver support.
 # Watch the caps line in the output: DMA_DRM = zero-copy; BGRx = CPU copy.
 
-info "Streaming to local window via $VIDEO_SINK (Ctrl-C to stop)..."
+PREVIEW_W=$(( WIDTH / OPT_PREVIEW_SCALE ))
+PREVIEW_H=$(( HEIGHT / OPT_PREVIEW_SCALE ))
+info "Streaming to local window via $VIDEO_SINK at ${PREVIEW_W}x${PREVIEW_H} (Ctrl-C to stop)..."
 
 launch "$LOG_DIR/gst.log" \
     env PIPEWIRE_REMOTE="$PW_SOCK" \
         gst-launch-1.0 -v \
             pipewiresrc path="$NODE_ID" do-timestamp=true \
             ! videoconvert \
+            ! videoscale \
+            ! "video/x-raw,width=${PREVIEW_W},height=${PREVIEW_H}" \
             ! "$VIDEO_SINK" sync=false
 GST_PID=${PIDS[-1]}
 
