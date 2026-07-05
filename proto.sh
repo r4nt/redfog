@@ -191,6 +191,13 @@ if [[ -n "$OPT_SIZE" ]]; then
         || die "--size must be WxH (e.g. 1280x720), got: $OPT_SIZE"
 fi
 
+# The KWin virtual output runs at the preview resolution directly — no scaling.
+# This avoids coordinate translation issues and keeps CPU usage low.
+PREVIEW_W=$(( WIDTH / OPT_PREVIEW_SCALE ))
+PREVIEW_H=$(( HEIGHT / OPT_PREVIEW_SCALE ))
+WIDTH=$PREVIEW_W
+HEIGHT=$PREVIEW_H
+
 # launch <logfile> <cmd> [args...] — start a background process, redirect its
 # output to logfile unless --verbose, then append its PID to PIDS.
 launch() {
@@ -212,6 +219,10 @@ cleanup() {
         kill "$pid" 2>/dev/null || true
     done
     wait 2>/dev/null || true
+    # Restore the host DISPLAY in the systemd user session
+    if [[ -n "${HOST_DISPLAY:-}" ]]; then
+        systemctl --user set-environment DISPLAY="$HOST_DISPLAY" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT INT TERM
 
@@ -298,26 +309,48 @@ sleep 1
 
 info "Starting KWin (virtual platform) on WAYLAND_DISPLAY=$SOCKET..."
 rm -f "$RUNTIME/$SOCKET" "$RUNTIME/$SOCKET.lock"
+
+# Snapshot existing X11 sockets so we can detect the one XWayland creates.
+X11_BEFORE=$(ls /tmp/.X11-unix/ 2>/dev/null | sort)
+
 launch "$LOG_DIR/kwin.log" \
     env -u WAYLAND_DISPLAY -u DISPLAY \
         KWIN_PLATFORM=virtual \
         KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
         XDG_RUNTIME_DIR="$RUNTIME" \
         PIPEWIRE_REMOTE="$PW_SOCK" \
-        kwin_wayland --no-lockscreen --socket "$SOCKET" $OPT_KWIN_ARGS
+        kwin_wayland --no-lockscreen --socket "$SOCKET" --xwayland $OPT_KWIN_ARGS
 KWIN_PID=${PIDS[-1]}
 
 wait_path "$RUNTIME/$SOCKET" 15 \
     || die "KWin Wayland socket did not appear — see $LOG_DIR/kwin.log"
 info "KWin up"
 
+# Detect the XWayland display KWin just started (new socket in /tmp/.X11-unix/).
+XWAYLAND_DISPLAY=""
+for ((i = 0; i < 40; i++)); do
+    NEW=$(comm -13 <(echo "$X11_BEFORE") <(ls /tmp/.X11-unix/ 2>/dev/null | sort) | head -1)
+    if [[ -n "$NEW" ]]; then
+        XWAYLAND_DISPLAY=":${NEW#X}"
+        info "KWin XWayland on DISPLAY=$XWAYLAND_DISPLAY"
+        break
+    fi
+    sleep 0.25
+done
+[[ -n "$XWAYLAND_DISPLAY" ]] || info "Warning: XWayland display not detected"
+
 # Point D-Bus-activated services at our headless session, not the desktop.
 # xdg-desktop-portal-kde uses WAYLAND_DISPLAY to connect to KWin for screencasting;
-# without this it falls back to DISPLAY=:20 (X11) and fails.
+# without this it falls back to the host display and fails.
 export XDG_RUNTIME_DIR="$RUNTIME"
 export WAYLAND_DISPLAY="$SOCKET"
+# Push DISPLAY into the systemd user session environment so fish (and other shells)
+# that read from systemctl --user show-environment pick up KWin's XWayland, not CRD.
+if [[ -n "$XWAYLAND_DISPLAY" ]]; then
+    systemctl --user set-environment DISPLAY="$XWAYLAND_DISPLAY" 2>/dev/null || true
+fi
 dbus-update-activation-environment \
-    XDG_RUNTIME_DIR WAYLAND_DISPLAY PIPEWIRE_REMOTE 2>/dev/null || true
+    XDG_RUNTIME_DIR WAYLAND_DISPLAY PIPEWIRE_REMOTE DISPLAY 2>/dev/null || true
 
 # ── 4. Plasmashell ───────────────────────────────────────────────────────────
 #
@@ -423,7 +456,7 @@ exec 5<>"$INPUT_FIFO"
 # kwin-viewer connects to the PipeWire stream by ID and displays it in a window
 # while forwarding keyboard and mouse events back to the headless KWin compositor.
 
-info "Streaming to local window via kwin-viewer (Ctrl-C to stop)..."
+info "Streaming to local window via kwin-viewer at ${PREVIEW_W}x${PREVIEW_H} (Ctrl-C to stop)..."
 
 launch "$LOG_DIR/kwin-viewer.log" \
     env -u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR \
@@ -431,7 +464,7 @@ launch "$LOG_DIR/kwin-viewer.log" \
         DISPLAY="$HOST_DISPLAY" \
         XDG_RUNTIME_DIR="$HOST_XDG_RUNTIME_DIR" \
         PIPEWIRE_REMOTE="$PW_SOCK" \
-        "$VIEWER_BIN" "$NODE_ID" "$RUNTIME/$SOCKET"
+        "$VIEWER_BIN" "$NODE_ID" "$RUNTIME/$SOCKET" "$PREVIEW_W" "$PREVIEW_H"
 VIEWER_PID=${PIDS[-1]}
 
 # ── 9. Launch a damage source ─────────────────────────────────────────────────
@@ -458,6 +491,7 @@ if [[ $OPT_NO_ALACRITTY -eq 0 ]]; then
     launch "$LOG_DIR/damage-app.log" \
         env WAYLAND_DISPLAY="$SOCKET" \
             XDG_RUNTIME_DIR="$RUNTIME" \
+            DISPLAY="${XWAYLAND_DISPLAY:-}" \
             $DAMAGE_APP
 fi
 

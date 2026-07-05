@@ -189,11 +189,13 @@ fn winit_button_to_evdev(btn: MouseButton) -> Option<u32> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <pipewire-node-id> <headless-wayland-socket-path>", args[0]);
+        eprintln!("Usage: {} <pipewire-node-id> <headless-wayland-socket-path> [width height]", args[0]);
         std::process::exit(1);
     }
     let node_id: u32 = args[1].parse().expect("Invalid PipeWire node ID");
     let headless_wayland_path = &args[2];
+    let preview_w: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(960);
+    let preview_h: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(540);
 
     // Initialize GStreamer
     gst::init()?;
@@ -224,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let window = Arc::new(
         WindowBuilder::new()
             .with_title("Redfog KWin Stream Viewer")
-            .with_inner_size(winit::dpi::PhysicalSize::new(960, 540))
+            .with_inner_size(winit::dpi::PhysicalSize::new(preview_w, preview_h))
             .build(&event_loop)?,
     );
 
@@ -237,11 +239,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame_store_clone = frame_store.clone();
     let event_loop_proxy = event_loop.create_proxy();
 
-    // Build GStreamer pipeline
-    // We use BGRx format from GStreamer videoconvert as it maps directly to softbuffer's u32 layout.
+    // KWin's virtual output is already at preview_w x preview_h — no scaling needed.
     let pipeline_desc = format!(
-        "pipewiresrc path={} do-timestamp=true ! videoconvert ! video/x-raw,format=BGRx ! appsink name=sink sync=false",
-        node_id
+        "pipewiresrc path={node_id} do-timestamp=true \
+         ! videoconvert \
+         ! video/x-raw,format=BGRx \
+         ! appsink name=sink sync=false"
     );
     let pipeline = gst::parse_launch(&pipeline_desc)?;
     let appsink = pipeline
@@ -303,8 +306,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if current_width != frame.width || current_height != frame.height {
                         current_width = frame.width;
                         current_height = frame.height;
-                        let size = winit::dpi::PhysicalSize::new(current_width, current_height);
-                        let _ = window.request_inner_size(size);
                         let _ = surface.resize(
                             NonZeroU32::new(current_width).unwrap(),
                             NonZeroU32::new(current_height).unwrap(),
