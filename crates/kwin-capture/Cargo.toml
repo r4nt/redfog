@@ -3,6 +3,10 @@ name = "kwin-capture"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "kwin_capture"
+path = "src/lib.rs"
+
 [[bin]]
 name = "kwin-capture"
 path = "src/main.rs"

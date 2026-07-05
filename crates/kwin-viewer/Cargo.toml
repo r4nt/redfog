@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+kwin-capture = { path = "../kwin-capture" }
 wayland-client = "0.31"
 wayland-scanner = "0.31"
 wayland-backend = "0.3"

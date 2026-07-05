@@ -833,6 +833,7 @@ version = "0.1.0"
 dependencies = [
  "gstreamer",
  "gstreamer-app",
+ "kwin-capture",
  "softbuffer",
  "wayland-backend",
  "wayland-client",

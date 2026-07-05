@@ -381,63 +381,41 @@ else
     info "Skipping build (--skip-build)"
 fi
 
-CAPTURE_BIN="$SCRIPT_DIR/target/release/kwin-capture"
 INPUT_BIN="$SCRIPT_DIR/target/release/kwin-input"
 VIEWER_BIN="$SCRIPT_DIR/target/release/kwin-viewer"
 
-# ── 6. Request a PipeWire stream from KWin ───────────────────────────────────
+# ── 6. Launch kwin-viewer ────────────────────────────────────────────────────
 #
-# kwin-capture connects to KWin as a Wayland client and calls
-# zkde_screencast_unstable_v1.stream_virtual_output, which:
-#   - creates a 1920×1080 virtual output inside KWin
-#   - starts a PipeWire stream for it
-#   - returns the PipeWire node ID via the 'created' event
-#
-# kwin-capture prints the node ID and then loops forever.  It must stay alive:
-# when the Wayland connection closes KWin destroys the virtual output and its
-# PipeWire node.
+# kwin-viewer connects to the headless KWin, creates the virtual output and
+# PipeWire stream internally (via the kwin-capture library), then opens a
+# preview window and forwards input back.  It prints "ready" to stdout once
+# the GStreamer pipeline is playing.
 
-info "Requesting PipeWire stream from KWin..."
-NODE_FIFO="$LOG_DIR/node-id.fifo"
-CMD_FIFO="$LOG_DIR/kwin-capture-cmd.fifo"
-rm -f "$NODE_FIFO" "$CMD_FIFO"
-mkfifo "$NODE_FIFO" "$CMD_FIFO"
-# Keep CMD_FIFO open in this shell so kwin-capture doesn't see EOF.
-# Open read+write (<>) so the open(2) doesn't block waiting for a reader.
-exec 4<>"$CMD_FIFO"
+info "Streaming to local window via kwin-viewer at ${PREVIEW_W}x${PREVIEW_H} (Ctrl-C to stop)..."
 
-WAYLAND_DISPLAY="$SOCKET" \
-XDG_RUNTIME_DIR="$RUNTIME" \
-PIPEWIRE_REMOTE="$PW_SOCK" \
-REDFOG_WIDTH="$WIDTH" \
-REDFOG_HEIGHT="$HEIGHT" \
-REDFOG_SCALE="$SCALE" \
-    "$CAPTURE_BIN" <"$CMD_FIFO" >"$NODE_FIFO" 2>"$LOG_DIR/kwin-capture.log" &
-PIDS+=($!)
-# kwin-capture always logs to file so node ID can be read from the FIFO cleanly
-# Send resize commands: echo "resize 1280x720" > /tmp/redfog-proto/kwin-capture-cmd.fifo
+READY_FIFO="$LOG_DIR/viewer-ready.fifo"
+rm -f "$READY_FIFO"
+mkfifo "$READY_FIFO"
 
-NODE_ID=$(head -n1 "$NODE_FIFO")
-[[ -n "$NODE_ID" ]] || die "kwin-capture did not return a node ID — see $LOG_DIR/kwin-capture.log"
-kill -0 "$KWIN_PID" 2>/dev/null || die "KWin died before stream was created — see $LOG_DIR/kwin.log"
-info "PipeWire node ID: $NODE_ID"
+env -u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR \
+    WAYLAND_DISPLAY="$HOST_WAYLAND_DISPLAY" \
+    DISPLAY="$HOST_DISPLAY" \
+    XDG_RUNTIME_DIR="$HOST_XDG_RUNTIME_DIR" \
+    PIPEWIRE_REMOTE="$PW_SOCK" \
+    REDFOG_SCALE="$SCALE" \
+    "$VIEWER_BIN" "$RUNTIME/$SOCKET" "$PREVIEW_W" "$PREVIEW_H" \
+    >"$READY_FIFO" 2>"$LOG_DIR/kwin-viewer.log" &
+VIEWER_PID=$!
+PIDS+=($VIEWER_PID)
 
-# Wait for the node to appear in the PipeWire graph.
-for ((i = 0; i < 20; i++)); do
-    PIPEWIRE_REMOTE="$PW_SOCK" pw-dump 2>/dev/null | python3 -c "
-import sys, json
-nodes = json.load(sys.stdin)
-ids = [str(n.get('id','')) for n in nodes if n.get('type') == 'PipeWire:Interface:Node']
-sys.exit(0 if '$NODE_ID' in ids else 1)" && break
-    sleep 0.5
-done || info "Warning: node $NODE_ID not yet visible in pw-dump, proceeding anyway"
+head -n1 "$READY_FIFO" >/dev/null
+kill -0 "$VIEWER_PID" 2>/dev/null || die "kwin-viewer died before becoming ready — see $LOG_DIR/kwin-viewer.log"
+info "Preview window open. Ctrl-C to stop."
 
 # ── 7. Input forwarding via org_kde_kwin_fake_input ──────────────────────────
 #
-# kwin-input binds org_kde_kwin_fake_input on the headless Wayland socket
-# (same socket kwin-capture uses) and calls authenticate().  This is KWin's
-# direct input injection interface — no EIS sessions, no portal dialogs, no
-# timing dependency on focused windows.
+# kwin-input provides a FIFO-based interface for scripted input injection,
+# complementing the direct input forwarding built into kwin-viewer.
 #
 # Send commands to the FIFO:
 #   echo "key 28 1"        > /tmp/redfog-proto/kwin-input-cmd.fifo  # Enter down
@@ -452,22 +430,6 @@ INPUT_FIFO="$LOG_DIR/kwin-input-cmd.fifo"
 rm -f "$INPUT_FIFO"
 mkfifo "$INPUT_FIFO"
 exec 5<>"$INPUT_FIFO"
-
-# ── 8. Display via kwin-viewer ────────────────────────────────────────────────
-#
-# kwin-viewer connects to the PipeWire stream by ID and displays it in a window
-# while forwarding keyboard and mouse events back to the headless KWin compositor.
-
-info "Streaming to local window via kwin-viewer at ${PREVIEW_W}x${PREVIEW_H} (Ctrl-C to stop)..."
-
-launch "$LOG_DIR/kwin-viewer.log" \
-    env -u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR \
-        WAYLAND_DISPLAY="$HOST_WAYLAND_DISPLAY" \
-        DISPLAY="$HOST_DISPLAY" \
-        XDG_RUNTIME_DIR="$HOST_XDG_RUNTIME_DIR" \
-        PIPEWIRE_REMOTE="$PW_SOCK" \
-        "$VIEWER_BIN" "$NODE_ID" "$RUNTIME/$SOCKET" "$PREVIEW_W" "$PREVIEW_H" "$CMD_FIFO"
-VIEWER_PID=${PIDS[-1]}
 
 # ── 9. Launch a damage source ─────────────────────────────────────────────────
 #
@@ -497,5 +459,4 @@ if [[ $OPT_NO_ALACRITTY -eq 0 ]]; then
             $DAMAGE_APP
 fi
 
-info "Preview window open. Ctrl-C to stop."
 wait $VIEWER_PID

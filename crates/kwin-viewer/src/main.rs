@@ -19,6 +19,8 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 
+use kwin_capture::CaptureSession;
+
 mod fake_input {
     #![allow(
         dead_code, non_camel_case_types, unused_unsafe, unused_variables,
@@ -44,15 +46,8 @@ use fake_input::client::org_kde_kwin_fake_input::OrgKdeKwinFakeInput;
 struct WaylandState;
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandState {
-    fn event(
-        _state: &mut Self,
-        _registry: &wl_registry::WlRegistry,
-        _event: wl_registry::Event,
-        _data: &GlobalListContents,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-    }
+    fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event,
+             _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
 }
 
 delegate_noop!(WaylandState: ignore wl_seat::WlSeat);
@@ -188,59 +183,45 @@ fn winit_button_to_evdev(btn: MouseButton) -> Option<u32> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <pipewire-node-id> <headless-wayland-socket-path> [width height [capture-cmd-fifo]]", args[0]);
+    if args.len() < 4 {
+        eprintln!("Usage: {} <headless-wayland-socket> <width> <height>", args[0]);
         std::process::exit(1);
     }
-    let node_id: u32 = args[1].parse().expect("Invalid PipeWire node ID");
-    let headless_wayland_path = &args[2];
-    let preview_w: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(960);
-    let preview_h: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(540);
-    let _capture_cmd_fifo: Option<String> = args.get(5).cloned();
+    let socket_path = std::path::Path::new(&args[1]);
+    let width: i32  = args[2].parse().expect("invalid width");
+    let height: i32 = args[3].parse().expect("invalid height");
+    let scale: f64  = std::env::var("REDFOG_SCALE").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(1.0);
 
-    // Initialize GStreamer
-    gst::init()?;
+    // Create virtual output and PipeWire stream via the capture library.
+    let session = CaptureSession::connect(socket_path, "redfog-output", width, height, scale)
+        .expect("failed to create capture session");
+    let node_id = session.node_id();
+    eprintln!("kwin-viewer: PipeWire node {node_id}");
 
-    // Connect to Wayland and bind fake_input
+    // Separate connection to headless KWin for fake_input (input injection).
     use std::os::unix::net::UnixStream;
-    let stream = UnixStream::connect(headless_wayland_path)?;
-    let conn = Connection::from_socket(stream)?;
-    let (globals, mut queue) = registry_queue_init::<WaylandState>(&conn)?;
-    let qh = queue.handle();
+    let fi_stream = UnixStream::connect(socket_path)?;
+    let fi_conn = Connection::from_socket(fi_stream)?;
+    let (globals, mut fi_queue) = registry_queue_init::<WaylandState>(&fi_conn)?;
+    let fi_qh = fi_queue.handle();
 
     let fake_input: OrgKdeKwinFakeInput = globals
-        .bind(&qh, 4..=6, ())
+        .bind(&fi_qh, 4..=6, ())
         .map_err(|e| format!("org_kde_kwin_fake_input not available: {e}"))?;
 
-    let mut wayland_state = WaylandState;
+    let mut fi_state = WaylandState;
     fake_input.authenticate(
         "redfog-viewer".to_string(),
         "input forwarding for game streaming".to_string(),
     );
-    conn.flush()?;
-    queue.roundtrip(&mut wayland_state)?;
+    fi_conn.flush()?;
+    fi_queue.roundtrip(&mut fi_state)?;
+    eprintln!("kwin-viewer: fake_input authenticated");
 
-    eprintln!("kwin-viewer: connected to Wayland & fake_input authenticated");
+    // Initialize GStreamer
+    gst::init()?;
 
-    // Build the Event Loop
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build()?;
-    let window = Arc::new(
-        WindowBuilder::new()
-            .with_title("Redfog KWin Stream Viewer")
-            .with_inner_size(winit::dpi::PhysicalSize::new(preview_w, preview_h))
-            .build(&event_loop)?,
-    );
-
-    // Setup softbuffer context & surface
-    let context = softbuffer::Context::new(window.clone())?;
-    let mut surface = softbuffer::Surface::new(&context, window.clone())?;
-
-    // Frame storage
-    let frame_store = Arc::new(Mutex::new(None));
-    let frame_store_clone = frame_store.clone();
-    let event_loop_proxy = event_loop.create_proxy();
-
-    // KWin's virtual output is already at preview_w x preview_h — no scaling needed.
     let pipeline_desc = format!(
         "pipewiresrc path={node_id} do-timestamp=true \
          ! videoconvert \
@@ -256,6 +237,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .dynamic_cast::<gst_app::AppSink>()
         .unwrap();
 
+    let frame_store: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
+    let frame_store_clone = frame_store.clone();
+
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build()?;
+    let event_loop_proxy = event_loop.create_proxy();
+
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -265,25 +252,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let structure = caps.structure(0).ok_or(gst::FlowError::Error)?;
                 let width = structure.get::<i32>("width").map_err(|_| gst::FlowError::Error)? as u32;
                 let height = structure.get::<i32>("height").map_err(|_| gst::FlowError::Error)? as u32;
-
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                 let data = map.to_vec();
-
                 let mut store = frame_store_clone.lock().unwrap();
                 let changed = store.as_ref().map(|f: &Frame| f.width != width || f.height != height).unwrap_or(true);
                 if changed {
                     eprintln!("kwin-viewer: frame size {}x{}", width, height);
                 }
                 *store = Some(Frame { width, height, data });
-
                 let _ = event_loop_proxy.send_event(UserEvent::NewFrame);
-
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
     );
 
     pipeline.set_state(gst::State::Playing)?;
+
+    // Signal readiness to proto.sh (read from stdout FIFO).
+    println!("ready");
+
+    let window = Arc::new(
+        WindowBuilder::new()
+            .with_title("Redfog KWin Stream Viewer")
+            .with_inner_size(winit::dpi::PhysicalSize::new(width as u32, height as u32))
+            .build(&event_loop)?,
+    );
+    let context = softbuffer::Context::new(window.clone())?;
+    let mut surface = softbuffer::Surface::new(&context, window.clone())?;
 
     let mut frame_w = 0u32;
     let mut frame_h = 0u32;
@@ -305,7 +300,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         data: f.data.clone(),
                     })
                 };
-
                 if let Some(frame) = frame_opt {
                     if frame.width != frame_w || frame.height != frame_h {
                         frame_w = frame.width;
@@ -328,6 +322,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            Event::WindowEvent { event: WindowEvent::Resized(size), .. } => {
+                if size.width > 0 && size.height > 0 {
+                    // Align to 8px: KDE aligns mode widths to multiples of 8.
+                    let w = ((size.width / 8) * 8) as i32;
+                    let h = size.height as i32;
+                    session.resize(w, h);
+                }
+            }
             Event::WindowEvent { event: WindowEvent::Focused(focused), .. } => {
                 has_focus = focused;
             }
@@ -339,7 +341,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let rx = (position.x / w_size.width as f64) * frame_w as f64;
                         let ry = (position.y / w_size.height as f64) * frame_h as f64;
                         fake_input.pointer_motion_absolute(rx, ry);
-                        let _ = conn.flush();
+                        let _ = fi_conn.flush();
                     }
                 }
             }
@@ -350,7 +352,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             evdev_btn,
                             if state == ElementState::Pressed { 1 } else { 0 },
                         );
-                        let _ = conn.flush();
+                        let _ = fi_conn.flush();
                     }
                 }
             }
@@ -362,7 +364,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 evdev_key,
                                 if key_event.state == ElementState::Pressed { 1 } else { 0 },
                             );
-                            let _ = conn.flush();
+                            let _ = fi_conn.flush();
                         }
                     }
                 }
