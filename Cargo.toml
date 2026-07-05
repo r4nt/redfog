@@ -2,5 +2,6 @@
 members = [
     "crates/kwin-capture",
     "crates/kwin-input",
+    "crates/kwin-viewer",
 ]
 resolver = "2"

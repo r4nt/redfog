@@ -129,6 +129,9 @@ if [[ -z "${_REDFOG_INNER:-}" ]]; then
     export _REDFOG_INNER=1
     exec dbus-run-session -- bash "${BASH_SOURCE[0]}" "$@"
 fi
+HOST_WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}"
+HOST_DISPLAY="${DISPLAY:-}"
+HOST_XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}"
 
 SOCKET="redfog-proto-0"
 RUNTIME="/tmp/redfog-runtime"
@@ -335,9 +338,9 @@ fi
 # ── 5. Build kwin-capture ────────────────────────────────────────────────────
 
 if [[ $OPT_SKIP_BUILD -eq 0 ]]; then
-    info "Building kwin-capture and kwin-input..."
+    info "Building kwin-capture, kwin-input and kwin-viewer..."
     cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" \
-        -p kwin-capture -p kwin-input --release 2>"$LOG_DIR/cargo.log" \
+        -p kwin-capture -p kwin-input -p kwin-viewer --release 2>"$LOG_DIR/cargo.log" \
         || { cat "$LOG_DIR/cargo.log" >&2; die "cargo build failed"; }
 else
     info "Skipping build (--skip-build)"
@@ -345,6 +348,7 @@ fi
 
 CAPTURE_BIN="$SCRIPT_DIR/target/release/kwin-capture"
 INPUT_BIN="$SCRIPT_DIR/target/release/kwin-input"
+VIEWER_BIN="$SCRIPT_DIR/target/release/kwin-viewer"
 
 # ── 6. Request a PipeWire stream from KWin ───────────────────────────────────
 #
@@ -414,25 +418,21 @@ rm -f "$INPUT_FIFO"
 mkfifo "$INPUT_FIFO"
 exec 5<>"$INPUT_FIFO"
 
-# ── 8. Display via GStreamer ──────────────────────────────────────────────────
+# ── 8. Display via kwin-viewer ────────────────────────────────────────────────
 #
-# pipewiresrc connects to the node by ID.  KWin negotiates BGRx (SHM path)
-# or DMA_DRM (zero-copy DMA-BUF) depending on driver support.
-# Watch the caps line in the output: DMA_DRM = zero-copy; BGRx = CPU copy.
+# kwin-viewer connects to the PipeWire stream by ID and displays it in a window
+# while forwarding keyboard and mouse events back to the headless KWin compositor.
 
-PREVIEW_W=$(( WIDTH / OPT_PREVIEW_SCALE ))
-PREVIEW_H=$(( HEIGHT / OPT_PREVIEW_SCALE ))
-info "Streaming to local window via $VIDEO_SINK at ${PREVIEW_W}x${PREVIEW_H} (Ctrl-C to stop)..."
+info "Streaming to local window via kwin-viewer (Ctrl-C to stop)..."
 
-launch "$LOG_DIR/gst.log" \
-    env PIPEWIRE_REMOTE="$PW_SOCK" \
-        gst-launch-1.0 -v \
-            pipewiresrc path="$NODE_ID" do-timestamp=true \
-            ! videoconvert \
-            ! videoscale \
-            ! "video/x-raw,width=${PREVIEW_W},height=${PREVIEW_H}" \
-            ! "$VIDEO_SINK" sync=false
-GST_PID=${PIDS[-1]}
+launch "$LOG_DIR/kwin-viewer.log" \
+    env -u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR \
+        WAYLAND_DISPLAY="$HOST_WAYLAND_DISPLAY" \
+        DISPLAY="$HOST_DISPLAY" \
+        XDG_RUNTIME_DIR="$HOST_XDG_RUNTIME_DIR" \
+        PIPEWIRE_REMOTE="$PW_SOCK" \
+        "$VIEWER_BIN" "$NODE_ID" "$RUNTIME/$SOCKET"
+VIEWER_PID=${PIDS[-1]}
 
 # ── 9. Launch a damage source ─────────────────────────────────────────────────
 #
@@ -462,4 +462,4 @@ if [[ $OPT_NO_ALACRITTY -eq 0 ]]; then
 fi
 
 info "Preview window open. Ctrl-C to stop."
-wait $GST_PID
+wait $VIEWER_PID
