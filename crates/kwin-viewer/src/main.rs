@@ -189,13 +189,14 @@ fn winit_button_to_evdev(btn: MouseButton) -> Option<u32> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <pipewire-node-id> <headless-wayland-socket-path> [width height]", args[0]);
+        eprintln!("Usage: {} <pipewire-node-id> <headless-wayland-socket-path> [width height [capture-cmd-fifo]]", args[0]);
         std::process::exit(1);
     }
     let node_id: u32 = args[1].parse().expect("Invalid PipeWire node ID");
     let headless_wayland_path = &args[2];
     let preview_w: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(960);
     let preview_h: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(540);
+    let _capture_cmd_fifo: Option<String> = args.get(5).cloned();
 
     // Initialize GStreamer
     gst::init()?;
@@ -246,11 +247,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          ! video/x-raw,format=BGRx \
          ! appsink name=sink sync=false"
     );
-    let pipeline = gst::parse_launch(&pipeline_desc)?;
-    let appsink = pipeline
-        .clone()
+    let pipeline = gst::parse_launch(&pipeline_desc)?
         .dynamic_cast::<gst::Pipeline>()
-        .unwrap()
+        .unwrap();
+    let appsink = pipeline
         .by_name("sink")
         .unwrap()
         .dynamic_cast::<gst_app::AppSink>()
@@ -270,6 +270,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let data = map.to_vec();
 
                 let mut store = frame_store_clone.lock().unwrap();
+                let changed = store.as_ref().map(|f: &Frame| f.width != width || f.height != height).unwrap_or(true);
+                if changed {
+                    eprintln!("kwin-viewer: frame size {}x{}", width, height);
+                }
                 *store = Some(Frame { width, height, data });
 
                 let _ = event_loop_proxy.send_event(UserEvent::NewFrame);
@@ -281,8 +285,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     pipeline.set_state(gst::State::Playing)?;
 
-    let mut current_width = 0;
-    let mut current_height = 0;
+    let mut frame_w = 0u32;
+    let mut frame_h = 0u32;
     let mut has_focus = true;
 
     event_loop.run(move |event, elwt| {
@@ -303,15 +307,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 if let Some(frame) = frame_opt {
-                    if current_width != frame.width || current_height != frame.height {
-                        current_width = frame.width;
-                        current_height = frame.height;
+                    if frame.width != frame_w || frame.height != frame_h {
+                        frame_w = frame.width;
+                        frame_h = frame.height;
+                        eprintln!("kwin-viewer: frame {}x{}", frame_w, frame_h);
                         let _ = surface.resize(
-                            NonZeroU32::new(current_width).unwrap(),
-                            NonZeroU32::new(current_height).unwrap(),
+                            NonZeroU32::new(frame_w).unwrap(),
+                            NonZeroU32::new(frame_h).unwrap(),
                         );
                     }
-
                     if let Ok(mut buffer) = surface.buffer_mut() {
                         let pixels = unsafe {
                             std::slice::from_raw_parts(
@@ -324,26 +328,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            Event::WindowEvent { event: WindowEvent::Resized(size), .. } => {
-                if size.width > 0 && size.height > 0 {
-                    current_width = size.width;
-                    current_height = size.height;
-                    let _ = surface.resize(
-                        NonZeroU32::new(current_width).unwrap(),
-                        NonZeroU32::new(current_height).unwrap(),
-                    );
-                }
-            }
             Event::WindowEvent { event: WindowEvent::Focused(focused), .. } => {
                 has_focus = focused;
             }
             Event::WindowEvent { event: WindowEvent::CursorLeft { .. }, .. } => {}
             Event::WindowEvent { event: WindowEvent::CursorMoved { position, .. }, .. } => {
-                if has_focus {
+                if has_focus && frame_w > 0 && frame_h > 0 {
                     let w_size = window.inner_size();
-                    if w_size.width > 0 && w_size.height > 0 && current_width > 0 && current_height > 0 {
-                        let rx = (position.x / w_size.width as f64) * current_width as f64;
-                        let ry = (position.y / w_size.height as f64) * current_height as f64;
+                    if w_size.width > 0 && w_size.height > 0 {
+                        let rx = (position.x / w_size.width as f64) * frame_w as f64;
+                        let ry = (position.y / w_size.height as f64) * frame_h as f64;
                         fake_input.pointer_motion_absolute(rx, ry);
                         let _ = conn.flush();
                     }

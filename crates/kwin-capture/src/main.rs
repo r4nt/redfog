@@ -72,9 +72,9 @@ struct ModeInfo {
 }
 
 struct OutputInfo {
-    proxy:  KdeOutputDeviceV2,
-    name:   Option<String>,
-    modes:  Vec<ModeInfo>,
+    proxy: KdeOutputDeviceV2,
+    name:  Option<String>,
+    modes: Vec<ModeInfo>,
 }
 
 // ── resize state machine ──────────────────────────────────────────────────────
@@ -144,7 +144,6 @@ impl State {
             return;
         };
 
-        eprintln!("resize: output found: {:?}", out.name);
         eprintln!("resize: sending set_custom_modes + apply for {w}x{h}");
 
         let mode_list = mgmt.create_mode_list(qh, ());
@@ -170,16 +169,18 @@ impl State {
 
         let Some(out) = self.our_output() else { return };
         let available: Vec<_> = out.modes.iter().map(|m| (m.w, m.h)).collect();
-        eprintln!("resize: phase1 applied; available modes: {available:?}");
+        eprintln!("resize: phase1 done; available modes: {available:?}, target: {target_w}x{target_h}");
+
+        // Exact match: viewer pre-aligns to 8px boundary so this should always find the mode.
         let Some(mode) = out.modes.iter().find(|m| m.w == target_w && m.h == target_h) else {
-            eprintln!("resize: {target_w}x{target_h} not yet visible, waiting for mode event");
-            // Mode not yet visible; mark that we're waiting for it.
+            eprintln!("resize: {target_w}x{target_h} not yet in mode list, waiting");
             if let ResizePhase::AddingMode { ref mut waiting_for_mode, .. } = self.resize_phase {
                 *waiting_for_mode = true;
             }
             return;
         };
 
+        eprintln!("resize: selecting {target_w}x{target_h}");
         let Some(mgmt) = &self.output_management else { return };
         let config = mgmt.create_configuration(qh, ());
         config.mode(&out.proxy, &mode.proxy);
@@ -302,7 +303,7 @@ impl Dispatch<KdeOutputDeviceModeV2, ()> for State {
                     if m.proxy.id() == proxy.id() { m.w = w; m.h = h; }
                 }
             }
-            // If we're waiting for this specific resolution to appear, advance.
+            // If waiting for this exact mode, check now that its size is known.
             if let ResizePhase::AddingMode { target_w, target_h, waiting_for_mode: true } = state.resize_phase {
                 if w == target_w && h == target_h {
                     state.try_advance_to_phase2(qh);

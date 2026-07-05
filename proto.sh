@@ -318,6 +318,7 @@ launch "$LOG_DIR/kwin.log" \
         KWIN_PLATFORM=virtual \
         KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
         XDG_RUNTIME_DIR="$RUNTIME" \
+        XDG_DATA_HOME="$LOG_DIR/kwin-data" \
         PIPEWIRE_REMOTE="$PW_SOCK" \
         kwin_wayland --no-lockscreen --socket "$SOCKET" --xwayland $OPT_KWIN_ARGS
 KWIN_PID=${PIDS[-1]}
@@ -465,7 +466,7 @@ launch "$LOG_DIR/kwin-viewer.log" \
         DISPLAY="$HOST_DISPLAY" \
         XDG_RUNTIME_DIR="$HOST_XDG_RUNTIME_DIR" \
         PIPEWIRE_REMOTE="$PW_SOCK" \
-        "$VIEWER_BIN" "$NODE_ID" "$RUNTIME/$SOCKET" "$PREVIEW_W" "$PREVIEW_H"
+        "$VIEWER_BIN" "$NODE_ID" "$RUNTIME/$SOCKET" "$PREVIEW_W" "$PREVIEW_H" "$CMD_FIFO"
 VIEWER_PID=${PIDS[-1]}
 
 # ── 9. Launch a damage source ─────────────────────────────────────────────────
