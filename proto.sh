@@ -335,15 +335,16 @@ fi
 # ── 5. Build kwin-capture ────────────────────────────────────────────────────
 
 if [[ $OPT_SKIP_BUILD -eq 0 ]]; then
-    info "Building kwin-capture..."
+    info "Building kwin-capture and kwin-input..."
     cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" \
-        -p kwin-capture --release 2>"$LOG_DIR/cargo.log" \
+        -p kwin-capture -p kwin-input --release 2>"$LOG_DIR/cargo.log" \
         || { cat "$LOG_DIR/cargo.log" >&2; die "cargo build failed"; }
 else
     info "Skipping build (--skip-build)"
 fi
 
 CAPTURE_BIN="$SCRIPT_DIR/target/release/kwin-capture"
+INPUT_BIN="$SCRIPT_DIR/target/release/kwin-input"
 
 # ── 6. Request a PipeWire stream from KWin ───────────────────────────────────
 #
@@ -392,7 +393,28 @@ sys.exit(0 if '$NODE_ID' in ids else 1)" && break
     sleep 0.5
 done || info "Warning: node $NODE_ID not yet visible in pw-dump, proceeding anyway"
 
-# ── 7. Display via GStreamer ──────────────────────────────────────────────────
+# ── 7. Input forwarding via org_kde_kwin_fake_input ──────────────────────────
+#
+# kwin-input binds org_kde_kwin_fake_input on the headless Wayland socket
+# (same socket kwin-capture uses) and calls authenticate().  This is KWin's
+# direct input injection interface — no EIS sessions, no portal dialogs, no
+# timing dependency on focused windows.
+#
+# Send commands to the FIFO:
+#   echo "key 28 1"        > /tmp/redfog-proto/kwin-input-cmd.fifo  # Enter down
+#   echo "key 28 0"        > /tmp/redfog-proto/kwin-input-cmd.fifo  # Enter up
+#   echo "rel 100 50"      > /tmp/redfog-proto/kwin-input-cmd.fifo  # mouse move
+#   echo "button 272 1"    > /tmp/redfog-proto/kwin-input-cmd.fifo  # left click
+#   echo "button 272 0"    > /tmp/redfog-proto/kwin-input-cmd.fifo
+# Keycodes are Linux evdev keycodes (not X11/USB HID). Common codes:
+#   1=ESC 28=Enter 57=Space 30=A 48=B ... 272=BTN_LEFT 273=BTN_RIGHT
+
+INPUT_FIFO="$LOG_DIR/kwin-input-cmd.fifo"
+rm -f "$INPUT_FIFO"
+mkfifo "$INPUT_FIFO"
+exec 5<>"$INPUT_FIFO"
+
+# ── 8. Display via GStreamer ──────────────────────────────────────────────────
 #
 # pipewiresrc connects to the node by ID.  KWin negotiates BGRx (SHM path)
 # or DMA_DRM (zero-copy DMA-BUF) depending on driver support.
@@ -412,12 +434,22 @@ launch "$LOG_DIR/gst.log" \
             ! "$VIDEO_SINK" sync=false
 GST_PID=${PIDS[-1]}
 
-# ── 8. Launch a damage source ─────────────────────────────────────────────────
+# ── 9. Launch a damage source ─────────────────────────────────────────────────
 #
 # Without any Wayland client committing frames, KWin renders at most one black
 # frame.  We need a real app drawing in the session.
 # --no-alacritty skips this (useful if you're launching your own app manually).
 # --app <cmd> uses a custom command instead of alacritty.
+
+info "Starting kwin-input (fake_input)..."
+WAYLAND_DISPLAY="$SOCKET" \
+XDG_RUNTIME_DIR="$RUNTIME" \
+    "$INPUT_BIN" <"$INPUT_FIFO" 2>"$LOG_DIR/kwin-input.log" &
+PIDS+=($!)
+sleep 0.3
+grep -q "authenticated" "$LOG_DIR/kwin-input.log" 2>/dev/null \
+    && info "kwin-input ready" \
+    || info "kwin-input started (see $LOG_DIR/kwin-input.log)"
 
 if [[ $OPT_NO_ALACRITTY -eq 0 ]]; then
     sleep 2

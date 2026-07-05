@@ -1,5 +1,6 @@
 [workspace]
 members = [
     "crates/kwin-capture",
+    "crates/kwin-input",
 ]
 resolver = "2"

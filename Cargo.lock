@@ -52,6 +52,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kwin-input"
+version = "0.1.0"
+dependencies = [
+ "wayland-backend",
+ "wayland-client",
+ "wayland-scanner",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
