@@ -363,9 +363,9 @@ dbus-update-activation-environment \
 # ── 5. Build kwin-capture ────────────────────────────────────────────────────
 
 if [[ $OPT_SKIP_BUILD -eq 0 ]]; then
-    info "Building kwin-capture, kwin-input and kwin-viewer..."
+    info "Building kwin-capture, kwin-input, kwin-viewer and redfog-login..."
     cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" \
-        -p kwin-capture -p kwin-input -p kwin-viewer --release 2>"$LOG_DIR/cargo.log" \
+        -p kwin-capture -p kwin-input -p kwin-viewer -p redfog-login --release 2>"$LOG_DIR/cargo.log" \
         || { cat "$LOG_DIR/cargo.log" >&2; die "cargo build failed"; }
 else
     info "Skipping build (--skip-build)"
@@ -373,6 +373,7 @@ fi
 
 INPUT_BIN="$SCRIPT_DIR/target/release/kwin-input"
 VIEWER_BIN="$SCRIPT_DIR/target/release/kwin-viewer"
+LOGIN_BIN="$SCRIPT_DIR/target/release/redfog-login"
 
 # ── 6. Launch kwin-viewer ────────────────────────────────────────────────────
 #
@@ -401,6 +402,20 @@ PIDS+=($VIEWER_PID)
 head -n1 "$READY_FIFO" >/dev/null
 kill -0 "$VIEWER_PID" 2>/dev/null || die "kwin-viewer died before becoming ready — see $LOG_DIR/kwin-viewer.log"
 info "Preview window open. Ctrl-C to stop."
+
+info "Starting login UI on virtual display..."
+env WAYLAND_DISPLAY="$SOCKET" \
+    XDG_RUNTIME_DIR="$RUNTIME" \
+    DISPLAY="${XWAYLAND_DISPLAY:-}" \
+    "$LOGIN_BIN" 2>"$LOG_DIR/login.log"
+LOGIN_STATUS=$?
+
+if [[ $LOGIN_STATUS -ne 0 ]]; then
+    info "Login UI cancelled or exited with error code $LOGIN_STATUS."
+    exit $LOGIN_STATUS
+fi
+
+info "Login authenticated successfully! Starting user desktop environment..."
 
 if [[ $OPT_NO_PLASMASHELL -eq 0 ]]; then
     info "Starting plasmashell..."
