@@ -313,20 +313,11 @@ rm -f "$RUNTIME/$SOCKET" "$RUNTIME/$SOCKET.lock"
 # Snapshot existing X11 sockets so we can detect the one XWayland creates.
 X11_BEFORE=$(ls /tmp/.X11-unix/ 2>/dev/null | sort)
 
-# Fresh data dir every run so KDE's kscreen config doesn't persist stale output modes.
-rm -rf "$LOG_DIR/kwin-data"
-
-# KDE's kscreen module writes DUMMY0 output config to the real XDG_DATA_HOME even
-# when KWin is isolated, because kscreen's QStandardPaths resolves outside our env.
-# Delete it so KWin doesn't start at a stale resize resolution from the last session.
-grep -rl '"DUMMY0"' ~/.local/share/kscreen/ 2>/dev/null | xargs rm -f 2>/dev/null || true
-
 launch "$LOG_DIR/kwin.log" \
     env -u WAYLAND_DISPLAY -u DISPLAY \
         KWIN_PLATFORM=virtual \
         KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
         XDG_RUNTIME_DIR="$RUNTIME" \
-        XDG_DATA_HOME="$LOG_DIR/kwin-data" \
         PIPEWIRE_REMOTE="$PW_SOCK" \
         kwin_wayland --no-lockscreen --socket "$SOCKET" --xwayland $OPT_KWIN_ARGS
 KWIN_PID=${PIDS[-1]}
@@ -416,8 +407,6 @@ if [[ $OPT_NO_PLASMASHELL -eq 0 ]]; then
     launch "$LOG_DIR/plasmashell.log" \
         env WAYLAND_DISPLAY="$SOCKET" \
             XDG_RUNTIME_DIR="$RUNTIME" \
-            XDG_DATA_HOME="$LOG_DIR/kwin-data" \
-            XDG_CONFIG_HOME="$LOG_DIR/kwin-data/config" \
             PIPEWIRE_REMOTE="$PW_SOCK" \
             DISPLAY="${XWAYLAND_DISPLAY:-}" \
             plasmashell --no-respawn
