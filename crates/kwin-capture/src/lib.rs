@@ -2,6 +2,20 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
 
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO);
+        let ms = now.as_millis() % 1000;
+        let secs = now.as_secs();
+        let h = (secs / 3600) % 24;
+        let m = (secs / 60) % 60;
+        let s = secs % 60;
+        std::eprintln!("[{:02}:{:02}:{:02}.{:03}] {}", h, m, s, ms, format!($($arg)*));
+    }};
+}
+
 use wayland_client::{
     backend::ObjectId,
     protocol::wl_registry,
@@ -415,7 +429,7 @@ fn create_stream(
 
 pub struct CaptureSession {
     node_id:   u32,
-    resize_tx: mpsc::Sender<(i32, i32)>,
+    resize_tx: mpsc::Sender<(i32, i32, mpsc::Sender<()>)>,
 }
 
 impl CaptureSession {
@@ -440,7 +454,7 @@ impl CaptureSession {
         let node_id = create_stream(&mut state, &mut queue, &qh, &conn, width, height, scale)
             .ok_or("virtual output stream failed")?;
 
-        let (resize_tx, resize_rx) = mpsc::channel::<(i32, i32)>();
+        let (resize_tx, resize_rx) = mpsc::channel::<(i32, i32, mpsc::Sender<()>)>();
 
         std::thread::spawn(move || {
             use std::os::fd::{AsFd, AsRawFd};
@@ -464,9 +478,10 @@ impl CaptureSession {
                 conn.flush().ok();
                 queue.dispatch_pending(&mut state).ok();
 
-                while let Ok((w, h)) = resize_rx.try_recv() {
+                while let Ok((w, h, reply_tx)) = resize_rx.try_recv() {
                     eprintln!("capture: resizing to {w}x{h}");
                     set_output_mode(&mut state, &mut queue, &qh, &conn, w, h);
+                    let _ = reply_tx.send(());
                 }
             }
         });
@@ -478,9 +493,12 @@ impl CaptureSession {
         self.node_id
     }
 
-    /// Request the virtual output to change resolution. The GStreamer stream
-    /// continues with the new frame size; no pipeline restart is needed.
+    /// Request the virtual output to change resolution.
+    /// This blocks until the compositor has successfully applied the mode change.
     pub fn resize(&self, w: i32, h: i32) {
-        let _ = self.resize_tx.send((w, h));
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self.resize_tx.send((w, h, reply_tx)).is_ok() {
+            let _ = reply_rx.recv();
+        }
     }
 }

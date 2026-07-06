@@ -1,6 +1,20 @@
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO);
+        let ms = now.as_millis() % 1000;
+        let secs = now.as_secs();
+        let h = (secs / 3600) % 24;
+        let m = (secs / 60) % 60;
+        let s = secs % 60;
+        std::eprintln!("[{:02}:{:02}:{:02}.{:03}] {}", h, m, s, ms, format!($($arg)*));
+    }};
+}
+
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gst::prelude::*;
@@ -236,8 +250,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     let socket_path = std::path::Path::new(&args[1]);
-    let width: i32  = args[2].parse().expect("invalid width");
-    let height: i32 = args[3].parse().expect("invalid height");
+    let mut width: i32  = args[2].parse().expect("invalid width");
+    let mut height: i32 = args[3].parse().expect("invalid height");
+    // Align to 32px grid for encoder efficiency and mode reuse
+    width = ((width + 16) / 32) * 32;
+    height = ((height + 16) / 32) * 32;
+
     let scale: f64  = std::env::var("REDFOG_SCALE").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(1.0);
 
@@ -307,24 +325,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Event::UserEvent(UserEvent::FrameSizeChanged) => {
                 // Snap window to whatever size KDE settled on, read directly from
                 // frame_store to avoid the RedrawRequested → Resized feedback loop.
+                let mut size = (0, 0);
                 {
                     let store = frame_store.lock().unwrap();
                     if let Some(f) = store.as_ref() {
+                        size = (f.width, f.height);
                         let _ = window.request_inner_size(
                             winit::dpi::PhysicalSize::new(f.width, f.height)
                         );
                     }
                 }
+                eprintln!("kwin-viewer: FrameSizeChanged event received (new size: {}x{})", size.0, size.1);
                 // Restart the pipeline so GStreamer renegotiates a fresh buffer pool
                 // with PipeWire at the new resolution; without this, old-size buffers
                 // block PipeWire from delivering new-size frames.
                 // Cooldown prevents a double-restart race when the output settles
                 // through two intermediate sizes (e.g., stale kscreen → correct size).
                 if last_pipeline_restart.elapsed() >= std::time::Duration::from_millis(500) {
+                    eprintln!("kwin-viewer: restarting GStreamer pipeline for new resolution...");
                     last_pipeline_restart = std::time::Instant::now();
                     pipeline.set_state(gst::State::Null).ok();
                     pipeline = make_pipeline(node_id, frame_store.clone(), event_loop_proxy.clone());
                     pipeline.set_state(gst::State::Playing).ok();
+                    eprintln!("kwin-viewer: pipeline restarted and set to PLAYING");
+                } else {
+                    eprintln!("kwin-viewer: pipeline restart throttled (cooldown)");
                 }
                 window.request_redraw();
             }
@@ -381,8 +406,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Debounce window resize.
                 if let Some((w, h, t)) = pending_resize {
                     if t.elapsed() >= std::time::Duration::from_millis(200) {
-                        eprintln!("kwin-viewer: debounce fired — resizing to {}x{}", w, h);
-                        session.resize(w, h);
+                        let snapped_w = ((w + 16) / 32) * 32;
+                        let snapped_h = ((h + 16) / 32) * 32;
+                        eprintln!("kwin-viewer: debounce fired — resizing to {}x{} (snapped from {}x{})", snapped_w, snapped_h, w, h);
+                        session.resize(snapped_w, snapped_h);
+                        
+                        // Restart pipeline immediately since KWin has applied the change
+                        eprintln!("kwin-viewer: KWin resize complete. Restarting GStreamer pipeline...");
+                        last_pipeline_restart = std::time::Instant::now();
+                        pipeline.set_state(gst::State::Null).ok();
+                        pipeline = make_pipeline(node_id, frame_store.clone(), event_loop_proxy.clone());
+                        pipeline.set_state(gst::State::Playing).ok();
+                        eprintln!("kwin-viewer: pipeline restarted and set to PLAYING");
+                        
                         pending_resize = None;
                     }
                     elwt.set_control_flow(ControlFlow::WaitUntil(
