@@ -56,6 +56,7 @@ delegate_noop!(WaylandState: ignore OrgKdeKwinFakeInput);
 #[derive(Debug)]
 enum UserEvent {
     NewFrame,
+    FrameSizeChanged,
 }
 
 struct Frame {
@@ -181,6 +182,53 @@ fn winit_button_to_evdev(btn: MouseButton) -> Option<u32> {
     }
 }
 
+fn make_pipeline(
+    node_id: u32,
+    frame_store: Arc<Mutex<Option<Frame>>>,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+) -> gst::Pipeline {
+    let desc = format!(
+        "pipewiresrc path={node_id} do-timestamp=true \
+         ! videoconvert \
+         ! video/x-raw,format=BGRx \
+         ! appsink name=sink sync=false"
+    );
+    let pipeline = gst::parse_launch(&desc)
+        .expect("pipeline parse failed")
+        .dynamic_cast::<gst::Pipeline>()
+        .unwrap();
+    let appsink = pipeline
+        .by_name("sink").unwrap()
+        .dynamic_cast::<gst_app::AppSink>().unwrap();
+    appsink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                let caps = sample.caps().ok_or(gst::FlowError::Error)?;
+                let s = caps.structure(0).ok_or(gst::FlowError::Error)?;
+                let w = s.get::<i32>("width").map_err(|_| gst::FlowError::Error)? as u32;
+                let h = s.get::<i32>("height").map_err(|_| gst::FlowError::Error)? as u32;
+                let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                let data = map.to_vec();
+                let mut store = frame_store.lock().unwrap();
+                let changed = store.as_ref().map(|f: &Frame| f.width != w || f.height != h).unwrap_or(true);
+                if changed {
+                    eprintln!("kwin-viewer: frame size {}x{}", w, h);
+                }
+                *store = Some(Frame { width: w, height: h, data });
+                if changed {
+                    let _ = proxy.send_event(UserEvent::FrameSizeChanged);
+                } else {
+                    let _ = proxy.send_event(UserEvent::NewFrame);
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    pipeline
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
@@ -222,50 +270,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize GStreamer
     gst::init()?;
 
-    let pipeline_desc = format!(
-        "pipewiresrc path={node_id} do-timestamp=true \
-         ! videoconvert \
-         ! video/x-raw,format=BGRx \
-         ! appsink name=sink sync=false"
-    );
-    let pipeline = gst::parse_launch(&pipeline_desc)?
-        .dynamic_cast::<gst::Pipeline>()
-        .unwrap();
-    let appsink = pipeline
-        .by_name("sink")
-        .unwrap()
-        .dynamic_cast::<gst_app::AppSink>()
-        .unwrap();
-
     let frame_store: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
-    let frame_store_clone = frame_store.clone();
-
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build()?;
     let event_loop_proxy = event_loop.create_proxy();
 
-    appsink.set_callbacks(
-        gst_app::AppSinkCallbacks::builder()
-            .new_sample(move |sink| {
-                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-                let caps = sample.caps().ok_or(gst::FlowError::Error)?;
-                let structure = caps.structure(0).ok_or(gst::FlowError::Error)?;
-                let width = structure.get::<i32>("width").map_err(|_| gst::FlowError::Error)? as u32;
-                let height = structure.get::<i32>("height").map_err(|_| gst::FlowError::Error)? as u32;
-                let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-                let data = map.to_vec();
-                let mut store = frame_store_clone.lock().unwrap();
-                let changed = store.as_ref().map(|f: &Frame| f.width != width || f.height != height).unwrap_or(true);
-                if changed {
-                    eprintln!("kwin-viewer: frame size {}x{}", width, height);
-                }
-                *store = Some(Frame { width, height, data });
-                let _ = event_loop_proxy.send_event(UserEvent::NewFrame);
-                Ok(gst::FlowSuccess::Ok)
-            })
-            .build(),
-    );
-
+    let mut pipeline = make_pipeline(node_id, frame_store.clone(), event_loop_proxy.clone());
     pipeline.set_state(gst::State::Playing)?;
 
     // Signal readiness to proto.sh (read from stdout FIFO).
@@ -283,12 +292,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frame_w = 0u32;
     let mut frame_h = 0u32;
     let mut has_focus = true;
+    let mut pending_resize: Option<(i32, i32, std::time::Instant)> = None;
 
     event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Wait);
 
         match event {
             Event::UserEvent(UserEvent::NewFrame) => {
+                window.request_redraw();
+            }
+            Event::UserEvent(UserEvent::FrameSizeChanged) => {
+                // Restart the pipeline so GStreamer renegotiates a fresh buffer pool
+                // with PipeWire at the new resolution; without this, old-size buffers
+                // block PipeWire from delivering new-size frames.
+                pipeline.set_state(gst::State::Null).ok();
+                pipeline = make_pipeline(node_id, frame_store.clone(), event_loop_proxy.clone());
+                pipeline.set_state(gst::State::Playing).ok();
                 window.request_redraw();
             }
             Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
@@ -304,10 +323,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if frame.width != frame_w || frame.height != frame_h {
                         frame_w = frame.width;
                         frame_h = frame.height;
-                        eprintln!("kwin-viewer: frame {}x{}", frame_w, frame_h);
                         let _ = surface.resize(
                             NonZeroU32::new(frame_w).unwrap(),
                             NonZeroU32::new(frame_h).unwrap(),
+                        );
+                        // Snap the viewer window to whatever size KDE settled on.
+                        let _ = window.request_inner_size(
+                            winit::dpi::PhysicalSize::new(frame_w, frame_h)
                         );
                     }
                     if let Ok(mut buffer) = surface.buffer_mut() {
@@ -324,10 +346,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::WindowEvent { event: WindowEvent::Resized(size), .. } => {
                 if size.width > 0 && size.height > 0 {
-                    // Align to 8px: KDE aligns mode widths to multiples of 8.
-                    let w = ((size.width / 8) * 8) as i32;
+                    let w = size.width as i32;
                     let h = size.height as i32;
-                    session.resize(w, h);
+                    eprintln!("kwin-viewer: window Resized {}x{} → queuing resize {}x{}", size.width, size.height, w, h);
+                    pending_resize = Some((w, h, std::time::Instant::now()));
+                    elwt.set_control_flow(ControlFlow::WaitUntil(
+                        std::time::Instant::now() + std::time::Duration::from_millis(50),
+                    ));
+                }
+            }
+            Event::AboutToWait => {
+                // Debounce window resize.
+                if let Some((w, h, t)) = pending_resize {
+                    if t.elapsed() >= std::time::Duration::from_millis(200) {
+                        eprintln!("kwin-viewer: debounce fired — resizing to {}x{}", w, h);
+                        session.resize(w, h);
+                        pending_resize = None;
+                    }
+                    elwt.set_control_flow(ControlFlow::WaitUntil(
+                        std::time::Instant::now() + std::time::Duration::from_millis(50),
+                    ));
                 }
             }
             Event::WindowEvent { event: WindowEvent::Focused(focused), .. } => {
@@ -336,13 +374,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Event::WindowEvent { event: WindowEvent::CursorLeft { .. }, .. } => {}
             Event::WindowEvent { event: WindowEvent::CursorMoved { position, .. }, .. } => {
                 if has_focus && frame_w > 0 && frame_h > 0 {
-                    let w_size = window.inner_size();
-                    if w_size.width > 0 && w_size.height > 0 {
-                        let rx = (position.x / w_size.width as f64) * frame_w as f64;
-                        let ry = (position.y / w_size.height as f64) * frame_h as f64;
-                        fake_input.pointer_motion_absolute(rx, ry);
-                        let _ = fi_conn.flush();
-                    }
+                    // Clamp to frame bounds — window may briefly be larger than the
+                    // frame if request_inner_size hasn't been honored by the compositor yet.
+                    let rx = position.x.clamp(0.0, frame_w as f64 - 1.0);
+                    let ry = position.y.clamp(0.0, frame_h as f64 - 1.0);
+                    fake_input.pointer_motion_absolute(rx, ry);
+                    let _ = fi_conn.flush();
                 }
             }
             Event::WindowEvent { event: WindowEvent::MouseInput { state, button, .. }, .. } => {

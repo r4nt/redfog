@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use wayland_client::{
+    backend::ObjectId,
     protocol::wl_registry,
     Connection, Dispatch, Proxy, QueueHandle,
 };
@@ -11,99 +12,86 @@ use wayland_protocols_plasma::screencast::v1::client::{
     zkde_screencast_unstable_v1::{self, ZkdeScreencastUnstableV1},
 };
 
-// Generated client bindings for kde-output-device-v2.
-mod kde_output_device_v2 {
-    #![allow(dead_code, non_camel_case_types, unused_unsafe, unused_variables,
-             non_upper_case_globals, non_snake_case, unused_imports, missing_docs,
-             clippy::all)]
-    pub mod client {
-        use wayland_client;
-        use wayland_client::protocol::*;
+// ── local protocol bindings from system v21 XMLs ─────────────────────────────
+//
+// Layout rationale:
+//   - device and management XMLs each need their own __interfaces module to avoid
+//     SyncWrapper/types_null conflicts when two generate_interfaces! calls share a module.
+//   - management's generate_client_code! references `super::kde_output_device_v2`, so
+//     the device client code must be generated one level above management's client code.
+//   - Concretely: device client types live in `kde_protocols`, management types in
+//     `kde_protocols::mgmt_client` where `super` == `kde_protocols` == device namespace.
+
+// ── local protocol bindings from system v21 XMLs ─────────────────────────────
+//
+// Both generate_client_code! calls must be in the same module (kde_protocols).
+// The management XML's generated code does `super::kde_output_device_v2::Foo`
+// where super is the module containing the generated modules — i.e. kde_protocols.
+// Device client code is generated there first so the reference resolves.
+//
+// generate_interfaces! conflicts (SyncWrapper, types_null) are avoided by putting
+// each protocol's interfaces in a private sub-module that is then star-imported.
+
+mod kde_protocols {
+    #![allow(
+        dead_code, non_camel_case_types, unused_unsafe, unused_variables,
+        non_upper_case_globals, non_snake_case, unused_imports, missing_docs,
+        clippy::all
+    )]
+    use wayland_client;
+    use wayland_client::protocol::*;
+    use wayland_backend;
+
+    mod device_ifaces {
+        use wayland_client::protocol::__interfaces::*;
         use wayland_backend;
-        use bitflags;
-        pub mod __interfaces {
-            use wayland_client::protocol::__interfaces::*;
-            use wayland_backend;
-            wayland_scanner::generate_interfaces!("protocols/kde-output-device-v2.xml");
-        }
-        use self::__interfaces::*;
-        wayland_scanner::generate_client_code!("protocols/kde-output-device-v2.xml");
+        wayland_scanner::generate_interfaces!("protocols/kde-output-device-v2.xml");
     }
-}
-
-// Generated client bindings for kde-output-management-v2 (depends on device types).
-mod kde_output_management_v2 {
-    #![allow(dead_code, non_camel_case_types, unused_unsafe, unused_variables,
-             non_upper_case_globals, non_snake_case, unused_imports, missing_docs,
-             clippy::all)]
-    pub mod client {
-        use wayland_client;
-        use wayland_client::protocol::*;
+    mod management_ifaces {
+        use wayland_client::protocol::__interfaces::*;
         use wayland_backend;
-        use bitflags;
-        use super::super::kde_output_device_v2::client::*;
-        pub mod __interfaces {
-            use wayland_client::protocol::__interfaces::*;
-            use wayland_backend;
-            use super::super::super::kde_output_device_v2::client::__interfaces::*;
-            wayland_scanner::generate_interfaces!("protocols/kde-output-management-v2.xml");
-        }
-        use self::__interfaces::*;
-        wayland_scanner::generate_client_code!("protocols/kde-output-management-v2.xml");
+        pub use super::device_ifaces::*;
+        wayland_scanner::generate_interfaces!("protocols/kde-output-management-v2.xml");
     }
+
+    use self::device_ifaces::*;
+    use self::management_ifaces::*;
+
+    // Both generate_client_code! in the same module.
+    // Device generates: pub mod kde_output_device_v2, pub mod kde_output_device_mode_v2
+    // Management then finds them as super::kde_output_device_v2 from inside its sub-modules.
+    wayland_scanner::generate_client_code!("protocols/kde-output-device-v2.xml");
+    wayland_scanner::generate_client_code!("protocols/kde-output-management-v2.xml");
 }
 
-use kde_output_device_v2::client::{
-    kde_output_device_registry_v2::KdeOutputDeviceRegistryV2,
-    kde_output_device_v2::{self as dev_ev, KdeOutputDeviceV2},
-    kde_output_device_mode_v2::{self as mode_ev, KdeOutputDeviceModeV2},
+use kde_protocols::{
+    kde_output_device_mode_v2::{self, KdeOutputDeviceModeV2},
+    kde_output_device_v2::{self, KdeOutputDeviceV2},
+    kde_output_device_registry_v2::{self, KdeOutputDeviceRegistryV2},
+    kde_mode_list_v2::{self, KdeModeListV2},
+    kde_output_configuration_v2::{self, KdeOutputConfigurationV2},
+    kde_output_management_v2::{self, KdeOutputManagementV2},
 };
-use kde_output_management_v2::client::{
-    kde_output_configuration_v2::{self as cfg_ev, KdeOutputConfigurationV2},
-    kde_output_management_v2::KdeOutputManagementV2,
-    kde_mode_list_v2::KdeModeListV2,
-};
-
-// ── output info ───────────────────────────────────────────────────────────────
-
-struct ModeInfo {
-    proxy: KdeOutputDeviceModeV2,
-    w: i32,
-    h: i32,
-}
-
-struct OutputInfo {
-    proxy: KdeOutputDeviceV2,
-    name:  Option<String>,
-    modes: Vec<ModeInfo>,
-}
-
-// ── resize state machine ──────────────────────────────────────────────────────
-
-#[derive(Default)]
-enum ResizePhase {
-    #[default]
-    Idle,
-    AddingMode { target_w: i32, target_h: i32, waiting_for_mode: bool },
-    SelectingMode,
-}
 
 // ── state ─────────────────────────────────────────────────────────────────────
 
 struct State {
-    screencast:         Option<ZkdeScreencastUnstableV1>,
-    _stream:            Option<ZkdeScreencastStreamUnstableV1>,
-    node_id:            Option<u32>,
-    stream_done:        bool,
-
-    output_registry:    Option<KdeOutputDeviceRegistryV2>,
-    output_management:  Option<KdeOutputManagementV2>,
-    outputs:            HashMap<wayland_client::backend::ObjectId, OutputInfo>,
-
-    our_output_name:    String,
-
-    resize_phase:       ResizePhase,
-    pending_config:     Option<KdeOutputConfigurationV2>,
+    // Screencast
+    screencast:      Option<ZkdeScreencastUnstableV1>,
+    _stream:         Option<ZkdeScreencastStreamUnstableV1>,
+    node_id:         Option<u32>,
+    stream_done:     bool,
+    our_output_name: String,
+    // Output management
+    output_management:    Option<KdeOutputManagementV2>,
+    _device_registry:     Option<KdeOutputDeviceRegistryV2>,
+    _all_devices:         Vec<KdeOutputDeviceV2>, // keep-alive; devices come from device_registry
+    our_device:           Option<KdeOutputDeviceV2>,
+    /// (proxy, width, height) keyed by ObjectId; width/height populated on Size event
+    modes:             HashMap<ObjectId, (KdeOutputDeviceModeV2, i32, i32)>,
+    current_mode_id:   Option<ObjectId>,
+    device_done:       bool,
+    config_done:       bool,
 }
 
 impl State {
@@ -113,90 +101,15 @@ impl State {
             _stream: None,
             node_id: None,
             stream_done: false,
-            output_registry: None,
-            output_management: None,
-            outputs: HashMap::new(),
             our_output_name: name.into(),
-            resize_phase: ResizePhase::Idle,
-            pending_config: None,
-        }
-    }
-
-    fn our_output(&self) -> Option<&OutputInfo> {
-        let target = format!("Virtual-{}", self.our_output_name);
-        self.outputs.values().find(|o| o.name.as_deref() == Some(target.as_str()))
-    }
-
-    fn start_resize(&mut self, qh: &QueueHandle<Self>, w: i32, h: i32) {
-        let Some(mgmt) = &self.output_management else {
-            eprintln!("resize: kde_output_management_v2 not available");
-            return;
-        };
-        let Some(out) = self.our_output() else {
-            eprintln!("resize: virtual output not found yet");
-            return;
-        };
-
-        eprintln!("resize: sending set_custom_modes + apply for {w}x{h}");
-
-        let mode_list = mgmt.create_mode_list(qh, ());
-        mode_list.set_resolution(w as u32, h as u32);
-        mode_list.set_refresh_rate(60_000);
-        mode_list.add_mode();
-
-        let config = mgmt.create_configuration(qh, ());
-        config.set_custom_modes(&out.proxy, &mode_list);
-        config.apply();
-
-        self.pending_config = Some(config);
-        self.resize_phase = ResizePhase::AddingMode { target_w: w, target_h: h, waiting_for_mode: false };
-    }
-
-    fn try_advance_to_phase2(&mut self, qh: &QueueHandle<Self>) {
-        let ResizePhase::AddingMode { target_w, target_h, .. } = self.resize_phase else { return };
-
-        let Some(out) = self.our_output() else { return };
-        let available: Vec<_> = out.modes.iter().map(|m| (m.w, m.h)).collect();
-        eprintln!("resize: phase1 done; available modes: {available:?}, target: {target_w}x{target_h}");
-
-        let Some(mode) = out.modes.iter().find(|m| m.w == target_w && m.h == target_h) else {
-            eprintln!("resize: {target_w}x{target_h} not yet in mode list, waiting");
-            if let ResizePhase::AddingMode { ref mut waiting_for_mode, .. } = self.resize_phase {
-                *waiting_for_mode = true;
-            }
-            return;
-        };
-
-        eprintln!("resize: selecting {target_w}x{target_h}");
-        let Some(mgmt) = &self.output_management else { return };
-        let config = mgmt.create_configuration(qh, ());
-        config.mode(&out.proxy, &mode.proxy);
-        config.apply();
-
-        self.pending_config = Some(config);
-        self.resize_phase = ResizePhase::SelectingMode;
-    }
-
-    fn on_config_event(&mut self, ok: bool) {
-        eprintln!("resize: config event ok={ok} phase={}", match self.resize_phase {
-            ResizePhase::Idle => "Idle",
-            ResizePhase::AddingMode { .. } => "AddingMode",
-            ResizePhase::SelectingMode => "SelectingMode",
-        });
-        match self.resize_phase {
-            ResizePhase::AddingMode { .. } => {
-                self.pending_config = None;
-                if !ok {
-                    eprintln!("resize: set_custom_modes failed");
-                    self.resize_phase = ResizePhase::Idle;
-                }
-            }
-            ResizePhase::SelectingMode => {
-                self.pending_config = None;
-                self.resize_phase = ResizePhase::Idle;
-                if ok { eprintln!("resize: done"); } else { eprintln!("resize: select failed"); }
-            }
-            ResizePhase::Idle => {}
+            output_management: None,
+            _device_registry: None,
+            _all_devices: Vec::new(),
+            our_device: None,
+            modes: HashMap::new(),
+            current_mode_id: None,
+            device_done: false,
+            config_done: false,
         }
     }
 }
@@ -207,13 +120,21 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
     fn event(state: &mut Self, registry: &wl_registry::WlRegistry, event: wl_registry::Event,
              _: &(), _: &Connection, qh: &QueueHandle<Self>) {
         let wl_registry::Event::Global { name, interface, version } = event else { return };
+        eprintln!("capture: registry global: {interface} v{version}");
         match interface.as_str() {
-            "zkde_screencast_unstable_v1" =>
-                state.screencast = Some(registry.bind(name, version.min(4), qh, ())),
-            "kde_output_device_registry_v2" if version >= 21 =>
-                state.output_registry = Some(registry.bind(name, version.min(23), qh, ())),
-            "kde_output_management_v2" if version >= 18 =>
-                state.output_management = Some(registry.bind(name, version.min(21), qh, ())),
+            "zkde_screencast_unstable_v1" => {
+                state.screencast = Some(registry.bind(name, version.min(4), qh, ()));
+            }
+            "kde_output_management_v2" => {
+                eprintln!("capture: binding kde_output_management_v2 v{}", version.min(18));
+                state.output_management = Some(registry.bind(name, version.min(18), qh, ()));
+            }
+            // In KWin v21+, devices come via kde_output_device_registry_v2.output() events,
+            // not as individual Wayland globals. Bind the registry to receive them.
+            "kde_output_device_registry_v2" => {
+                eprintln!("capture: binding kde_output_device_registry_v2 v{}", version.min(21));
+                state._device_registry = Some(registry.bind(name, version.min(21), qh, ()));
+            }
             _ => {}
         }
     }
@@ -230,88 +151,111 @@ impl Dispatch<ZkdeScreencastStreamUnstableV1, ()> for State {
              _: &(), _: &Connection, _: &QueueHandle<Self>) {
         match event {
             zkde_screencast_stream_unstable_v1::Event::Created { node } => {
-                state.node_id = Some(node); state.stream_done = true;
+                eprintln!("capture: stream created, node={node}");
+                state.node_id = Some(node);
+                state.stream_done = true;
             }
             zkde_screencast_stream_unstable_v1::Event::Failed { error } => {
-                eprintln!("stream failed: {error}"); state.stream_done = true;
+                eprintln!("capture: stream failed: {error}");
+                state.stream_done = true;
             }
             _ => {}
-        }
-    }
-}
-
-impl Dispatch<KdeOutputDeviceRegistryV2, ()> for State {
-    fn event(state: &mut Self, _: &KdeOutputDeviceRegistryV2,
-             event: kde_output_device_v2::client::kde_output_device_registry_v2::Event,
-             _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        use kde_output_device_v2::client::kde_output_device_registry_v2::Event;
-        if let Event::Output { output } = event {
-            state.outputs.insert(output.id(), OutputInfo { proxy: output, name: None, modes: vec![] });
-        }
-    }
-
-    wayland_client::event_created_child!(State, KdeOutputDeviceRegistryV2, [
-        1 => (KdeOutputDeviceV2, ())
-    ]);
-}
-
-impl Dispatch<KdeOutputDeviceV2, ()> for State {
-    fn event(state: &mut Self, proxy: &KdeOutputDeviceV2, event: dev_ev::Event,
-             _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        let id = proxy.id();
-        match event {
-            dev_ev::Event::Name { name } => {
-                if let Some(info) = state.outputs.get_mut(&id) { info.name = Some(name); }
-            }
-            dev_ev::Event::Mode { mode } => {
-                if let Some(info) = state.outputs.get_mut(&id) {
-                    info.modes.push(ModeInfo { proxy: mode, w: 0, h: 0 });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    wayland_client::event_created_child!(State, KdeOutputDeviceV2, [
-        2 => (KdeOutputDeviceModeV2, ())
-    ]);
-}
-
-impl Dispatch<KdeOutputDeviceModeV2, ()> for State {
-    fn event(state: &mut Self, proxy: &KdeOutputDeviceModeV2, event: mode_ev::Event,
-             _: &(), _: &Connection, qh: &QueueHandle<Self>) {
-        if let mode_ev::Event::Size { width, height } = event {
-            let (w, h) = (width as i32, height as i32);
-            for info in state.outputs.values_mut() {
-                for m in &mut info.modes {
-                    if m.proxy.id() == proxy.id() { m.w = w; m.h = h; }
-                }
-            }
-            if let ResizePhase::AddingMode { target_w, target_h, waiting_for_mode: true } = state.resize_phase {
-                if w == target_w && h == target_h {
-                    state.try_advance_to_phase2(qh);
-                }
-            }
         }
     }
 }
 
 impl Dispatch<KdeOutputManagementV2, ()> for State {
     fn event(_: &mut Self, _: &KdeOutputManagementV2,
-             _: kde_output_management_v2::client::kde_output_management_v2::Event,
-             _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+             _: kde_output_management_v2::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<KdeOutputDeviceRegistryV2, ()> for State {
+    fn event(state: &mut Self, _: &KdeOutputDeviceRegistryV2,
+             event: kde_output_device_registry_v2::Event,
+             _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            kde_output_device_registry_v2::Event::Output { output } => {
+                eprintln!("capture: device_registry output event → new device");
+                state._all_devices.push(output);
+            }
+            _ => {}
+        }
+    }
+
+    // output event (opcode 1) creates a kde_output_device_v2 child object.
+    wayland_client::event_created_child!(State, KdeOutputDeviceRegistryV2, [
+        1 => (KdeOutputDeviceV2, ()),
+    ]);
+}
+
+impl Dispatch<KdeOutputDeviceV2, ()> for State {
+    fn event(state: &mut Self, proxy: &KdeOutputDeviceV2, event: kde_output_device_v2::Event,
+             _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            kde_output_device_v2::Event::Name { name } => {
+                eprintln!("capture: device Name={name}");
+                // KWin prefixes "Virtual-" to stream_virtual_output names.
+                if name == state.our_output_name || name.contains(&*state.our_output_name) {
+                    eprintln!("capture: matched our device");
+                    state.our_device = Some(proxy.clone());
+                }
+            }
+            kde_output_device_v2::Event::Mode { mode } => {
+                let id = mode.id();
+                eprintln!("capture: device Mode id={id:?}");
+                state.modes.insert(id, (mode, 0, 0));
+            }
+            kde_output_device_v2::Event::CurrentMode { mode } => {
+                eprintln!("capture: device CurrentMode id={:?}", mode.id());
+                state.current_mode_id = Some(mode.id());
+            }
+            kde_output_device_v2::Event::Done => {
+                eprintln!("capture: device Done (is_ours={})",
+                    state.our_device.as_ref().map(|d| d.id() == proxy.id()).unwrap_or(false));
+                if state.our_device.as_ref().map(|d| d.id() == proxy.id()).unwrap_or(false) {
+                    state.device_done = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // mode event (opcode 2) creates a kde_output_device_mode_v2 child object.
+    wayland_client::event_created_child!(State, KdeOutputDeviceV2, [
+        2 => (KdeOutputDeviceModeV2, ()),
+    ]);
+}
+
+impl Dispatch<KdeOutputDeviceModeV2, ()> for State {
+    fn event(state: &mut Self, proxy: &KdeOutputDeviceModeV2,
+             event: kde_output_device_mode_v2::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            kde_output_device_mode_v2::Event::Size { width, height } => {
+                if let Some(entry) = state.modes.get_mut(&proxy.id()) {
+                    entry.1 = width;
+                    entry.2 = height;
+                }
+            }
+            kde_output_device_mode_v2::Event::Removed => {
+                state.modes.remove(&proxy.id());
+                if state.current_mode_id == Some(proxy.id()) {
+                    state.current_mode_id = None;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Dispatch<KdeOutputConfigurationV2, ()> for State {
-    fn event(state: &mut Self, _: &KdeOutputConfigurationV2, event: cfg_ev::Event,
-             _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+    fn event(state: &mut Self, _: &KdeOutputConfigurationV2,
+             event: kde_output_configuration_v2::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         match event {
-            cfg_ev::Event::Applied => {
-                let was_phase1 = matches!(state.resize_phase, ResizePhase::AddingMode { .. });
-                state.on_config_event(true);
-                if was_phase1 { state.try_advance_to_phase2(qh); }
+            kde_output_configuration_v2::Event::Applied => { state.config_done = true; }
+            kde_output_configuration_v2::Event::Failed => {
+                eprintln!("capture: output configuration failed");
+                state.config_done = true;
             }
-            cfg_ev::Event::Failed => state.on_config_event(false),
             _ => {}
         }
     }
@@ -319,21 +263,147 @@ impl Dispatch<KdeOutputConfigurationV2, ()> for State {
 
 impl Dispatch<KdeModeListV2, ()> for State {
     fn event(_: &mut Self, _: &KdeModeListV2,
-             _: kde_output_management_v2::client::kde_mode_list_v2::Event,
-             _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+             _: kde_mode_list_v2::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn pump(state: &mut State, queue: &mut wayland_client::EventQueue<State>, conn: &Connection) {
+    conn.flush().unwrap();
+    queue.blocking_dispatch(state).ok();
+}
+
+/// Find a mode whose dimensions are within 8px of (w, h). KDE may snap widths.
+fn find_mode(modes: &HashMap<ObjectId, (KdeOutputDeviceModeV2, i32, i32)>, w: i32, h: i32)
+    -> Option<KdeOutputDeviceModeV2>
+{
+    modes.values()
+        .filter(|(_, mw, mh)| *mw > 0 && *mh > 0)
+        .find(|(_, mw, mh)| (*mw - w).abs() <= 1 && (*mh - h).abs() <= 1)
+        .map(|(proxy, _, _)| proxy.clone())
+}
+
+/// Apply a mode change on the virtual output. Two-step when the mode doesn't exist yet:
+/// set_custom_modes (replaces any prior custom mode) then mode() (activates it).
+fn set_output_mode(
+    state: &mut State,
+    queue: &mut wayland_client::EventQueue<State>,
+    qh: &QueueHandle<State>,
+    conn: &Connection,
+    w: i32,
+    h: i32,
+) {
+    let (Some(device), Some(mgmt)) = (state.our_device.clone(), state.output_management.clone())
+    else {
+        eprintln!("capture: set_output_mode: no device or management object");
+        return;
+    };
+
+    // Skip if current mode already matches.
+    let already_correct = state.current_mode_id
+        .as_ref()
+        .and_then(|id| state.modes.get(id))
+        .map(|(_, mw, mh)| (*mw - w).abs() <= 1 && (*mh - h).abs() <= 1)
+        .unwrap_or(false);
+    if already_correct {
+        return;
+    }
+
+    // If no existing mode matches, add a custom one (set_custom_modes replaces any prior).
+    let target = if let Some(m) = find_mode(&state.modes, w, h) {
+        m
+    } else {
+        let pre_ids: std::collections::HashSet<ObjectId> = state.modes.keys().cloned().collect();
+
+        let mode_list = mgmt.create_mode_list(qh, ());
+        mode_list.set_resolution(w as u32, h as u32);
+        mode_list.set_refresh_rate(60_000);
+        mode_list.add_mode();
+
+        let config = mgmt.create_configuration(qh, ());
+        config.set_custom_modes(&device, &mode_list);
+        config.apply();
+        conn.flush().unwrap();
+
+        // Wait for applied; device updates (Removed + new Mode + Size events) arrive first.
+        state.config_done = false;
+        while !state.config_done { pump(state, queue, conn); }
+
+        match state.modes.iter()
+            .filter(|(id, _)| !pre_ids.contains(*id))
+            .find(|(_, (_, mw, mh))| *mw > 0 && *mh > 0)
+            .map(|(_, (proxy, _, _))| proxy.clone())
+        {
+            Some(m) => m,
+            None => {
+                eprintln!("capture: custom mode {w}x{h} not found after set_custom_modes");
+                return;
+            }
+        }
+    };
+
+    // Activate the target mode.
+    let config = mgmt.create_configuration(qh, ());
+    config.mode(&device, &target);
+    config.apply();
+    conn.flush().unwrap();
+
+    state.config_done = false;
+    while !state.config_done { pump(state, queue, conn); }
+}
+
+fn create_stream(
+    state: &mut State,
+    queue: &mut wayland_client::EventQueue<State>,
+    qh: &QueueHandle<State>,
+    conn: &Connection,
+    w: i32,
+    h: i32,
+    scale: f64,
+) -> Option<u32> {
+    state._stream = None;
+    conn.flush().unwrap();
+    queue.roundtrip(state).ok()?;
+
+    eprintln!("capture: calling stream_virtual_output({}, {w}x{h})", state.our_output_name);
+    let stream = {
+        let screencast = state.screencast.as_ref()?;
+        screencast.stream_virtual_output(
+            state.our_output_name.clone(),
+            w, h, scale,
+            zkde_screencast_unstable_v1::Pointer::Hidden as u32,
+            qh, (),
+        )
+    };
+    state._stream = Some(stream);
+    state.node_id = None;
+    state.stream_done = false;
+    state.our_device = None;
+    state.device_done = false;
+    state.current_mode_id = None;
+    conn.flush().unwrap();
+
+    eprintln!("capture: waiting for stream+device (stream_done={} device={} device_done={})",
+        state.stream_done, state.our_device.is_some(), state.device_done);
+    // Wait for PipeWire node AND output device to be fully described.
+    while !state.stream_done || state.our_device.is_none() || !state.device_done {
+        pump(state, queue, conn);
+    }
+    eprintln!("capture: stream+device ready, node={:?}", state.node_id);
+
+    set_output_mode(state, queue, qh, conn, w, h);
+
+    state.node_id
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
 
 pub struct CaptureSession {
-    node_id: u32,
+    node_id:   u32,
     resize_tx: mpsc::Sender<(i32, i32)>,
 }
 
 impl CaptureSession {
-    /// Connect to the headless KWin at `socket_path`, create a virtual output of
-    /// `width x height` at `scale`, and return once the PipeWire node is ready.
-    /// A background thread keeps the Wayland connection and resize state machine alive.
     pub fn connect(
         socket_path: &Path,
         output_name: &str,
@@ -352,51 +422,37 @@ impl CaptureSession {
         let mut state = State::new(output_name);
         queue.roundtrip(&mut state)?;
 
-        let stream_proxy = {
-            let screencast = state.screencast.as_ref()
-                .ok_or("zkde_screencast_unstable_v1 not available — is this KWin?")?;
-            screencast.stream_virtual_output(
-                output_name.to_string(),
-                width, height, scale,
-                zkde_screencast_unstable_v1::Pointer::Hidden as u32,
-                &qh, (),
-            )
-        };
-        state._stream = Some(stream_proxy);
-        conn.flush()?;
+        let node_id = create_stream(&mut state, &mut queue, &qh, &conn, width, height, scale)
+            .ok_or("virtual output stream failed")?;
 
-        while !state.stream_done {
-            queue.blocking_dispatch(&mut state)?;
-        }
-        let node_id = state.node_id.ok_or("virtual output stream failed")?;
-
-        let (tx, rx) = mpsc::channel::<(i32, i32)>();
+        let (resize_tx, resize_rx) = mpsc::channel::<(i32, i32)>();
 
         std::thread::spawn(move || {
             loop {
-                if let Some(guard) = queue.prepare_read() {
-                    let _ = guard.read();
-                }
-                queue.dispatch_pending(&mut state).expect("Wayland dispatch error");
-                conn.flush().unwrap();
+                // Dispatch any buffered compositor events without blocking on socket read.
+                // Blocking reads happen inside set_output_mode's wait loops; here we only
+                // need to keep the queue drained so stale events don't accumulate.
+                conn.flush().ok();
+                queue.dispatch_pending(&mut state).ok();
 
-                while let Ok((w, h)) = rx.try_recv() {
-                    eprintln!("resize: requested {w}x{h}");
-                    state.start_resize(&qh, w, h);
-                    conn.flush().unwrap();
+                while let Ok((w, h)) = resize_rx.try_recv() {
+                    eprintln!("capture: resizing to {w}x{h}");
+                    set_output_mode(&mut state, &mut queue, &qh, &conn, w, h);
                 }
 
                 std::thread::sleep(std::time::Duration::from_millis(8));
             }
         });
 
-        Ok(CaptureSession { node_id, resize_tx: tx })
+        Ok(CaptureSession { node_id, resize_tx })
     }
 
     pub fn node_id(&self) -> u32 {
         self.node_id
     }
 
+    /// Request the virtual output to change resolution. The GStreamer stream
+    /// continues with the new frame size; no pipeline restart is needed.
     pub fn resize(&self, w: i32, h: i32) {
         let _ = self.resize_tx.send((w, h));
     }
