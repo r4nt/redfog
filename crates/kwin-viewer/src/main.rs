@@ -293,6 +293,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frame_h = 0u32;
     let mut has_focus = true;
     let mut pending_resize: Option<(i32, i32, std::time::Instant)> = None;
+    let mut last_pipeline_restart = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
 
     event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Wait);
@@ -302,12 +305,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 window.request_redraw();
             }
             Event::UserEvent(UserEvent::FrameSizeChanged) => {
+                // Snap window to whatever size KDE settled on, read directly from
+                // frame_store to avoid the RedrawRequested → Resized feedback loop.
+                {
+                    let store = frame_store.lock().unwrap();
+                    if let Some(f) = store.as_ref() {
+                        let _ = window.request_inner_size(
+                            winit::dpi::PhysicalSize::new(f.width, f.height)
+                        );
+                    }
+                }
                 // Restart the pipeline so GStreamer renegotiates a fresh buffer pool
                 // with PipeWire at the new resolution; without this, old-size buffers
                 // block PipeWire from delivering new-size frames.
-                pipeline.set_state(gst::State::Null).ok();
-                pipeline = make_pipeline(node_id, frame_store.clone(), event_loop_proxy.clone());
-                pipeline.set_state(gst::State::Playing).ok();
+                // Cooldown prevents a double-restart race when the output settles
+                // through two intermediate sizes (e.g., stale kscreen → correct size).
+                if last_pipeline_restart.elapsed() >= std::time::Duration::from_millis(500) {
+                    last_pipeline_restart = std::time::Instant::now();
+                    pipeline.set_state(gst::State::Null).ok();
+                    pipeline = make_pipeline(node_id, frame_store.clone(), event_loop_proxy.clone());
+                    pipeline.set_state(gst::State::Playing).ok();
+                }
                 window.request_redraw();
             }
             Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
@@ -326,10 +344,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = surface.resize(
                             NonZeroU32::new(frame_w).unwrap(),
                             NonZeroU32::new(frame_h).unwrap(),
-                        );
-                        // Snap the viewer window to whatever size KDE settled on.
-                        let _ = window.request_inner_size(
-                            winit::dpi::PhysicalSize::new(frame_w, frame_h)
                         );
                     }
                     if let Ok(mut buffer) = surface.buffer_mut() {

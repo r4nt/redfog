@@ -237,6 +237,9 @@ impl Dispatch<KdeOutputDeviceModeV2, ()> for State {
                 }
             }
             kde_output_device_mode_v2::Event::Removed => {
+                eprintln!("capture: mode Removed {:?} (size was {:?})",
+                    proxy.id(),
+                    state.modes.get(&proxy.id()).map(|(_, w, h)| (*w, *h)));
                 state.modes.remove(&proxy.id());
                 if state.current_mode_id == Some(proxy.id()) {
                     state.current_mode_id = None;
@@ -269,7 +272,7 @@ impl Dispatch<KdeModeListV2, ()> for State {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn pump(state: &mut State, queue: &mut wayland_client::EventQueue<State>, conn: &Connection) {
-    conn.flush().unwrap();
+    conn.flush().ok();
     queue.blocking_dispatch(state).ok();
 }
 
@@ -323,15 +326,17 @@ fn set_output_mode(
         let config = mgmt.create_configuration(qh, ());
         config.set_custom_modes(&device, &mode_list);
         config.apply();
-        conn.flush().unwrap();
+        conn.flush().ok();
 
         // Wait for applied; device updates (Removed + new Mode + Size events) arrive first.
         state.config_done = false;
         while !state.config_done { pump(state, queue, conn); }
 
+        // KDE may create several new mode objects (e.g. a re-added standard mode
+        // alongside the custom one). Pick the new mode closest to what we asked for.
         match state.modes.iter()
-            .filter(|(id, _)| !pre_ids.contains(*id))
-            .find(|(_, (_, mw, mh))| *mw > 0 && *mh > 0)
+            .filter(|(id, (_, mw, mh))| !pre_ids.contains(*id) && *mw > 0 && *mh > 0)
+            .min_by_key(|(_, (_, mw, mh))| (*mw - w).abs() + (*mh - h).abs())
             .map(|(_, (proxy, _, _))| proxy.clone())
         {
             Some(m) => m,
@@ -346,7 +351,7 @@ fn set_output_mode(
     let config = mgmt.create_configuration(qh, ());
     config.mode(&device, &target);
     config.apply();
-    conn.flush().unwrap();
+    conn.flush().ok();
 
     state.config_done = false;
     while !state.config_done { pump(state, queue, conn); }
@@ -362,7 +367,7 @@ fn create_stream(
     scale: f64,
 ) -> Option<u32> {
     state._stream = None;
-    conn.flush().unwrap();
+    conn.flush().ok();
     queue.roundtrip(state).ok()?;
 
     eprintln!("capture: calling stream_virtual_output({}, {w}x{h})", state.our_output_name);
@@ -381,7 +386,7 @@ fn create_stream(
     state.our_device = None;
     state.device_done = false;
     state.current_mode_id = None;
-    conn.flush().unwrap();
+    conn.flush().ok();
 
     eprintln!("capture: waiting for stream+device (stream_done={} device={} device_done={})",
         state.stream_done, state.our_device.is_some(), state.device_done);
@@ -389,6 +394,9 @@ fn create_stream(
     while !state.stream_done || state.our_device.is_none() || !state.device_done {
         pump(state, queue, conn);
     }
+    // Size events arrive after Mode events in a subsequent roundtrip; flush them now
+    // so find_mode sees populated sizes and doesn't needlessly call set_custom_modes.
+    queue.roundtrip(state).ok();
     eprintln!("capture: stream+device ready, node={:?}", state.node_id);
 
     set_output_mode(state, queue, qh, conn, w, h);
