@@ -69,6 +69,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         default_height: 1080,
         default_fps: 60,
         handler: session_manager.clone(),
+        session_id: format!("{:016X}", rand::random::<u64>()),
     });
 
     let control_server = ControlServer {

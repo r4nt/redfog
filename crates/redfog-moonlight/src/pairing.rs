@@ -91,12 +91,13 @@ impl PairingServer {
                     continue;
                 }
             };
+            let local_addr = stream.local_addr().unwrap_or(std::net::SocketAddr::new(bind_addr, self.http_port));
             let this = self.clone();
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let service = service_fn(move |req| {
                     let this = this.clone();
-                    async move { Ok::<_, Infallible>(this.handle(req, peer, false).await) }
+                    async move { Ok::<_, Infallible>(this.handle(req, peer, local_addr, false).await) }
                 });
                 if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
                     tracing::debug!("http connection from {peer} ended: {e}");
@@ -135,6 +136,7 @@ impl PairingServer {
                     continue;
                 }
             };
+            let local_addr = stream.local_addr().unwrap_or(std::net::SocketAddr::new(bind_addr, self.https_port));
             let this = self.clone();
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
@@ -148,7 +150,7 @@ impl PairingServer {
                 let io = TokioIo::new(tls_stream);
                 let service = service_fn(move |req| {
                     let this = this.clone();
-                    async move { Ok::<_, Infallible>(this.handle(req, peer, true).await) }
+                    async move { Ok::<_, Infallible>(this.handle(req, peer, local_addr, true).await) }
                 });
                 if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
                     tracing::debug!("https connection from {peer} ended: {e}");
@@ -157,7 +159,7 @@ impl PairingServer {
         }
     }
 
-    async fn handle(&self, req: Request<Incoming>, peer: SocketAddr, https: bool) -> Response<Full<Bytes>> {
+    async fn handle(&self, req: Request<Incoming>, peer: SocketAddr, local_addr: SocketAddr, https: bool) -> Response<Full<Bytes>> {
         let path = req.uri().path().to_string();
         let params = parse_query(req.uri().query().unwrap_or(""));
 
@@ -175,8 +177,8 @@ impl PairingServer {
             "/applist" => self.app_list(),
             "/pair" => self.pair(&params).await,
             "/unpair" => self.unpair(&params),
-            "/launch" => self.launch(&params),
-            "/resume" => self.resume(&params),
+            "/launch" => self.launch(&params, local_addr.ip()),
+            "/resume" => self.resume(&params, local_addr.ip()),
             "/cancel" => self.cancel(&params),
             "/pin" => self.pin_page(&params),
             "/submit-pin" => self.submit_pin_query(&params, req.into_body()).await,
@@ -348,7 +350,7 @@ impl PairingServer {
         xml_response(paired_xml(""))
     }
 
-    fn launch(&self, params: &HashMap<String, String>) -> Response<Full<Bytes>> {
+    fn launch(&self, params: &HashMap<String, String>, local_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
         let width = params.get("width").and_then(|s| s.parse().ok()).unwrap_or(1920);
         let height = params.get("height").and_then(|s| s.parse().ok()).unwrap_or(1080);
         let fps = params.get("fps").and_then(|s| s.parse().ok()).unwrap_or(60);
@@ -358,28 +360,29 @@ impl PairingServer {
         };
 
         match self.launch_handler.launch(width, height, fps, rikey) {
+            // The client parses this as a raw socket address, not a hostname
+            // (no DNS resolution) — mirror back the IP it actually used to
+            // reach us, from the accepted connection's local address.
             Ok(()) => xml_response(format!(
                 r#"<?xml version="1.0" encoding="utf-8"?>
 <root status_code="200">
     <gamesession>1</gamesession>
-    <sessionUrl0>rtsp://{hostname}:{rtsp_port}</sessionUrl0>
+    <sessionUrl0>rtsp://{local_ip}:{rtsp_port}</sessionUrl0>
 </root>"#,
-                hostname = self.hostname,
                 rtsp_port = self.rtsp_port,
             )),
             Err(e) => bad_request(e),
         }
     }
 
-    fn resume(&self, _params: &HashMap<String, String>) -> Response<Full<Bytes>> {
+    fn resume(&self, _params: &HashMap<String, String>, local_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
         match self.launch_handler.resume() {
             Ok(()) => xml_response(format!(
                 r#"<?xml version="1.0" encoding="utf-8"?>
 <root status_code="200">
     <resume>1</resume>
-    <sessionUrl0>rtsp://{hostname}:{rtsp_port}</sessionUrl0>
+    <sessionUrl0>rtsp://{local_ip}:{rtsp_port}</sessionUrl0>
 </root>"#,
-                hostname = self.hostname,
                 rtsp_port = self.rtsp_port,
             )),
             Err(e) => bad_request(e),

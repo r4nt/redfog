@@ -220,6 +220,16 @@ impl LaunchHandler for SessionManager {
     fn launch(&self, width: u32, height: u32, _fps: u32, rikey: RemoteInputKey) -> Result<(), String> {
         {
             let shared = self.shared.lock().unwrap();
+            // A client that gave up before RTSP reached PLAY (closed early,
+            // network hiccup, etc.) previously had no way back in short of
+            // an explicit /cancel — the compositor it spawned is still
+            // alive and well, so just let the retry reconnect to it rather
+            // than hard-erroring "a session is already active".
+            if matches!(shared.state, State::Launched { .. }) {
+                drop(shared);
+                *self.rikey_cell.lock().unwrap() = Some(rikey.key);
+                return Ok(());
+            }
             if !matches!(shared.state, State::Idle) {
                 return Err("a session is already active".to_string());
             }

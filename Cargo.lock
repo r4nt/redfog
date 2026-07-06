@@ -3778,6 +3778,7 @@ version = "0.1.0"
 dependencies = [
  "gethostname 0.5.0",
  "gstreamer",
+ "rand",
  "redfog-core",
  "redfog-moonlight",
  "tokio",
