@@ -11,6 +11,12 @@
 #   gstreamer1.0-pipewire  (provides the pipewiresrc element)
 #   gstreamer1.0-plugins-base, gstreamer1.0-plugins-good
 #
+# NOTE: D-Bus session isolation and PipeWire/wireplumber bring-up (described
+# below) now live in redfog-core::environment (ensure_private_dbus_session,
+# HeadlessRuntime) since a future moonlight-style server needs the identical
+# setup. kwin-viewer performs this itself on startup; proto.sh just builds
+# and launches it. The discoveries are kept here for reference.
+#
 # ── DISCOVERIES FROM BRING-UP ───────────────────────────────────────────────
 #
 # PipeWire socket:
@@ -113,31 +119,14 @@
 #   TODO: investigate GBM segfault on NVIDIA; may need kernel driver update,
 #   nvidia-drm.modeset=1, or switching to EGL_PLATFORM_DEVICE_EXT instead of
 #   EGL_PLATFORM_GBM_KHR in the KWin virtual backend.
-#
-# set -euo pipefail
-#
-# SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-#
-# Re-exec inside a fresh D-Bus session so the headless stack (kwin_wayland,
-# plasmashell) gets its own bus and doesn't collide with the desktop session.
-# Without this, plasmashell crashes immediately because org.kde.plasmashell is
-# already owned by the desktop, and org.kde.KWin gets stolen from the desktop
-# portal by our headless kwin_wayland.
 
-if [[ -z "${_REDFOG_INNER:-}" ]]; then
-    export _REDFOG_INNER=1
-    exec dbus-run-session -- bash "${BASH_SOURCE[0]}" "$@"
-fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOST_WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}"
+# Captured so cleanup() can restore it in the systemd --user environment,
+# which dbus-update-activation-environment --systemd may overwrite globally
+# for the user (it is not scoped to the private D-Bus session).
 HOST_DISPLAY="${DISPLAY:-}"
-HOST_XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}"
 
-SOCKET="redfog-proto-0"
-RUNTIME="/tmp/redfog-runtime"
-PW_SOCK="$RUNTIME/pipewire-0"
 LOG_DIR="/tmp/redfog-proto"
-PIDS=()
 WIDTH=1920
 HEIGHT=1080
 SCALE=1.0
@@ -156,7 +145,6 @@ OPT_APP=""
 OPT_SIZE=""
 OPT_KWIN_ARGS=""
 OPT_PREVIEW_SCALE=2
-OPT_VERBOSE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -167,7 +155,6 @@ while [[ $# -gt 0 ]]; do
         --size)            OPT_SIZE="$2"; shift ;;
         --kwin-args)       OPT_KWIN_ARGS="$2"; shift ;;
         --preview-scale)   OPT_PREVIEW_SCALE="$2"; shift ;;
-        --verbose)         OPT_VERBOSE=1 ;;
         *) die "unknown argument: $1 (see script header for usage)" ;;
     esac
     shift
@@ -184,42 +171,17 @@ fi
 PREVIEW_W=$(( WIDTH / OPT_PREVIEW_SCALE ))
 PREVIEW_H=$(( HEIGHT / OPT_PREVIEW_SCALE ))
 
-# launch <logfile> <cmd> [args...] — start a background process, redirect its
-# output to logfile unless --verbose, then append its PID to PIDS.
-launch() {
-    local logfile="$1"; shift
-    if [[ $OPT_VERBOSE -eq 1 ]]; then
-        "$@" &
-    else
-        "$@" &>"$logfile" &
-    fi
-    PIDS+=($!)
-}
-
 CLEANED_UP=0
 cleanup() {
     [[ $CLEANED_UP -eq 1 ]] && return
     CLEANED_UP=1
     info "Shutting down..."
-    for pid in "${PIDS[@]:-}"; do
-        kill "$pid" 2>/dev/null || true
-    done
-    wait 2>/dev/null || true
     # Restore the host DISPLAY in the systemd user session
     if [[ -n "${HOST_DISPLAY:-}" ]]; then
         systemctl --user set-environment DISPLAY="$HOST_DISPLAY" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT INT TERM
-
-wait_path() {
-    local path="$1" secs="${2:-10}"
-    for ((i = 0; i < secs * 2; i++)); do
-        [[ -e "$path" ]] && return 0
-        sleep 0.5
-    done
-    return 1
-}
 
 check_cmd() {
     for cmd in "$@"; do
@@ -248,35 +210,13 @@ else
 fi
 info "Video sink: $VIDEO_SINK"
 
-mkdir -p "$RUNTIME" "$LOG_DIR"
-chmod 700 "$RUNTIME"
+mkdir -p "$LOG_DIR"
 
-# Write the session bus address to a known file so external tools can reach it.
-echo "$DBUS_SESSION_BUS_ADDRESS" > "$LOG_DIR/dbus-session-address"
+# PipeWire, wireplumber, and D-Bus session isolation are now brought up by
+# kwin-viewer itself via redfog-core::environment (ensure_private_dbus_session,
+# HeadlessRuntime) — see the note at the top of this script.
 
-# ── 1. PipeWire ──────────────────────────────────────────────────────────────
-
-info "Starting PipeWire..."
-rm -f "$PW_SOCK" "$PW_SOCK.lock" "$RUNTIME/pipewire-0-manager" "$RUNTIME/pipewire-0-manager.lock"
-
-launch "$LOG_DIR/pipewire.log" \
-    env XDG_RUNTIME_DIR="$RUNTIME" pipewire
-
-wait_path "$PW_SOCK" 10 || die "PipeWire socket did not appear — see $LOG_DIR/pipewire.log"
-PIPEWIRE_REMOTE="$PW_SOCK" pw-cli info 0 &>/dev/null \
-    || die "PipeWire started but not responding"
-info "PipeWire up"
-
-export PIPEWIRE_REMOTE="$PW_SOCK"
-
-# ── 2. Wireplumber ───────────────────────────────────────────────────────────
-
-info "Starting wireplumber..."
-launch "$LOG_DIR/wireplumber.log" \
-    env XDG_RUNTIME_DIR="$RUNTIME" PIPEWIRE_REMOTE="$PW_SOCK" wireplumber
-sleep 1
-
-# ── 3. Build Binaries ────────────────────────────────────────────────────────
+# ── 1. Build Binaries ────────────────────────────────────────────────────────
 
 if [[ $OPT_SKIP_BUILD == 0 ]]; then
     info "Building kwin-capture, kwin-input, kwin-viewer and redfog-login..."
@@ -289,7 +229,7 @@ fi
 
 VIEWER_BIN="$SCRIPT_DIR/target/release/kwin-viewer"
 
-# ── 4. Run kwin-viewer ────────────────────────────────────────────────────────
+# ── 2. Run kwin-viewer ────────────────────────────────────────────────────────
 
 DAMAGE_APP="${OPT_APP:-alacritty}"
 if [[ $OPT_NO_ALACRITTY -ne 0 ]]; then
@@ -298,12 +238,6 @@ fi
 
 info "Running managed kwin-viewer session..."
 
-# Run kwin-viewer under host display contexts so it opens on host monitor,
-# but connect it to the isolated PipeWire daemon.
-env -u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR \
-    WAYLAND_DISPLAY="$HOST_WAYLAND_DISPLAY" \
-    DISPLAY="$HOST_DISPLAY" \
-    XDG_RUNTIME_DIR="$HOST_XDG_RUNTIME_DIR" \
-    PIPEWIRE_REMOTE="$PW_SOCK" \
-    REDFOG_SCALE="$SCALE" \
-    "$VIEWER_BIN" "$PREVIEW_W" "$PREVIEW_H" "$DAMAGE_APP"
+# kwin-viewer brings up its own private D-Bus session and PipeWire/wireplumber
+# (see redfog-core::environment), so it just runs directly on the host display.
+REDFOG_SCALE="$SCALE" "$VIEWER_BIN" "$PREVIEW_W" "$PREVIEW_H" "$DAMAGE_APP"

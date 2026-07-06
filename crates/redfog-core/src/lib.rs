@@ -15,6 +15,13 @@ use wayland_client::{
 
 pub use kwin_capture::CaptureSession;
 
+mod environment;
+pub use environment::{ensure_private_dbus_session, HeadlessRuntime};
+
+/// Shared by `HeadlessRuntime::start` and `CompositorSession::spawn` so the
+/// PipeWire runtime dir and the KWin socket dir always agree.
+pub const DEFAULT_RUNTIME_DIR: &str = "/tmp/redfog-runtime";
+
 // Define fake_input module generated from protocols/fake-input.xml
 pub mod fake_input {
     #![allow(
@@ -72,7 +79,7 @@ impl CompositorSession {
         scale: f64,
         payload_args: &[String],
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let runtime = "/tmp/redfog-runtime".to_string();
+        let runtime = DEFAULT_RUNTIME_DIR.to_string();
         let runtime_path = Path::new(&runtime);
         let socket_path = runtime_path.join(socket_name);
 

@@ -133,6 +133,10 @@ fn winit_button_to_evdev(btn: MouseButton) -> Option<u32> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Must run before anything else touches D-Bus: re-execs the whole
+    // process inside dbus-run-session on first launch.
+    redfog_core::ensure_private_dbus_session();
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: {} <width> <height> [user-payload-command]", args[0]);
@@ -151,6 +155,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize GStreamer
     gst::init()?;
+
+    // Bring up PipeWire + wireplumber on an isolated runtime dir; exports
+    // PIPEWIRE_REMOTE for CompositorSession::spawn to pick up. Kept alive
+    // for the process lifetime and torn down on drop.
+    eprintln!("kwin-viewer: starting headless PipeWire runtime...");
+    let _headless_runtime = redfog_core::HeadlessRuntime::start(redfog_core::DEFAULT_RUNTIME_DIR)
+        .map_err(|e| e as Box<dyn std::error::Error>)?;
 
     // 1. Spawn Login Compositor
     eprintln!("kwin-viewer: spawning Login KWin compositor...");
