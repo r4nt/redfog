@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::os::unix::net::UnixStream;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
 use gst::prelude::*;
 
 use wayland_client::{
@@ -275,6 +276,145 @@ where
                 let changed = store.as_ref().map(|f| f.width != w || f.height != h).unwrap_or(true);
                 *store = Some(Frame { width: w, height: h, data });
                 on_frame(changed);
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    pipeline
+}
+
+/// Name of the `x264enc` element in the pipeline built by
+/// [`make_encoder_pipeline`], so callers can address it (e.g. [`request_keyframe`]).
+const ENCODER_ELEMENT_NAME: &str = "enc";
+
+/// Capture -> H.264 encode pipeline for network streaming (as opposed to
+/// [`make_pipeline`]'s raw-BGRx path for local display). Delivers Annex-B
+/// access units (one per encoded frame) to `on_access_unit(bytes, is_keyframe)`.
+///
+/// Software `x264enc` for this iteration; `nvh264enc` is a drop-in swap once
+/// hardware encoding is worth the complexity (see project notes on the
+/// NVIDIA GBM issue — encoding is a separate GPU path from KWin's virtual
+/// backend rendering, so it isn't necessarily blocked by the same bug).
+pub fn make_encoder_pipeline<F>(node_id: u32, bitrate_kbps: u32, on_access_unit: F) -> gst::Pipeline
+where
+    F: Fn(Vec<u8>, bool) + Send + Sync + 'static,
+{
+    let desc = format!(
+        "pipewiresrc name=src path={node_id} do-timestamp=true \
+         ! videoconvert \
+         ! video/x-raw,format=I420 \
+         ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
+                   byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
+         ! video/x-h264,stream-format=byte-stream,alignment=au \
+         ! appsink name=sink sync=false"
+    );
+    let pipeline = gst::parse_launch(&desc)
+        .expect("encoder pipeline parse failed")
+        .dynamic_cast::<gst::Pipeline>()
+        .unwrap();
+    let appsink = pipeline
+        .by_name("sink").unwrap()
+        .dynamic_cast::<gst_app::AppSink>().unwrap();
+    appsink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                let is_keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+                let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                on_access_unit(map.to_vec(), is_keyframe);
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    pipeline
+}
+
+/// Force the next frame out of a [`make_encoder_pipeline`] pipeline to be a
+/// keyframe — used to honor Moonlight's `RequestIdrFrame`/
+/// `InvalidateReferenceFrames` control messages after packet loss.
+pub fn request_keyframe(pipeline: &gst::Pipeline) {
+    let Some(encoder) = pipeline.by_name(ENCODER_ELEMENT_NAME) else {
+        return;
+    };
+    let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
+    encoder.send_event(event);
+}
+
+/// A per-session virtual audio sink: apps in the compositor session play
+/// audio to `sink_name`, which we then capture from `capture_name`. Backed
+/// by `pw-loopback` rather than PipeWire's own graph, since nothing creates
+/// a default sink in `HeadlessRuntime`'s isolated PipeWire instance
+/// otherwise (there's no real hardware for wireplumber to link to).
+pub struct AudioLoopback {
+    pub sink_name: String,
+    pub capture_name: String,
+    process: Child,
+}
+
+impl AudioLoopback {
+    /// Spawn a loopback named after `session_name` (e.g. the compositor's
+    /// socket name, to keep it unique per session).
+    pub fn spawn(session_name: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let sink_name = format!("redfog-audio-sink-{session_name}");
+        let capture_name = format!("redfog-audio-capture-{session_name}");
+
+        let process = Command::new("pw-loopback")
+            .arg("-n")
+            .arg(format!("redfog-audio-{session_name}"))
+            .arg("--capture-props")
+            .arg(format!("media.class=Audio/Sink node.name={sink_name}"))
+            .arg("--playback-props")
+            .arg(format!("media.class=Audio/Source node.name={capture_name}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to spawn pw-loopback: {e}"))?;
+
+        Ok(Self {
+            sink_name,
+            capture_name,
+            process,
+        })
+    }
+}
+
+impl Drop for AudioLoopback {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
+/// Capture -> Opus encode pipeline for network streaming: `pipewiresrc`
+/// targeting an [`AudioLoopback`]'s capture side -> stereo 48kHz -> Opus.
+/// Delivers one encoded Opus packet per callback invocation.
+pub fn make_audio_pipeline<F>(loopback: &AudioLoopback, on_packet: F) -> gst::Pipeline
+where
+    F: Fn(Vec<u8>) + Send + Sync + 'static,
+{
+    let desc = format!(
+        "pipewiresrc target-object={capture_name} do-timestamp=true \
+         ! audioconvert ! audioresample \
+         ! audio/x-raw,format=S16LE,channels=2,rate=48000 \
+         ! opusenc frame-size=20 \
+         ! appsink name=sink sync=false",
+        capture_name = loopback.capture_name,
+    );
+    let pipeline = gst::parse_launch(&desc)
+        .expect("audio pipeline parse failed")
+        .dynamic_cast::<gst::Pipeline>()
+        .unwrap();
+    let appsink = pipeline
+        .by_name("sink").unwrap()
+        .dynamic_cast::<gst_app::AppSink>().unwrap();
+    appsink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                on_packet(map.to_vec());
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),

@@ -5,5 +5,7 @@ members = [
     "crates/kwin-viewer",
     "crates/redfog-login",
     "crates/redfog-core",
+    "crates/redfog-moonlight",
+    "crates/redfog-server",
 ]
 resolver = "2"
