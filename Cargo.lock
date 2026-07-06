@@ -812,6 +812,7 @@ name = "kwin-capture"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.0",
+ "libc",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols-plasma 0.3.12",

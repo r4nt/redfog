@@ -362,11 +362,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if size.width > 0 && size.height > 0 {
                     let w = size.width as i32;
                     let h = size.height as i32;
-                    eprintln!("kwin-viewer: window Resized {}x{} → queuing resize {}x{}", size.width, size.height, w, h);
-                    pending_resize = Some((w, h, std::time::Instant::now()));
-                    elwt.set_control_flow(ControlFlow::WaitUntil(
-                        std::time::Instant::now() + std::time::Duration::from_millis(50),
-                    ));
+                    let already_matching = {
+                        let store = frame_store.lock().unwrap();
+                        store.as_ref().map(|f| f.width == size.width && f.height == size.height).unwrap_or(false)
+                    };
+                    if !already_matching {
+                        eprintln!("kwin-viewer: window Resized {}x{} → queuing resize {}x{}", size.width, size.height, w, h);
+                        pending_resize = Some((w, h, std::time::Instant::now()));
+                        elwt.set_control_flow(ControlFlow::WaitUntil(
+                            std::time::Instant::now() + std::time::Duration::from_millis(50),
+                        ));
+                    } else {
+                        eprintln!("kwin-viewer: window Resized {}x{} matches frame size, ignoring", size.width, size.height);
+                    }
                 }
             }
             Event::AboutToWait => {

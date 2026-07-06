@@ -17,3 +17,4 @@ wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 wayland-backend = "0.3"
 wayland-scanner = "0.31"
 bitflags = "2"
+libc = "0.2"

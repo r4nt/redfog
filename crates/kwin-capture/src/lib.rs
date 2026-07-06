@@ -282,7 +282,7 @@ fn find_mode(modes: &HashMap<ObjectId, (KdeOutputDeviceModeV2, i32, i32)>, w: i3
 {
     modes.values()
         .filter(|(_, mw, mh)| *mw > 0 && *mh > 0)
-        .find(|(_, mw, mh)| (*mw - w).abs() <= 1 && (*mh - h).abs() <= 1)
+        .find(|(_, mw, mh)| (*mw - w).abs() <= 8 && (*mh - h).abs() <= 8)
         .map(|(proxy, _, _)| proxy.clone())
 }
 
@@ -306,7 +306,7 @@ fn set_output_mode(
     let already_correct = state.current_mode_id
         .as_ref()
         .and_then(|id| state.modes.get(id))
-        .map(|(_, mw, mh)| (*mw - w).abs() <= 1 && (*mh - h).abs() <= 1)
+        .map(|(_, mw, mh)| (*mw - w).abs() <= 8 && (*mh - h).abs() <= 8)
         .unwrap_or(false);
     if already_correct {
         return;
@@ -316,8 +316,6 @@ fn set_output_mode(
     let target = if let Some(m) = find_mode(&state.modes, w, h) {
         m
     } else {
-        let pre_ids: std::collections::HashSet<ObjectId> = state.modes.keys().cloned().collect();
-
         let mode_list = mgmt.create_mode_list(qh, ());
         mode_list.set_resolution(w as u32, h as u32);
         mode_list.set_refresh_rate(60_000);
@@ -332,17 +330,26 @@ fn set_output_mode(
         state.config_done = false;
         while !state.config_done { pump(state, queue, conn); }
 
-        // KDE may create several new mode objects (e.g. a re-added standard mode
-        // alongside the custom one). Pick the new mode closest to what we asked for.
-        match state.modes.iter()
-            .filter(|(id, (_, mw, mh))| !pre_ids.contains(*id) && *mw > 0 && *mh > 0)
-            .min_by_key(|(_, (_, mw, mh))| (*mw - w).abs() + (*mh - h).abs())
-            .map(|(_, (proxy, _, _))| proxy.clone())
-        {
+        // Extra roundtrip to ensure all Size events are fully processed.
+        queue.roundtrip(state).ok();
+
+        match find_mode(&state.modes, w, h) {
             Some(m) => m,
             None => {
-                eprintln!("capture: custom mode {w}x{h} not found after set_custom_modes");
-                return;
+                eprintln!("capture: custom mode {w}x{h} not found after set_custom_modes. Available modes:");
+                for (id, (_, mw, mh)) in &state.modes {
+                    eprintln!("  - {id:?}: {mw}x{mh}");
+                }
+                // Try finding the closest mode as a fallback
+                if let Some((proxy, mw, mh)) = state.modes.values()
+                    .filter(|(_, mw, mh)| *mw > 0 && *mh > 0)
+                    .min_by_key(|(_, mw, mh)| (*mw - w).abs() + (*mh - h).abs())
+                {
+                    eprintln!("capture: falling back to closest mode {mw}x{mh}");
+                    proxy.clone()
+                } else {
+                    return;
+                }
             }
         }
     };
@@ -436,10 +443,24 @@ impl CaptureSession {
         let (resize_tx, resize_rx) = mpsc::channel::<(i32, i32)>();
 
         std::thread::spawn(move || {
+            use std::os::fd::{AsFd, AsRawFd};
+            let fd = conn.as_fd().as_raw_fd();
             loop {
-                // Dispatch any buffered compositor events without blocking on socket read.
-                // Blocking reads happen inside set_output_mode's wait loops; here we only
-                // need to keep the queue drained so stale events don't accumulate.
+                if let Some(guard) = conn.prepare_read() {
+                    let mut fds = [libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }];
+                    let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, 8) };
+                    if ret > 0 && (fds[0].revents & libc::POLLIN) != 0 {
+                        if let Err(e) = guard.read() {
+                            eprintln!("capture: error reading from Wayland socket: {e}");
+                            break;
+                        }
+                    }
+                }
+
                 conn.flush().ok();
                 queue.dispatch_pending(&mut state).ok();
 
@@ -447,8 +468,6 @@ impl CaptureSession {
                     eprintln!("capture: resizing to {w}x{h}");
                     set_output_mode(&mut state, &mut queue, &qh, &conn, w, h);
                 }
-
-                std::thread::sleep(std::time::Duration::from_millis(8));
             }
         });
 

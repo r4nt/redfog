@@ -368,17 +368,6 @@ dbus-update-activation-environment \
 # services to render anything useful), and in any case launch a plain terminal
 # as a guaranteed damage source so there's always visible content.
 
-if [[ $OPT_NO_PLASMASHELL -eq 0 ]]; then
-    info "Starting plasmashell..."
-    launch "$LOG_DIR/plasmashell.log" \
-        env WAYLAND_DISPLAY="$SOCKET" \
-            XDG_RUNTIME_DIR="$RUNTIME" \
-            XDG_DATA_HOME="$LOG_DIR/kwin-data" \
-            XDG_CONFIG_HOME="$LOG_DIR/kwin-data/config" \
-            PIPEWIRE_REMOTE="$PW_SOCK" \
-            DISPLAY="${XWAYLAND_DISPLAY:-}" \
-            plasmashell --no-respawn
-fi
 
 # ── 5. Build kwin-capture ────────────────────────────────────────────────────
 
@@ -421,6 +410,19 @@ PIDS+=($VIEWER_PID)
 head -n1 "$READY_FIFO" >/dev/null
 kill -0 "$VIEWER_PID" 2>/dev/null || die "kwin-viewer died before becoming ready — see $LOG_DIR/kwin-viewer.log"
 info "Preview window open. Ctrl-C to stop."
+
+if [[ $OPT_NO_PLASMASHELL -eq 0 ]]; then
+    info "Starting plasmashell..."
+    launch "$LOG_DIR/plasmashell.log" \
+        env WAYLAND_DISPLAY="$SOCKET" \
+            XDG_RUNTIME_DIR="$RUNTIME" \
+            XDG_DATA_HOME="$LOG_DIR/kwin-data" \
+            XDG_CONFIG_HOME="$LOG_DIR/kwin-data/config" \
+            PIPEWIRE_REMOTE="$PW_SOCK" \
+            DISPLAY="${XWAYLAND_DISPLAY:-}" \
+            plasmashell --no-respawn
+fi
+
 
 # ── 7. Input forwarding via org_kde_kwin_fake_input ──────────────────────────
 #
