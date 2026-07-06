@@ -160,12 +160,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         width,
         height,
         scale,
+        &["target/release/redfog-login".to_string()],
     ).map_err(|e| e as Box<dyn std::error::Error>)?;
-
-    // 2. Launch Login UI inside compositor
-    eprintln!("kwin-viewer: starting redfog-login UI payload...");
-    let login_ui = login_session.launch_payload(&["target/release/redfog-login"])
-        .map_err(|e| e as Box<dyn std::error::Error>)?;
 
     // 3. Initialize Streaming Engine connected to Login session
     let frame_store: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
@@ -192,7 +188,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut login_session_opt = Some(login_session);
     let mut user_session_opt: Option<CompositorSession> = None;
-    let mut login_ui_opt = Some(login_ui);
 
     let mut frame_w = 0u32;
     let mut frame_h = 0u32;
@@ -300,57 +295,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Event::AboutToWait => {
-                // Monitor if Login UI has exited to trigger dynamic handoff
-                if let Some(ref mut child) = login_ui_opt {
-                    if let Ok(Some(status)) = child.try_wait() {
-                        login_ui_opt = None;
+                // Monitor if Login KWin compositor has exited to trigger dynamic handoff
+                if let Some(ref mut l_sess) = login_session_opt {
+                    if let Ok(Some(status)) = l_sess.try_wait() {
                         if status.success() {
-                            eprintln!("kwin-viewer: Login UI authenticated successfully. Starting User session compositor...");
+                            eprintln!("kwin-viewer: Login UI compositor exited successfully. Starting User session compositor...");
                             
+                            let payload = if user_app == "plasmashell" {
+                                vec!["plasmashell".to_string(), "--no-respawn".to_string()]
+                            } else {
+                                vec![user_app.to_string()]
+                            };
+
                             match CompositorSession::spawn(
                                 SessionType::User("user".to_string()),
                                 "redfog-user-0",
                                 width,
                                 height,
                                 scale,
+                                &payload,
                             ) {
                                 Ok(u_session) => {
-                                    eprintln!("kwin-viewer: User session spawned! Launching payload ({})...", user_app);
-                                    let args = if user_app == "plasmashell" {
-                                        vec!["plasmashell", "--no-respawn"]
-                                    } else {
-                                        vec![user_app]
-                                    };
-                                    u_session.launch_payload(&args).ok();
+                                    eprintln!("kwin-viewer: User session compositor spawned successfully with payload natively!");
 
                                     eprintln!("kwin-viewer: executing dynamic pipeline and input handoff...");
                                     if let Err(e) = engine.handoff(&u_session) {
                                         eprintln!("kwin-viewer: Handoff failed: {e}");
                                     } else {
                                         eprintln!("kwin-viewer: Handoff successful!");
-                                        user_session_opt = Some(u_session);
-
-                                        // Recreate the GStreamer pipeline from scratch for the new node
-                                        engine.pipeline.set_state(gst::State::Null).ok();
-                                        let proxy_clone = event_loop_proxy.clone();
-                                        engine.pipeline = redfog_core::make_pipeline(
-                                            user_session_opt.as_ref().unwrap().pipewire_node_id,
-                                            frame_store.clone(),
-                                            move |changed| {
-                                                if changed {
-                                                    let _ = proxy_clone.send_event(UserEvent::FrameSizeChanged);
-                                                } else {
-                                                    let _ = proxy_clone.send_event(UserEvent::NewFrame);
-                                                }
-                                            }
-                                        );
-                                        engine.pipeline.set_state(gst::State::Playing).ok();
-                                        eprintln!("kwin-viewer: GStreamer pipeline recreated for user session");
-
-                                        if let Some(l_session) = login_session_opt.take() {
-                                            l_session.terminate();
-                                        }
-                                    }
+                                         user_session_opt = Some(u_session);
+ 
+                                         // Recreate the GStreamer pipeline from scratch for the new node
+                                         engine.pipeline.set_state(gst::State::Null).ok();
+                                         let proxy_clone = event_loop_proxy.clone();
+                                         engine.pipeline = redfog_core::make_pipeline(
+                                             user_session_opt.as_ref().unwrap().pipewire_node_id,
+                                             frame_store.clone(),
+                                             move |changed| {
+                                                 if changed {
+                                                     let _ = proxy_clone.send_event(UserEvent::FrameSizeChanged);
+                                                 } else {
+                                                     let _ = proxy_clone.send_event(UserEvent::NewFrame);
+                                                 }
+                                             }
+                                         );
+                                         engine.pipeline.set_state(gst::State::Playing).ok();
+                                         eprintln!("kwin-viewer: GStreamer pipeline recreated for user session");
+ 
+                                         login_session_opt = None; // Already exited cleanly
+                                     }
                                 }
                                 Err(e) => {
                                     eprintln!("kwin-viewer: failed to spawn User session: {e}");

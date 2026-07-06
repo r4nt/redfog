@@ -70,6 +70,7 @@ impl CompositorSession {
         width: i32,
         height: i32,
         scale: f64,
+        payload_args: &[String],
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let runtime = "/tmp/redfog-runtime".to_string();
         let runtime_path = Path::new(&runtime);
@@ -82,12 +83,13 @@ impl CompositorSession {
         let pw_sock = std::env::var("PIPEWIRE_REMOTE")
             .unwrap_or_else(|_| "pipewire-0".to_string());
 
-        let mut child = Command::new("kwin_wayland")
-            .env("KWIN_PLATFORM", "virtual")
+        let mut cmd = Command::new("kwin_wayland");
+        cmd.env("KWIN_PLATFORM", "virtual")
             .env("KWIN_WAYLAND_NO_PERMISSION_CHECKS", "1")
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("PIPEWIRE_REMOTE", &pw_sock)
             .env("LIBGL_ALWAYS_SOFTWARE", "1")
+            .env("KDE_NO_SYSTEMD_BOOT", "1")
             .arg("--virtual")
             .arg("--width")
             .arg(&width.to_string())
@@ -98,8 +100,20 @@ impl CompositorSession {
             .arg("--no-lockscreen")
             .arg("--socket")
             .arg(socket_name)
-            .arg("--xwayland")
-            .stdout(Stdio::inherit())
+            .arg("--xwayland");
+
+        if !payload_args.is_empty() {
+            cmd.arg("--exit-with-session");
+            cmd.arg(&payload_args[0]);
+            if payload_args.len() > 1 {
+                cmd.arg("--");
+                for arg in &payload_args[1..] {
+                    cmd.arg(arg);
+                }
+            }
+        }
+
+        let mut child = cmd.stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()?;
 
@@ -118,35 +132,32 @@ impl CompositorSession {
             return Err(format!("KWin Wayland socket {:?} failed to appear", socket_path).into());
         }
 
+        // Update D-Bus activation environment so services connect to this compositor socket
+        Command::new("dbus-update-activation-environment")
+            .arg("--systemd")
+            .arg(format!("WAYLAND_DISPLAY={}", socket_name))
+            .arg(format!("XDG_RUNTIME_DIR={}", runtime))
+            .arg(format!("PIPEWIRE_REMOTE={}", pw_sock))
+            .spawn()
+            .and_then(|mut c| c.wait())
+            .ok();
+
         // Connect CaptureSession to claim virtual output and get PipeWire node ID
         let capture_session = CaptureSession::connect(&socket_path, "redfog-output", width, height, scale)?;
         let pipewire_node_id = capture_session.node_id();
 
         Ok(Self {
             session_type,
-            socket_name: socket_name.to_string(),
             socket_path,
+            socket_name: socket_name.to_string(),
             kwin_process: child,
             capture_session,
             pipewire_node_id,
         })
     }
 
-    pub fn launch_payload(&self, command_args: &[&str]) -> Result<Child, Box<dyn std::error::Error + Send + Sync>> {
-        if command_args.is_empty() {
-            return Err("Empty command arguments".into());
-        }
-
-        let runtime = "/tmp/redfog-runtime".to_string();
-
-        let child = Command::new(command_args[0])
-            .args(&command_args[1..])
-            .env("WAYLAND_DISPLAY", &self.socket_name)
-            .env("XDG_RUNTIME_DIR", &runtime)
-            .env("LIBGL_ALWAYS_SOFTWARE", "1")
-            .spawn()?;
-
-        Ok(child)
+    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
+        self.kwin_process.try_wait()
     }
 
     pub fn terminate(mut self) {
