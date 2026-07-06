@@ -4,8 +4,7 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Redfog Login")
-            .with_inner_size([400.0, 300.0])
-            .with_fullscreen(true),
+            .with_inner_size([400.0, 300.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -33,6 +32,12 @@ impl Default for LoginApp {
 
 impl eframe::App for LoginApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Support headless/automated testing trigger
+        if std::path::Path::new("/tmp/trigger-login").exists() {
+            let _ = std::fs::remove_file("/tmp/trigger-login");
+            std::process::exit(0);
+        }
+
         // Set a dark, clean look
         let mut visual = egui::Visuals::dark();
         visual.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(20, 20, 25);

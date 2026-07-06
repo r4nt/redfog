@@ -16,16 +16,7 @@ macro_rules! eprintln {
 }
 
 use gstreamer as gst;
-use gstreamer_app as gst_app;
 use gst::prelude::*;
-
-use wayland_client::{
-    delegate_noop,
-    globals::{registry_queue_init, GlobalListContents},
-    protocol::{wl_registry, wl_seat},
-    Connection, Dispatch, QueueHandle,
-};
-
 use winit::{
     event::{ElementState, Event, WindowEvent, MouseButton},
     event_loop::{ControlFlow, EventLoopBuilder},
@@ -33,50 +24,12 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 
-use kwin_capture::CaptureSession;
-
-mod fake_input {
-    #![allow(
-        dead_code, non_camel_case_types, unused_unsafe, unused_variables,
-        non_upper_case_globals, non_snake_case, unused_imports, missing_docs,
-        clippy::all
-    )]
-    pub mod client {
-        use wayland_client;
-        use wayland_client::protocol::*;
-        use wayland_backend;
-        pub mod __interfaces {
-            use wayland_client::protocol::__interfaces::*;
-            use wayland_backend;
-            wayland_scanner::generate_interfaces!("protocols/fake-input.xml");
-        }
-        use self::__interfaces::*;
-        wayland_scanner::generate_client_code!("protocols/fake-input.xml");
-    }
-}
-
-use fake_input::client::org_kde_kwin_fake_input::OrgKdeKwinFakeInput;
-
-struct WaylandState;
-
-impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandState {
-    fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event,
-             _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
-}
-
-delegate_noop!(WaylandState: ignore wl_seat::WlSeat);
-delegate_noop!(WaylandState: ignore OrgKdeKwinFakeInput);
+use redfog_core::{CompositorSession, SessionType, StreamingEngine, Frame};
 
 #[derive(Debug)]
 enum UserEvent {
     NewFrame,
     FrameSizeChanged,
-}
-
-struct Frame {
-    width: u32,
-    height: u32,
-    data: Vec<u8>,
 }
 
 fn winit_key_to_evdev(code: KeyCode) -> Option<u32> {
@@ -117,27 +70,22 @@ fn winit_key_to_evdev(code: KeyCode) -> Option<u32> {
         KeyCode::Digit8 => Some(9),
         KeyCode::Digit9 => Some(10),
         KeyCode::Digit0 => Some(11),
+        KeyCode::Enter => Some(28),
         KeyCode::Escape => Some(1),
-        KeyCode::Minus => Some(12),
-        KeyCode::Equal => Some(13),
         KeyCode::Backspace => Some(14),
         KeyCode::Tab => Some(15),
+        KeyCode::Space => Some(57),
+        KeyCode::Minus => Some(12),
+        KeyCode::Equal => Some(13),
         KeyCode::BracketLeft => Some(26),
         KeyCode::BracketRight => Some(27),
-        KeyCode::Enter => Some(28),
-        KeyCode::ControlLeft => Some(29),
+        KeyCode::Backslash => Some(43),
         KeyCode::Semicolon => Some(39),
         KeyCode::Quote => Some(40),
         KeyCode::Backquote => Some(41),
-        KeyCode::ShiftLeft => Some(42),
-        KeyCode::Backslash => Some(43),
         KeyCode::Comma => Some(51),
         KeyCode::Period => Some(52),
         KeyCode::Slash => Some(53),
-        KeyCode::ShiftRight => Some(54),
-        KeyCode::NumpadMultiply => Some(55),
-        KeyCode::AltLeft => Some(56),
-        KeyCode::Space => Some(57),
         KeyCode::CapsLock => Some(58),
         KeyCode::F1 => Some(59),
         KeyCode::F2 => Some(60),
@@ -149,24 +97,12 @@ fn winit_key_to_evdev(code: KeyCode) -> Option<u32> {
         KeyCode::F8 => Some(66),
         KeyCode::F9 => Some(67),
         KeyCode::F10 => Some(68),
-        KeyCode::NumLock => Some(69),
-        KeyCode::ScrollLock => Some(70),
-        KeyCode::Numpad7 => Some(71),
-        KeyCode::Numpad8 => Some(72),
-        KeyCode::Numpad9 => Some(73),
-        KeyCode::NumpadSubtract => Some(74),
-        KeyCode::Numpad4 => Some(75),
-        KeyCode::Numpad5 => Some(76),
-        KeyCode::Numpad6 => Some(77),
-        KeyCode::NumpadAdd => Some(78),
-        KeyCode::Numpad1 => Some(79),
-        KeyCode::Numpad2 => Some(80),
-        KeyCode::Numpad3 => Some(81),
-        KeyCode::Numpad0 => Some(82),
-        KeyCode::NumpadDecimal => Some(83),
         KeyCode::F11 => Some(87),
         KeyCode::F12 => Some(88),
-        KeyCode::NumpadEnter => Some(96),
+        KeyCode::ShiftLeft => Some(42),
+        KeyCode::ControlLeft => Some(29),
+        KeyCode::AltLeft => Some(56),
+        KeyCode::ShiftRight => Some(54),
         KeyCode::ControlRight => Some(97),
         KeyCode::NumpadDivide => Some(98),
         KeyCode::PrintScreen => Some(99),
@@ -196,116 +132,67 @@ fn winit_button_to_evdev(btn: MouseButton) -> Option<u32> {
     }
 }
 
-fn make_pipeline(
-    node_id: u32,
-    frame_store: Arc<Mutex<Option<Frame>>>,
-    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
-) -> gst::Pipeline {
-    let desc = format!(
-        "pipewiresrc path={node_id} do-timestamp=true \
-         ! videoconvert \
-         ! video/x-raw,format=BGRx \
-         ! appsink name=sink sync=false"
-    );
-    let pipeline = gst::parse_launch(&desc)
-        .expect("pipeline parse failed")
-        .dynamic_cast::<gst::Pipeline>()
-        .unwrap();
-    let appsink = pipeline
-        .by_name("sink").unwrap()
-        .dynamic_cast::<gst_app::AppSink>().unwrap();
-    appsink.set_callbacks(
-        gst_app::AppSinkCallbacks::builder()
-            .new_sample(move |sink| {
-                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-                let caps = sample.caps().ok_or(gst::FlowError::Error)?;
-                let s = caps.structure(0).ok_or(gst::FlowError::Error)?;
-                let w = s.get::<i32>("width").map_err(|_| gst::FlowError::Error)? as u32;
-                let h = s.get::<i32>("height").map_err(|_| gst::FlowError::Error)? as u32;
-                let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-                let data = map.to_vec();
-                let mut store = frame_store.lock().unwrap();
-                let changed = store.as_ref().map(|f: &Frame| f.width != w || f.height != h).unwrap_or(true);
-                if changed {
-                    eprintln!("kwin-viewer: frame size {}x{}", w, h);
-                }
-                *store = Some(Frame { width: w, height: h, data });
-                if changed {
-                    let _ = proxy.send_event(UserEvent::FrameSizeChanged);
-                } else {
-                    let _ = proxy.send_event(UserEvent::NewFrame);
-                }
-                Ok(gst::FlowSuccess::Ok)
-            })
-            .build(),
-    );
-    pipeline
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 4 {
-        eprintln!("Usage: {} <headless-wayland-socket> <width> <height>", args[0]);
+    if args.len() < 3 {
+        eprintln!("Usage: {} <width> <height> [user-payload-command]", args[0]);
         std::process::exit(1);
     }
-    let socket_path = std::path::Path::new(&args[1]);
-    let mut width: i32  = args[2].parse().expect("invalid width");
-    let mut height: i32 = args[3].parse().expect("invalid height");
-    // Align to 32px grid for encoder efficiency and mode reuse
+    let mut width: i32  = args[1].parse().expect("invalid width");
+    let mut height: i32 = args[2].parse().expect("invalid height");
+    let user_app = args.get(3).map(|s| s.as_str()).unwrap_or("plasmashell");
+
+    // Align to 32px grid
     width = ((width + 16) / 32) * 32;
     height = ((height + 16) / 32) * 32;
 
     let scale: f64  = std::env::var("REDFOG_SCALE").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(1.0);
 
-    // Create virtual output and PipeWire stream via the capture library.
-    let session = CaptureSession::connect(socket_path, "redfog-output", width, height, scale)
-        .expect("failed to create capture session");
-    let node_id = session.node_id();
-    eprintln!("kwin-viewer: PipeWire node {node_id}");
-
-    // Separate connection to headless KWin for fake_input (input injection).
-    use std::os::unix::net::UnixStream;
-    let fi_stream = UnixStream::connect(socket_path)?;
-    let fi_conn = Connection::from_socket(fi_stream)?;
-    let (globals, mut fi_queue) = registry_queue_init::<WaylandState>(&fi_conn)?;
-    let fi_qh = fi_queue.handle();
-
-    let fake_input: OrgKdeKwinFakeInput = globals
-        .bind(&fi_qh, 4..=6, ())
-        .map_err(|e| format!("org_kde_kwin_fake_input not available: {e}"))?;
-
-    let mut fi_state = WaylandState;
-    fake_input.authenticate(
-        "redfog-viewer".to_string(),
-        "input forwarding for game streaming".to_string(),
-    );
-    fi_conn.flush()?;
-    fi_queue.roundtrip(&mut fi_state)?;
-    eprintln!("kwin-viewer: fake_input authenticated");
-
     // Initialize GStreamer
     gst::init()?;
 
+    // 1. Spawn Login Compositor
+    eprintln!("kwin-viewer: spawning Login KWin compositor...");
+    let login_session = CompositorSession::spawn(
+        SessionType::Login,
+        "redfog-login-0",
+        width,
+        height,
+        scale,
+    ).map_err(|e| e as Box<dyn std::error::Error>)?;
+
+    // 2. Launch Login UI inside compositor
+    eprintln!("kwin-viewer: starting redfog-login UI payload...");
+    let login_ui = login_session.launch_payload(&["target/release/redfog-login"])
+        .map_err(|e| e as Box<dyn std::error::Error>)?;
+
+    // 3. Initialize Streaming Engine connected to Login session
     let frame_store: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build()?;
     let event_loop_proxy = event_loop.create_proxy();
 
-    let mut pipeline = make_pipeline(node_id, frame_store.clone(), event_loop_proxy.clone());
-    pipeline.set_state(gst::State::Playing)?;
-
-    // Signal readiness to proto.sh (read from stdout FIFO).
-    println!("ready");
+    let proxy_clone = event_loop_proxy.clone();
+    let mut engine = StreamingEngine::new(&login_session, frame_store.clone(), move |changed| {
+        if changed {
+            let _ = proxy_clone.send_event(UserEvent::FrameSizeChanged);
+        } else {
+            let _ = proxy_clone.send_event(UserEvent::NewFrame);
+        }
+    }).map_err(|e| e as Box<dyn std::error::Error>)?;
 
     let window = Arc::new(
         WindowBuilder::new()
-            .with_title("Redfog KWin Stream Viewer")
+            .with_title("Redfog Managed Stream Viewer")
             .with_inner_size(winit::dpi::PhysicalSize::new(width as u32, height as u32))
             .build(&event_loop)?,
     );
     let context = softbuffer::Context::new(window.clone())?;
     let mut surface = softbuffer::Surface::new(&context, window.clone())?;
+
+    let mut login_session_opt = Some(login_session);
+    let mut user_session_opt: Option<CompositorSession> = None;
+    let mut login_ui_opt = Some(login_ui);
 
     let mut frame_w = 0u32;
     let mut frame_h = 0u32;
@@ -323,8 +210,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 window.request_redraw();
             }
             Event::UserEvent(UserEvent::FrameSizeChanged) => {
-                // Snap window to whatever size KDE settled on, read directly from
-                // frame_store to avoid the RedrawRequested → Resized feedback loop.
                 let mut size = (0, 0);
                 {
                     let store = frame_store.lock().unwrap();
@@ -336,17 +221,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 eprintln!("kwin-viewer: FrameSizeChanged event received (new size: {}x{})", size.0, size.1);
-                // Restart the pipeline so GStreamer renegotiates a fresh buffer pool
-                // with PipeWire at the new resolution; without this, old-size buffers
-                // block PipeWire from delivering new-size frames.
-                // Cooldown prevents a double-restart race when the output settles
-                // through two intermediate sizes (e.g., stale kscreen → correct size).
+                
                 if last_pipeline_restart.elapsed() >= std::time::Duration::from_millis(500) {
                     eprintln!("kwin-viewer: restarting GStreamer pipeline for new resolution...");
                     last_pipeline_restart = std::time::Instant::now();
-                    pipeline.set_state(gst::State::Null).ok();
-                    pipeline = make_pipeline(node_id, frame_store.clone(), event_loop_proxy.clone());
-                    pipeline.set_state(gst::State::Playing).ok();
+                    engine.pipeline.set_state(gst::State::Null).ok();
+                    let proxy_clone = event_loop_proxy.clone();
+                    
+                    let active_node = if let Some(ref u_sess) = user_session_opt {
+                        u_sess.pipewire_node_id
+                    } else if let Some(ref l_sess) = login_session_opt {
+                        l_sess.pipewire_node_id
+                    } else {
+                        0
+                    };
+
+                    engine.pipeline = redfog_core::make_pipeline(active_node, frame_store.clone(), move |changed| {
+                        if changed {
+                            let _ = proxy_clone.send_event(UserEvent::FrameSizeChanged);
+                        } else {
+                            let _ = proxy_clone.send_event(UserEvent::NewFrame);
+                        }
+                    });
+                    engine.pipeline.set_state(gst::State::Playing).ok();
                     eprintln!("kwin-viewer: pipeline restarted and set to PLAYING");
                 } else {
                     eprintln!("kwin-viewer: pipeline restart throttled (cooldown)");
@@ -403,20 +300,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Event::AboutToWait => {
+                // Monitor if Login UI has exited to trigger dynamic handoff
+                if let Some(ref mut child) = login_ui_opt {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        login_ui_opt = None;
+                        if status.success() {
+                            eprintln!("kwin-viewer: Login UI authenticated successfully. Starting User session compositor...");
+                            
+                            match CompositorSession::spawn(
+                                SessionType::User("user".to_string()),
+                                "redfog-user-0",
+                                width,
+                                height,
+                                scale,
+                            ) {
+                                Ok(u_session) => {
+                                    eprintln!("kwin-viewer: User session spawned! Launching payload ({})...", user_app);
+                                    let args = if user_app == "plasmashell" {
+                                        vec!["plasmashell", "--no-respawn"]
+                                    } else {
+                                        vec![user_app]
+                                    };
+                                    u_session.launch_payload(&args).ok();
+
+                                    eprintln!("kwin-viewer: executing dynamic pipeline and input handoff...");
+                                    if let Err(e) = engine.handoff(&u_session) {
+                                        eprintln!("kwin-viewer: Handoff failed: {e}");
+                                    } else {
+                                        eprintln!("kwin-viewer: Handoff successful!");
+                                        user_session_opt = Some(u_session);
+
+                                        // Recreate the GStreamer pipeline from scratch for the new node
+                                        engine.pipeline.set_state(gst::State::Null).ok();
+                                        let proxy_clone = event_loop_proxy.clone();
+                                        engine.pipeline = redfog_core::make_pipeline(
+                                            user_session_opt.as_ref().unwrap().pipewire_node_id,
+                                            frame_store.clone(),
+                                            move |changed| {
+                                                if changed {
+                                                    let _ = proxy_clone.send_event(UserEvent::FrameSizeChanged);
+                                                } else {
+                                                    let _ = proxy_clone.send_event(UserEvent::NewFrame);
+                                                }
+                                            }
+                                        );
+                                        engine.pipeline.set_state(gst::State::Playing).ok();
+                                        eprintln!("kwin-viewer: GStreamer pipeline recreated for user session");
+
+                                        if let Some(l_session) = login_session_opt.take() {
+                                            l_session.terminate();
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("kwin-viewer: failed to spawn User session: {e}");
+                                    elwt.exit();
+                                }
+                            }
+                        } else {
+                            eprintln!("kwin-viewer: Login UI exited with error status {:?}", status);
+                            elwt.exit();
+                        }
+                    }
+                }
+
                 // Debounce window resize.
                 if let Some((w, h, t)) = pending_resize {
                     if t.elapsed() >= std::time::Duration::from_millis(200) {
                         let snapped_w = ((w + 16) / 32) * 32;
                         let snapped_h = ((h + 16) / 32) * 32;
                         eprintln!("kwin-viewer: debounce fired — resizing to {}x{} (snapped from {}x{})", snapped_w, snapped_h, w, h);
-                        session.resize(snapped_w, snapped_h);
                         
-                        // Restart pipeline immediately since KWin has applied the change
+                        if let Some(ref u_sess) = user_session_opt {
+                            u_sess.capture_session.resize(snapped_w, snapped_h);
+                        } else if let Some(ref l_sess) = login_session_opt {
+                            l_sess.capture_session.resize(snapped_w, snapped_h);
+                        }
+                        
                         eprintln!("kwin-viewer: KWin resize complete. Restarting GStreamer pipeline...");
                         last_pipeline_restart = std::time::Instant::now();
-                        pipeline.set_state(gst::State::Null).ok();
-                        pipeline = make_pipeline(node_id, frame_store.clone(), event_loop_proxy.clone());
-                        pipeline.set_state(gst::State::Playing).ok();
+                        engine.pipeline.set_state(gst::State::Null).ok();
+                        let proxy_clone = event_loop_proxy.clone();
+                        
+                        let active_node = if let Some(ref u_sess) = user_session_opt {
+                            u_sess.pipewire_node_id
+                        } else if let Some(ref l_sess) = login_session_opt {
+                            l_sess.pipewire_node_id
+                        } else {
+                            0
+                        };
+
+                        engine.pipeline = redfog_core::make_pipeline(active_node, frame_store.clone(), move |changed| {
+                            if changed {
+                                let _ = proxy_clone.send_event(UserEvent::FrameSizeChanged);
+                            } else {
+                                let _ = proxy_clone.send_event(UserEvent::NewFrame);
+                            }
+                        });
+                        engine.pipeline.set_state(gst::State::Playing).ok();
                         eprintln!("kwin-viewer: pipeline restarted and set to PLAYING");
                         
                         pending_resize = None;
@@ -432,22 +413,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Event::WindowEvent { event: WindowEvent::CursorLeft { .. }, .. } => {}
             Event::WindowEvent { event: WindowEvent::CursorMoved { position, .. }, .. } => {
                 if has_focus && frame_w > 0 && frame_h > 0 {
-                    // Clamp to frame bounds — window may briefly be larger than the
-                    // frame if request_inner_size hasn't been honored by the compositor yet.
                     let rx = position.x.clamp(0.0, frame_w as f64 - 1.0);
                     let ry = position.y.clamp(0.0, frame_h as f64 - 1.0);
-                    fake_input.pointer_motion_absolute(rx, ry);
-                    let _ = fi_conn.flush();
+                    engine.input_forwarder.fake_input.pointer_motion_absolute(rx, ry);
+                    let _ = engine.input_forwarder.conn.flush();
                 }
             }
             Event::WindowEvent { event: WindowEvent::MouseInput { state, button, .. }, .. } => {
                 if has_focus {
                     if let Some(evdev_btn) = winit_button_to_evdev(button) {
-                        fake_input.button(
+                        engine.input_forwarder.fake_input.button(
                             evdev_btn,
                             if state == ElementState::Pressed { 1 } else { 0 },
                         );
-                        let _ = fi_conn.flush();
+                        let _ = engine.input_forwarder.conn.flush();
                     }
                 }
             }
@@ -455,16 +434,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if has_focus {
                     if let PhysicalKey::Code(winit_key) = key_event.physical_key {
                         if let Some(evdev_key) = winit_key_to_evdev(winit_key) {
-                            fake_input.keyboard_key(
+                            engine.input_forwarder.fake_input.keyboard_key(
                                 evdev_key,
                                 if key_event.state == ElementState::Pressed { 1 } else { 0 },
                             );
-                            let _ = fi_conn.flush();
+                            let _ = engine.input_forwarder.conn.flush();
                         }
                     }
                 }
             }
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+                // Shut down any active session compositors upon viewer exit
+                if let Some(u_session) = user_session_opt.take() {
+                    u_session.terminate();
+                }
+                if let Some(l_session) = login_session_opt.take() {
+                    l_session.terminate();
+                }
                 elwt.exit();
             }
             _ => {}

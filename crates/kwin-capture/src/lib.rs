@@ -106,6 +106,7 @@ struct State {
     current_mode_id:   Option<ObjectId>,
     device_done:       bool,
     config_done:       bool,
+    has_configured_outputs: bool,
 }
 
 impl State {
@@ -124,6 +125,7 @@ impl State {
             current_mode_id: None,
             device_done: false,
             config_done: false,
+            has_configured_outputs: false,
         }
     }
 }
@@ -316,8 +318,8 @@ fn set_output_mode(
         return;
     };
 
-    // Skip if current mode already matches.
-    let already_correct = state.current_mode_id
+    // Skip if current mode already matches and we have already disabled other outputs.
+    let already_correct = state.has_configured_outputs && state.current_mode_id
         .as_ref()
         .and_then(|id| state.modes.get(id))
         .map(|(_, mw, mh)| (*mw - w).abs() <= 8 && (*mh - h).abs() <= 8)
@@ -371,11 +373,25 @@ fn set_output_mode(
     // Activate the target mode.
     let config = mgmt.create_configuration(qh, ());
     config.mode(&device, &target);
+    config.enable(&device, 1);
+    config.set_primary_output(&device);
+    config.set_priority(&device, 1);
+
+    // Disable all other output devices (like the default Virtual-0) to force
+    // all windows to map to our virtual output.
+    for other_device in &state._all_devices {
+        if other_device.id() != device.id() {
+            eprintln!("capture: disabling non-stream output device: {:?}", other_device.id());
+            config.enable(other_device, 0);
+        }
+    }
+
     config.apply();
     conn.flush().ok();
 
     state.config_done = false;
     while !state.config_done { pump(state, queue, conn); }
+    state.has_configured_outputs = true;
 }
 
 fn create_stream(

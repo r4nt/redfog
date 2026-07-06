@@ -113,22 +113,22 @@
 #   TODO: investigate GBM segfault on NVIDIA; may need kernel driver update,
 #   nvidia-drm.modeset=1, or switching to EGL_PLATFORM_DEVICE_EXT instead of
 #   EGL_PLATFORM_GBM_KHR in the KWin virtual backend.
-
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# ── D-Bus session isolation ───────────────────────────────────────────────────
+#
+# set -euo pipefail
+#
+# SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #
 # Re-exec inside a fresh D-Bus session so the headless stack (kwin_wayland,
 # plasmashell) gets its own bus and doesn't collide with the desktop session.
 # Without this, plasmashell crashes immediately because org.kde.plasmashell is
 # already owned by the desktop, and org.kde.KWin gets stolen from the desktop
 # portal by our headless kwin_wayland.
+
 if [[ -z "${_REDFOG_INNER:-}" ]]; then
     export _REDFOG_INNER=1
     exec dbus-run-session -- bash "${BASH_SOURCE[0]}" "$@"
 fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST_WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}"
 HOST_DISPLAY="${DISPLAY:-}"
 HOST_XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}"
@@ -148,17 +148,6 @@ die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
 # ── argument parsing ─────────────────────────────────────────────────────────
-#
-# Usage: proto.sh [options]
-#
-#   --skip-build       skip cargo build (use existing binary)
-#   --no-plasmashell   don't launch plasmashell
-#   --no-alacritty     don't launch alacritty as damage source
-#   --app <cmd>        launch <cmd> instead of alacritty as damage source
-#   --size WxH         virtual display size (default: 1920x1080)
-#   --kwin-args <a>    pass extra arguments to kwin_wayland
-#   --preview-scale N  scale preview window by 1/N (default: 2 = half size)
-#   --verbose          tail all logs to stdout instead of only printing errors
 
 OPT_SKIP_BUILD=0
 OPT_NO_PLASMASHELL=0
@@ -192,11 +181,8 @@ if [[ -n "$OPT_SIZE" ]]; then
 fi
 
 # The KWin virtual output runs at the preview resolution directly — no scaling.
-# This avoids coordinate translation issues and keeps CPU usage low.
 PREVIEW_W=$(( WIDTH / OPT_PREVIEW_SCALE ))
 PREVIEW_H=$(( HEIGHT / OPT_PREVIEW_SCALE ))
-WIDTH=$PREVIEW_W
-HEIGHT=$PREVIEW_H
 
 # launch <logfile> <cmd> [args...] — start a background process, redirect its
 # output to logfile unless --verbose, then append its PID to PIDS.
@@ -269,11 +255,6 @@ chmod 700 "$RUNTIME"
 echo "$DBUS_SESSION_BUS_ADDRESS" > "$LOG_DIR/dbus-session-address"
 
 # ── 1. PipeWire ──────────────────────────────────────────────────────────────
-#
-# Clean up any stale sockets from a previous run so PipeWire can bind fresh.
-# We use a private RUNTIME dir so we never collide with the system PipeWire.
-# PIPEWIRE_REMOTE (absolute socket path) is the reliable way to point clients
-# at a non-default PipeWire instance; XDG_RUNTIME_DIR alone is not enough.
 
 info "Starting PipeWire..."
 rm -f "$PW_SOCK" "$PW_SOCK.lock" "$RUNTIME/pipewire-0-manager" "$RUNTIME/pipewire-0-manager.lock"
@@ -289,80 +270,15 @@ info "PipeWire up"
 export PIPEWIRE_REMOTE="$PW_SOCK"
 
 # ── 2. Wireplumber ───────────────────────────────────────────────────────────
-#
-# Wireplumber is the PipeWire session manager.  Without it the graph stays
-# in 'suspended' and nodes never transition to 'running'.
 
 info "Starting wireplumber..."
 launch "$LOG_DIR/wireplumber.log" \
     env XDG_RUNTIME_DIR="$RUNTIME" PIPEWIRE_REMOTE="$PW_SOCK" wireplumber
 sleep 1
 
-# ── 3. KWin in virtual / headless mode ───────────────────────────────────────
-#
-# KWIN_PLATFORM=virtual: headless backend, no DRM/KMS, no dummy EDID.
-# KWin renders via OpenGL/Vulkan into GPU memory when a GBM-capable render
-# device is found (GpuManager scans /dev/dri/ via udev).  On NVIDIA with the
-# proprietary driver, gbm_create_device() segfaults, so KWin falls back to
-# software rendering — frames are exported via SHM (BGRx) instead of DMA-BUF.
-# Must start after PipeWire so the screencast plugin can connect.
+# ── 3. Build Binaries ────────────────────────────────────────────────────────
 
-info "Starting KWin (virtual platform) on WAYLAND_DISPLAY=$SOCKET..."
-rm -f "$RUNTIME/$SOCKET" "$RUNTIME/$SOCKET.lock"
-
-# Snapshot existing X11 sockets so we can detect the one XWayland creates.
-X11_BEFORE=$(ls /tmp/.X11-unix/ 2>/dev/null | sort)
-
-launch "$LOG_DIR/kwin.log" \
-    env -u WAYLAND_DISPLAY -u DISPLAY \
-        KWIN_PLATFORM=virtual \
-        KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
-        XDG_RUNTIME_DIR="$RUNTIME" \
-        PIPEWIRE_REMOTE="$PW_SOCK" \
-        kwin_wayland --no-lockscreen --socket "$SOCKET" --xwayland $OPT_KWIN_ARGS
-KWIN_PID=${PIDS[-1]}
-
-wait_path "$RUNTIME/$SOCKET" 15 \
-    || die "KWin Wayland socket did not appear — see $LOG_DIR/kwin.log"
-info "KWin up"
-
-# Detect the XWayland display KWin just started (new socket in /tmp/.X11-unix/).
-XWAYLAND_DISPLAY=""
-for ((i = 0; i < 40; i++)); do
-    NEW=$(comm -13 <(echo "$X11_BEFORE") <(ls /tmp/.X11-unix/ 2>/dev/null | sort) | head -1)
-    if [[ -n "$NEW" ]]; then
-        XWAYLAND_DISPLAY=":${NEW#X}"
-        info "KWin XWayland on DISPLAY=$XWAYLAND_DISPLAY"
-        break
-    fi
-    sleep 0.25
-done
-[[ -n "$XWAYLAND_DISPLAY" ]] || info "Warning: XWayland display not detected"
-
-# Point D-Bus-activated services at our headless session, not the desktop.
-# xdg-desktop-portal-kde uses WAYLAND_DISPLAY to connect to KWin for screencasting;
-# without this it falls back to the host display and fails.
-export XDG_RUNTIME_DIR="$RUNTIME"
-export WAYLAND_DISPLAY="$SOCKET"
-# Push DISPLAY into the systemd user session environment so fish (and other shells)
-# that read from systemctl --user show-environment pick up KWin's XWayland, not CRD.
-if [[ -n "$XWAYLAND_DISPLAY" ]]; then
-    systemctl --user set-environment DISPLAY="$XWAYLAND_DISPLAY" 2>/dev/null || true
-fi
-dbus-update-activation-environment \
-    XDG_RUNTIME_DIR WAYLAND_DISPLAY PIPEWIRE_REMOTE DISPLAY 2>/dev/null || true
-
-# ── 4. Plasmashell ───────────────────────────────────────────────────────────
-#
-# Without any Wayland clients there is no surface damage and KWin does not
-# render frames.  We try plasmashell first (best-effort: it needs Plasma DBus
-# services to render anything useful), and in any case launch a plain terminal
-# as a guaranteed damage source so there's always visible content.
-
-
-# ── 5. Build kwin-capture ────────────────────────────────────────────────────
-
-if [[ $OPT_SKIP_BUILD -eq 0 ]]; then
+if [[ $OPT_SKIP_BUILD == 0 ]]; then
     info "Building kwin-capture, kwin-input, kwin-viewer and redfog-login..."
     cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" \
         -p kwin-capture -p kwin-input -p kwin-viewer -p redfog-login --release 2>"$LOG_DIR/cargo.log" \
@@ -371,108 +287,23 @@ else
     info "Skipping build (--skip-build)"
 fi
 
-INPUT_BIN="$SCRIPT_DIR/target/release/kwin-input"
 VIEWER_BIN="$SCRIPT_DIR/target/release/kwin-viewer"
-LOGIN_BIN="$SCRIPT_DIR/target/release/redfog-login"
 
-# ── 6. Launch kwin-viewer ────────────────────────────────────────────────────
-#
-# kwin-viewer connects to the headless KWin, creates the virtual output and
-# PipeWire stream internally (via the kwin-capture library), then opens a
-# preview window and forwards input back.  It prints "ready" to stdout once
-# the GStreamer pipeline is playing.
+# ── 4. Run kwin-viewer ────────────────────────────────────────────────────────
 
-info "Streaming to local window via kwin-viewer at ${PREVIEW_W}x${PREVIEW_H} (Ctrl-C to stop)..."
+DAMAGE_APP="${OPT_APP:-alacritty}"
+if [[ $OPT_NO_ALACRITTY -ne 0 ]]; then
+    DAMAGE_APP=""
+fi
 
-READY_FIFO="$LOG_DIR/viewer-ready.fifo"
-rm -f "$READY_FIFO"
-mkfifo "$READY_FIFO"
+info "Running managed kwin-viewer session..."
 
+# Run kwin-viewer under host display contexts so it opens on host monitor,
+# but connect it to the isolated PipeWire daemon.
 env -u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR \
     WAYLAND_DISPLAY="$HOST_WAYLAND_DISPLAY" \
     DISPLAY="$HOST_DISPLAY" \
     XDG_RUNTIME_DIR="$HOST_XDG_RUNTIME_DIR" \
     PIPEWIRE_REMOTE="$PW_SOCK" \
     REDFOG_SCALE="$SCALE" \
-    "$VIEWER_BIN" "$RUNTIME/$SOCKET" "$PREVIEW_W" "$PREVIEW_H" \
-    >"$READY_FIFO" 2>"$LOG_DIR/kwin-viewer.log" &
-VIEWER_PID=$!
-PIDS+=($VIEWER_PID)
-
-head -n1 "$READY_FIFO" >/dev/null
-kill -0 "$VIEWER_PID" 2>/dev/null || die "kwin-viewer died before becoming ready — see $LOG_DIR/kwin-viewer.log"
-info "Preview window open. Ctrl-C to stop."
-
-info "Starting login UI on virtual display..."
-env WAYLAND_DISPLAY="$SOCKET" \
-    XDG_RUNTIME_DIR="$RUNTIME" \
-    DISPLAY="${XWAYLAND_DISPLAY:-}" \
-    "$LOGIN_BIN" 2>"$LOG_DIR/login.log"
-LOGIN_STATUS=$?
-
-if [[ $LOGIN_STATUS -ne 0 ]]; then
-    info "Login UI cancelled or exited with error code $LOGIN_STATUS."
-    exit $LOGIN_STATUS
-fi
-
-info "Login authenticated successfully! Starting user desktop environment..."
-
-if [[ $OPT_NO_PLASMASHELL -eq 0 ]]; then
-    info "Starting plasmashell..."
-    launch "$LOG_DIR/plasmashell.log" \
-        env WAYLAND_DISPLAY="$SOCKET" \
-            XDG_RUNTIME_DIR="$RUNTIME" \
-            PIPEWIRE_REMOTE="$PW_SOCK" \
-            DISPLAY="${XWAYLAND_DISPLAY:-}" \
-            plasmashell --no-respawn
-fi
-
-
-# ── 7. Input forwarding via org_kde_kwin_fake_input ──────────────────────────
-#
-# kwin-input provides a FIFO-based interface for scripted input injection,
-# complementing the direct input forwarding built into kwin-viewer.
-#
-# Send commands to the FIFO:
-#   echo "key 28 1"        > /tmp/redfog-proto/kwin-input-cmd.fifo  # Enter down
-#   echo "key 28 0"        > /tmp/redfog-proto/kwin-input-cmd.fifo  # Enter up
-#   echo "rel 100 50"      > /tmp/redfog-proto/kwin-input-cmd.fifo  # mouse move
-#   echo "button 272 1"    > /tmp/redfog-proto/kwin-input-cmd.fifo  # left click
-#   echo "button 272 0"    > /tmp/redfog-proto/kwin-input-cmd.fifo
-# Keycodes are Linux evdev keycodes (not X11/USB HID). Common codes:
-#   1=ESC 28=Enter 57=Space 30=A 48=B ... 272=BTN_LEFT 273=BTN_RIGHT
-
-INPUT_FIFO="$LOG_DIR/kwin-input-cmd.fifo"
-rm -f "$INPUT_FIFO"
-mkfifo "$INPUT_FIFO"
-exec 5<>"$INPUT_FIFO"
-
-# ── 9. Launch a damage source ─────────────────────────────────────────────────
-#
-# Without any Wayland client committing frames, KWin renders at most one black
-# frame.  We need a real app drawing in the session.
-# --no-alacritty skips this (useful if you're launching your own app manually).
-# --app <cmd> uses a custom command instead of alacritty.
-
-info "Starting kwin-input (fake_input)..."
-WAYLAND_DISPLAY="$SOCKET" \
-XDG_RUNTIME_DIR="$RUNTIME" \
-    "$INPUT_BIN" <"$INPUT_FIFO" 2>"$LOG_DIR/kwin-input.log" &
-PIDS+=($!)
-sleep 0.3
-grep -q "authenticated" "$LOG_DIR/kwin-input.log" 2>/dev/null \
-    && info "kwin-input ready" \
-    || info "kwin-input started (see $LOG_DIR/kwin-input.log)"
-
-if [[ $OPT_NO_ALACRITTY -eq 0 ]]; then
-    sleep 2
-    DAMAGE_APP="${OPT_APP:-alacritty}"
-    info "Launching $DAMAGE_APP as damage source..."
-    launch "$LOG_DIR/damage-app.log" \
-        env WAYLAND_DISPLAY="$SOCKET" \
-            XDG_RUNTIME_DIR="$RUNTIME" \
-            DISPLAY="${XWAYLAND_DISPLAY:-}" \
-            $DAMAGE_APP
-fi
-
-wait $VIEWER_PID
+    "$VIEWER_BIN" "$PREVIEW_W" "$PREVIEW_H" "$DAMAGE_APP"
