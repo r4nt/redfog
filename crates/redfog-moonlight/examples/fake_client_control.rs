@@ -24,7 +24,8 @@ fn gcm_encrypt(plaintext: &[u8], key: &[u8; 16], iv: &[u8; 12]) -> (Vec<u8>, [u8
 fn build_encrypted_message(key: &[u8; 16], sequence_number: u32, inner: &[u8]) -> Vec<u8> {
     let mut iv = [0u8; 12];
     iv[0..4].copy_from_slice(&sequence_number.to_le_bytes());
-    iv[10] = b'H';
+    // Serverbound marker (this simulates a client sending to the server).
+    iv[10] = b'C';
     iv[11] = b'C';
     let (ciphertext, tag) = gcm_encrypt(inner, key, &iv);
 
@@ -90,9 +91,13 @@ async fn main() {
                 _ => {}
             }
         }
-        if sent {
-            break;
-        }
+    }
+    // Keep servicing the connection for a few more seconds so ENet's reliable
+    // retransmission actually has a chance to complete before we exit and
+    // drop the socket.
+    let linger_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < linger_deadline {
+        let _ = host.service(Duration::from_millis(200)).await;
     }
 
     if connected && sent {

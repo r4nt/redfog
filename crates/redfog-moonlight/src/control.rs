@@ -4,7 +4,15 @@
 //! type][u16 LE length][payload]` where `length = payload.len()`. The
 //! `Encrypted` (0x0001) type wraps an AES-128-GCM-encrypted inner message:
 //! `[u32 LE sequence_number][16-byte tag][ciphertext]`, IV = `[sequence_number
-//! LE (4 bytes)][6 zero bytes]['H']['C']`, key = the client's `rikey` (sent
+//! LE (4 bytes)][5 zero bytes]['C']['C']` for messages *we receive*
+//! (serverbound) — clientbound (messages a server sends) uses `['H']['C']`
+//! instead; confirmed against moonlight-common-rust's `ControlEncryptionMethod::
+//! Sunshine` IV derivation, which is direction-dependent. Also requires the
+//! server to advertise itself as Sunshine-like (`<appversion>` with a negative
+//! 4th component, `x-ss-general.encryptionSupported` with `CONTROL_V2`
+//! (`0x01`) set — see pairing.rs/rtsp.rs) or real clients skip this whole
+//! negotiation and fall back to sending `InputData` unencrypted, keyed/framed
+//! differently than what's documented here. Key = the client's `rikey` (sent
 //! as a query param on `/launch`, not in the RTSP SDP — see pairing.rs).
 //! `InputData` (0x0206) payloads are `[u32 LE input_event_type][event bytes]`.
 //! Gamepad input is out of scope for this iteration (deferred, see plan doc).
@@ -58,7 +66,13 @@ impl ControlServer {
         let config = HostConfig {
             address: Some(std::net::SocketAddr::new(bind_addr, self.port)),
             peer_count: 4,
-            channel_limit: 1,
+            // Real clients request 48 channels (confirmed live: "channel_count=48"
+            // in the connection log) — keyboard/mouse/gamepad input each use
+            // dedicated channel indices (see moonlight-common-rust's
+            // `EnetChannel`, CHANNEL_COUNT=0x30=48), not just channel 0.
+            // Capping this at 1 silently clamps the negotiated channel count,
+            // corrupting/dropping anything sent on a channel we never set up.
+            channel_limit: 48,
             ..Default::default()
         };
         let mut host = Host::new(config).map_err(|e| format!("failed to create enet host on port {}: {e}", self.port))?;
@@ -170,7 +184,9 @@ fn decrypt_wrapper(payload: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 
     let mut iv = [0u8; 12];
     iv[0..4].copy_from_slice(&sequence_number.to_le_bytes());
-    iv[10] = b'H';
+    // Serverbound (client -> server, i.e. everything we ever decrypt here)
+    // uses 'C' at iv[10] — 'H' is the clientbound marker instead.
+    iv[10] = b'C';
     iv[11] = b'C';
 
     crypto::gcm_decrypt(ciphertext, key, &iv, &tag)
@@ -363,7 +379,9 @@ mod tests {
     fn encrypt_message(key: &[u8; 16], sequence_number: u32, inner: &[u8]) -> Vec<u8> {
         let mut iv = [0u8; 12];
         iv[0..4].copy_from_slice(&sequence_number.to_le_bytes());
-        iv[10] = b'H';
+        // Matches decrypt_wrapper's serverbound ('C') marker — this helper
+        // simulates a client sending to us.
+        iv[10] = b'C';
         iv[11] = b'C';
         let (ciphertext, tag) = crypto::gcm_encrypt(inner, key, &iv).unwrap();
 

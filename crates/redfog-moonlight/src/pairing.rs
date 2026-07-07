@@ -220,11 +220,19 @@ impl PairingServer {
         // moonlight-qt takes that completely literally: it strips even H.264
         // out of its own supported-formats list before ever attempting to
         // stream, so the connection silently dies before RTSP every time.
+        // The 4th version component negative marks us "Sunshine-like" to real
+        // clients (moonlight-common-rust's `ServerVersion::new`: `server_type
+        // = Sunshine` iff this component is negative) — confirmed against
+        // Wolf, which advertises the exact same "7.1.431.-1". Without it,
+        // clients treat us as genuine Nvidia GameStream and skip ALL
+        // Sunshine-specific negotiation, including which control-channel
+        // input-encryption scheme (IV/key derivation) to use — the likely
+        // cause of input packets failing to decrypt/parse on our end.
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <root status_code="200">
     <hostname>{hostname}</hostname>
-    <appversion>7.1.415.0</appversion>
+    <appversion>7.1.431.-1</appversion>
     <GfeVersion>3.23.0.74</GfeVersion>
     <uniqueid>{server_id}</uniqueid>
     <MaxLumaPixelsHEVC>0</MaxLumaPixelsHEVC>

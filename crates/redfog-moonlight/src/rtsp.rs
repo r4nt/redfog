@@ -239,12 +239,19 @@ impl RtspServer {
     }
 
     fn sdp(&self) -> String {
+        // `encryptionSupported` is a bitmask: CONTROL_V2=0x01, VIDEO=0x02,
+        // AUDIO=0x04 (confirmed against moonlight-common-rust's
+        // `SunshineEncryptionFlags`). Only CONTROL_V2 — control.rs already
+        // implements it, video/audio don't. Without this bit set, real
+        // clients (having also been told we're "Sunshine-like" via
+        // `<appversion>`, see pairing.rs) still fall back to skipping
+        // control-channel encryption negotiation entirely.
         format!(
             "v=0\r\n\
              o=redfog 0 0 IN IPv4 0.0.0.0\r\n\
              s=redfog-server\r\n\
              a=x-ss-general.featureFlags:0\r\n\
-             a=x-ss-general.encryptionSupported:0\r\n\
+             a=x-ss-general.encryptionSupported:1\r\n\
              a=x-nv-video[0].videoPort:{video_port}\r\n\
              a=x-nv-general.serverControlPort:{control_port}\r\n\
              a=x-nv-general.serverAudioPort:{audio_port}\r\n",
