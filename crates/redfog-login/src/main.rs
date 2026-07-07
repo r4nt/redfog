@@ -32,6 +32,13 @@ impl Default for LoginApp {
 
 impl eframe::App for LoginApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // egui only repaints on input by default. Streaming needs a steady
+        // stream of Wayland surface commits regardless of user interaction —
+        // KWin's screencast only pushes a PipeWire frame when a client
+        // commits a new buffer, so without this the capture pipeline sends
+        // one frame and then stalls forever.
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+
         // Support headless/automated testing trigger
         if std::path::Path::new("/tmp/trigger-login").exists() {
             let _ = std::fs::remove_file("/tmp/trigger-login");

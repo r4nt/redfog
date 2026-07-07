@@ -111,9 +111,7 @@ impl SessionManager {
 
     fn spawn_session(&self, kind: SessionType, width: u32, height: u32) -> Result<RunningSession, String> {
         let (socket_name, payload): (&str, Vec<String>) = match &kind {
-            // TEMPORARY: still glxgears, to verify the fixed-size-shard fix
-            // in isolation before also tackling the damage-source stall.
-            SessionType::Login => ("redfog-login-0", vec!["glxgears".to_string()]),
+            SessionType::Login => ("redfog-login-0", vec!["target/release/redfog-login".to_string()]),
             SessionType::User(_) => ("redfog-user-0", self.config.user_app.clone()),
         };
 
