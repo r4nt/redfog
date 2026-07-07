@@ -76,6 +76,21 @@ pub struct SessionManager {
     /// Shared with `control::ControlServer` — see its doc comment for why
     /// this is a cell rather than passed in at construction.
     rikey_cell: Arc<Mutex<Option<[u8; 16]>>>,
+    /// RTP sequence numbers, frame indices, and the timestamp clock's epoch
+    /// must stay continuous across a Login->User handoff — it's the same
+    /// wire-level RTSP/video session from the client's perspective, just a
+    /// different compositor underneath. Recreating these per-`spawn_session`
+    /// call (as originally written) reset sequence numbers/frame indices back
+    /// near zero on every handoff; real clients' RTP jitter buffers/frame
+    /// trackers treat a sudden drop like that as stale/duplicate data and
+    /// silently stop accepting new frames — confirmed live: video froze on
+    /// the last login-screen frame forever after handoff, while input (a
+    /// separate control-channel path) kept working fine. `reset_stream_state`
+    /// is the only thing allowed to replace these, and only for a genuinely
+    /// new `/launch`, not a handoff within the same session.
+    video_packetizer: Mutex<Arc<Mutex<VideoPacketizer>>>,
+    audio_packetizer: Mutex<Arc<Mutex<AudioPacketizer>>>,
+    stream_start: Mutex<std::time::Instant>,
 }
 
 impl SessionManager {
@@ -90,6 +105,9 @@ impl SessionManager {
             spawn_done: Condvar::new(),
             self_ref: OnceLock::new(),
             rikey_cell: Arc::new(Mutex::new(None)),
+            video_packetizer: Mutex::new(Arc::new(Mutex::new(VideoPacketizer::new()))),
+            audio_packetizer: Mutex::new(Arc::new(Mutex::new(AudioPacketizer::new()))),
+            stream_start: Mutex::new(std::time::Instant::now()),
         });
         let _ = this.self_ref.set(Arc::downgrade(&this));
         this
@@ -99,6 +117,15 @@ impl SessionManager {
     /// session's `rikey` from.
     pub fn rikey_cell(&self) -> Arc<Mutex<Option<[u8; 16]>>> {
         self.rikey_cell.clone()
+    }
+
+    /// Start a fresh RTP sequence/frame-index/timestamp epoch for a genuinely
+    /// new `/launch` (a new RTSP session from the client's perspective) — NOT
+    /// called on a Login->User handoff, which must keep the existing state.
+    fn reset_stream_state(&self) {
+        *self.video_packetizer.lock().unwrap() = Arc::new(Mutex::new(VideoPacketizer::new()));
+        *self.audio_packetizer.lock().unwrap() = Arc::new(Mutex::new(AudioPacketizer::new()));
+        *self.stream_start.lock().unwrap() = std::time::Instant::now();
     }
 
     /// An owned `Arc<Self>` for moving into spawned tasks — trait methods
@@ -134,12 +161,15 @@ impl SessionManager {
         // than capturing today's (always-`None`) value once here.
         let bitrate = self.config.bitrate_kbps;
         let this = self.arc_self();
-        let video_packetizer = Arc::new(Mutex::new(VideoPacketizer::new()));
+        // Shared across the whole RTSP session (see the doc comment on these
+        // fields) — NOT recreated here, so a Login->User handoff keeps
+        // sequence numbers/frame indices/timestamps continuous.
+        let video_packetizer = self.video_packetizer.lock().unwrap().clone();
         // RTP timestamps use a 90kHz clock (standard for video) — derived
         // from wall-clock time since streaming started rather than a fixed
         // per-frame increment, since frames aren't encoded at a perfectly
         // even interval.
-        let stream_start = std::time::Instant::now();
+        let stream_start = *self.stream_start.lock().unwrap();
         let video_pipeline = redfog_core::make_encoder_pipeline(compositor.pipewire_node_id, bitrate, {
             let handle = handle.clone();
             let this = this.clone();
@@ -154,7 +184,7 @@ impl SessionManager {
             }
         });
 
-        let audio_packetizer = Arc::new(Mutex::new(AudioPacketizer::new()));
+        let audio_packetizer = self.audio_packetizer.lock().unwrap().clone();
         let audio_pipeline = redfog_core::make_audio_pipeline(&audio_loopback, move |packet| {
             let Some(sender) = this.shared.lock().unwrap().audio_sender.clone() else { return };
             // Opus's RTP clock rate is 48kHz regardless of the actual sample rate.
@@ -297,6 +327,11 @@ impl LaunchHandler for SessionManager {
             // check above rather than after `spawn_session()` returns.
             shared.state = State::Spawning;
         }
+        // A genuinely new RTSP session (not a handoff) — start fresh RTP
+        // sequence numbers/frame indices/timestamps. See the doc comment on
+        // `SessionManager`'s packetizer fields for why this must NOT also
+        // happen inside `handoff_to_user`.
+        self.reset_stream_state();
         // A panic during spawn (e.g. a bad GStreamer pipeline description —
         // this has actually happened) must not skip the state reset below:
         // without `catch_unwind` here, `Spawning` would be stuck forever and

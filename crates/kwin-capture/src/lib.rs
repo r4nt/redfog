@@ -413,7 +413,7 @@ fn create_stream(
         screencast.stream_virtual_output(
             state.our_output_name.clone(),
             w, h, scale,
-            zkde_screencast_unstable_v1::Pointer::Hidden as u32,
+            zkde_screencast_unstable_v1::Pointer::Embedded as u32,
             qh, (),
         )
     };

@@ -97,7 +97,6 @@ impl CompositorSession {
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("PIPEWIRE_REMOTE", &pw_sock)
             .env("LIBGL_ALWAYS_SOFTWARE", "1")
-            .env("KDE_NO_SYSTEMD_BOOT", "1")
             .arg("--virtual")
             .arg("--width")
             .arg(&width.to_string())
