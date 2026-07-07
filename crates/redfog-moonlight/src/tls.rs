@@ -6,6 +6,7 @@
 //! used across restarts or every paired client would need to re-pair.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::RsaPrivateKey;
@@ -124,4 +125,89 @@ impl ServerIdentity {
 
 pub fn default_state_dir() -> PathBuf {
     PathBuf::from(redfog_core::DEFAULT_RUNTIME_DIR).join("moonlight")
+}
+
+/// Requests (but doesn't require, and doesn't validate against any CA) a
+/// client certificate on the HTTPS listener.
+///
+/// Real Moonlight clients present a self-signed cert with no shared trust
+/// anchor — GameStream's actual trust model is "whatever cert came through
+/// during PIN pairing, remembered forever", not a CA chain. Confirmed against
+/// Wolf (Games on Whales)'s server, which does the same: it accepts any
+/// client cert at the TLS layer, then separately checks whether *that
+/// specific certificate* is on its paired-clients list before treating the
+/// request as authenticated (`get_client_via_ssl` in
+/// `state/config.hpp`) — a client's `uniqueid` string isn't trustworthy for
+/// this on its own, since moonlight-qt reuses a shared placeholder uniqueid
+/// for any server it doesn't detect as genuine Nvidia GFE software.
+#[derive(Debug)]
+pub struct AcceptAnyClientCert {
+    schemes: Vec<rustls::SignatureScheme>,
+}
+
+impl AcceptAnyClientCert {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            schemes: rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes(),
+        })
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        // Optional: `/pair` itself and the client's very first discovery
+        // poll happen before it has any reason to present a cert tied to us.
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.schemes.clone()
+    }
 }

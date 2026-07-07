@@ -97,7 +97,7 @@ impl PairingServer {
                 let io = TokioIo::new(stream);
                 let service = service_fn(move |req| {
                     let this = this.clone();
-                    async move { Ok::<_, Infallible>(this.handle(req, peer, local_addr, false).await) }
+                    async move { Ok::<_, Infallible>(this.handle(req, peer, local_addr, false, None).await) }
                 });
                 if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
                     tracing::debug!("http connection from {peer} ended: {e}");
@@ -119,8 +119,13 @@ impl PairingServer {
         // outright per RFC 7301 rather than falling back — better to not
         // negotiate ALPN at all than to guess wrong and hard-fail every
         // connection. We only ever speak HTTP/1.1 regardless.
+        //
+        // Client auth is requested (not `with_no_client_auth`) so we can see
+        // *which* certificate a request actually presents — see
+        // `is_paired_by_cert`'s doc comment for why that's the only
+        // trustworthy way to tell two physical clients apart.
         let tls_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
+            .with_client_cert_verifier(crate::tls::AcceptAnyClientCert::new())
             .with_single_cert(cert, key)
             .map_err(|e| format!("failed to build tls config: {e}"))?;
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
@@ -147,10 +152,17 @@ impl PairingServer {
                         return;
                     }
                 };
+                let client_cert_fingerprint = tls_stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certs| certs.first())
+                    .map(|cert| crate::crypto::cert_fingerprint_der(cert));
                 let io = TokioIo::new(tls_stream);
                 let service = service_fn(move |req| {
                     let this = this.clone();
-                    async move { Ok::<_, Infallible>(this.handle(req, peer, local_addr, true).await) }
+                    let client_cert_fingerprint = client_cert_fingerprint.clone();
+                    async move { Ok::<_, Infallible>(this.handle(req, peer, local_addr, true, client_cert_fingerprint).await) }
                 });
                 if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
                     tracing::debug!("https connection from {peer} ended: {e}");
@@ -159,7 +171,14 @@ impl PairingServer {
         }
     }
 
-    async fn handle(&self, req: Request<Incoming>, peer: SocketAddr, local_addr: SocketAddr, https: bool) -> Response<Full<Bytes>> {
+    async fn handle(
+        &self,
+        req: Request<Incoming>,
+        peer: SocketAddr,
+        local_addr: SocketAddr,
+        https: bool,
+        client_cert_fingerprint: Option<String>,
+    ) -> Response<Full<Bytes>> {
         let path = req.uri().path().to_string();
         let params = parse_query(req.uri().query().unwrap_or(""));
 
@@ -173,24 +192,34 @@ impl PairingServer {
         });
 
         match path.as_str() {
-            "/serverinfo" => self.server_info(&params),
+            "/serverinfo" => self.server_info(&params, https, client_cert_fingerprint.as_deref()),
             "/applist" => self.app_list(),
             "/pair" => self.pair(&params).await,
             "/unpair" => self.unpair(&params),
-            "/launch" => self.launch(&params, local_addr.ip()),
-            "/resume" => self.resume(&params, local_addr.ip()),
-            "/cancel" => self.cancel(&params),
+            "/launch" => self.launch(&params, local_addr.ip()).await,
+            "/resume" => self.resume(&params, local_addr.ip()).await,
+            "/cancel" => self.cancel(&params).await,
             "/pin" => self.pin_page(&params),
             "/submit-pin" => self.submit_pin_query(&params, req.into_body()).await,
             _ => not_found(),
         }
     }
 
-    fn server_info(&self, params: &HashMap<String, String>) -> Response<Full<Bytes>> {
-        let paired = params
-            .get("uniqueid")
-            .map(|id| self.clients.is_paired(id))
-            .unwrap_or(false);
+    fn server_info(&self, _params: &HashMap<String, String>, https: bool, client_cert_fingerprint: Option<&str>) -> Response<Full<Bytes>> {
+        // `uniqueid` alone can't tell two physical clients apart — real
+        // Moonlight clients share a hardcoded placeholder uniqueid for any
+        // server they don't detect as genuine Nvidia GFE (see
+        // `ClientManager::is_paired_by_cert`'s doc comment). Plain HTTP has
+        // no TLS session to pull a certificate from, so it's always reported
+        // unpaired — matches Wolf, whose HTTP `/serverinfo` handler passes an
+        // empty client unconditionally for the same reason.
+        let paired = https && client_cert_fingerprint.is_some_and(|fp| self.clients.is_paired_by_cert(fp));
+        // `ServerCodecModeSupport` is a bitmask (0x0001 = H.264, confirmed
+        // against Wolf's implementation), not a boolean/placeholder — `0`
+        // doesn't mean "no explicit info", it means "zero codecs supported".
+        // moonlight-qt takes that completely literally: it strips even H.264
+        // out of its own supported-formats list before ever attempting to
+        // stream, so the connection silently dies before RTSP every time.
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <root status_code="200">
@@ -199,7 +228,7 @@ impl PairingServer {
     <GfeVersion>3.23.0.74</GfeVersion>
     <uniqueid>{server_id}</uniqueid>
     <MaxLumaPixelsHEVC>0</MaxLumaPixelsHEVC>
-    <ServerCodecModeSupport>0</ServerCodecModeSupport>
+    <ServerCodecModeSupport>1</ServerCodecModeSupport>
     <HttpsPort>{https_port}</HttpsPort>
     <ExternalPort>{http_port}</ExternalPort>
     <mac>00:00:00:00:00:00</mac>
@@ -272,6 +301,7 @@ impl PairingServer {
             Some(s) => s,
             None => return bad_request("invalid salt (expected 16 bytes)".to_string()),
         };
+        tracing::info!("pairing started for uniqueid={unique_id}, waiting for PIN via /submit-pin");
 
         let pin_ready = self.clients.start_pairing(unique_id, client_cert_pem, salt);
 
@@ -350,7 +380,16 @@ impl PairingServer {
         xml_response(paired_xml(""))
     }
 
-    fn launch(&self, params: &HashMap<String, String>, local_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
+    // `LaunchHandler`'s methods are synchronous and genuinely block (process
+    // spawning, D-Bus activation, and — for `launch` specifically — up to a
+    // 15s condvar wait for a concurrent spawn to finish). Calling them
+    // directly from an async handler blocks a tokio *worker* thread for that
+    // whole duration; with enough concurrent `/launch` calls piling up (real
+    // clients retry it on their own), that starves the entire small worker
+    // pool and even trivial requests like `/serverinfo` stop being served at
+    // all — confirmed live. `spawn_blocking` runs it on tokio's separate,
+    // much larger blocking-thread pool instead.
+    async fn launch(&self, params: &HashMap<String, String>, local_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
         let width = params.get("width").and_then(|s| s.parse().ok()).unwrap_or(1920);
         let height = params.get("height").and_then(|s| s.parse().ok()).unwrap_or(1080);
         let fps = params.get("fps").and_then(|s| s.parse().ok()).unwrap_or(60);
@@ -359,7 +398,12 @@ impl PairingServer {
             return bad_request("missing/invalid rikey/rikeyid".to_string());
         };
 
-        match self.launch_handler.launch(width, height, fps, rikey) {
+        let handler = self.launch_handler.clone();
+        let result = tokio::task::spawn_blocking(move || handler.launch(width, height, fps, rikey))
+            .await
+            .unwrap_or_else(|e| Err(format!("launch task panicked: {e}")));
+
+        match result {
             // The client parses this as a raw socket address, not a hostname
             // (no DNS resolution) — mirror back the IP it actually used to
             // reach us, from the accepted connection's local address.
@@ -375,8 +419,13 @@ impl PairingServer {
         }
     }
 
-    fn resume(&self, _params: &HashMap<String, String>, local_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
-        match self.launch_handler.resume() {
+    async fn resume(&self, _params: &HashMap<String, String>, local_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
+        let handler = self.launch_handler.clone();
+        let result = tokio::task::spawn_blocking(move || handler.resume())
+            .await
+            .unwrap_or_else(|e| Err(format!("resume task panicked: {e}")));
+
+        match result {
             Ok(()) => xml_response(format!(
                 r#"<?xml version="1.0" encoding="utf-8"?>
 <root status_code="200">
@@ -389,8 +438,13 @@ impl PairingServer {
         }
     }
 
-    fn cancel(&self, _params: &HashMap<String, String>) -> Response<Full<Bytes>> {
-        match self.launch_handler.cancel() {
+    async fn cancel(&self, _params: &HashMap<String, String>) -> Response<Full<Bytes>> {
+        let handler = self.launch_handler.clone();
+        let result = tokio::task::spawn_blocking(move || handler.cancel())
+            .await
+            .unwrap_or_else(|e| Err(format!("cancel task panicked: {e}")));
+
+        match result {
             Ok(()) => xml_response(paired_xml("<cancel>1</cancel>")),
             Err(e) => bad_request(e),
         }

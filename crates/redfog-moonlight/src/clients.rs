@@ -64,6 +64,16 @@ impl ClientManager {
         self.state.lock().unwrap().paired.contains_key(unique_id)
     }
 
+    /// Real Moonlight clients reuse a shared placeholder `uniqueid`
+    /// ("0123456789ABCDEF") for any server it doesn't detect as genuine
+    /// Nvidia GFE software (see `nvhttp.cpp` in moonlight-qt) — so `uniqueid`
+    /// alone can't distinguish between two different physical devices.
+    /// Real Sunshine/Wolf hosts key pairing by the client's actual TLS
+    /// certificate instead; this mirrors that.
+    pub fn is_paired_by_cert(&self, cert_fingerprint: &str) -> bool {
+        self.state.lock().unwrap().paired.values().any(|fp| fp == cert_fingerprint)
+    }
+
     /// Step 1: client sent its cert + salt. Returns the notifier to await the
     /// PIN before responding with the server cert.
     pub fn start_pairing(&self, unique_id: &str, client_cert_pem: String, salt: [u8; 16]) -> Arc<Notify> {

@@ -133,7 +133,9 @@ impl RtspServer {
         };
         tracing::debug!("rtsp: {:?} cseq={:?} target={:?}", request.method(), request.header(&CSEQ), original_target);
 
-        let response = self.handle_request(&request, &self.session_id, original_target.as_deref().unwrap_or(""));
+        let response = self
+            .handle_request(&request, &self.session_id, original_target.as_deref().unwrap_or(""))
+            .await;
         let mut out = Vec::new();
         response
             .write(&mut out)
@@ -144,7 +146,7 @@ impl RtspServer {
         Ok(())
     }
 
-    fn handle_request(&self, request: &Request<Vec<u8>>, session_id: &str, target: &str) -> Response<Vec<u8>> {
+    async fn handle_request(&self, request: &Request<Vec<u8>>, session_id: &str, target: &str) -> Response<Vec<u8>> {
         let cseq = request.header(&CSEQ).cloned();
         let mut response = match *request.method() {
             Method::Options => Response::builder(Version::V1_0, StatusCode::Ok)
@@ -182,7 +184,15 @@ impl RtspServer {
                 Response::builder(Version::V1_0, StatusCode::Ok).build(Vec::new())
             }
             Method::Play => {
-                self.handler.on_play();
+                // `on_play` can block (waiting for a concurrent `/launch`'s
+                // slow compositor spawn to finish) — run it on the blocking
+                // pool so it can't stall this connection's tokio worker
+                // thread, same reasoning as the `pairing.rs` launch/resume/
+                // cancel call sites.
+                let handler = self.handler.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || handler.on_play()).await {
+                    tracing::error!("on_play task panicked: {e}");
+                }
                 Response::builder(Version::V1_0, StatusCode::Ok)
                     .header(SESSION, session_id.to_string())
                     .build(Vec::new())
@@ -263,23 +273,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn options_echoes_cseq() {
+    #[tokio::test]
+    async fn options_echoes_cseq() {
         let request = Request::builder(Method::Options, Version::V1_0)
             .header(CSEQ, "1")
             .empty();
-        let response = server().handle_request(&request.replace_body(Vec::new()), "deadbeef", "*");
+        let response = server()
+            .handle_request(&request.replace_body(Vec::new()), "deadbeef", "*")
+            .await;
         assert_eq!(response.status(), StatusCode::Ok);
         assert_eq!(response.header(&CSEQ).map(|v| v.as_str()), Some("1"));
     }
 
-    #[test]
-    fn setup_returns_session_id_and_correct_transport_port() {
+    #[tokio::test]
+    async fn setup_returns_session_id_and_correct_transport_port() {
         let request = Request::builder(Method::Setup, Version::V1_0)
             .header(CSEQ, "2")
             .empty();
         // Real clients send "stream=control/N/0" (not "streamid=") for this one — see rtsp.rs comment.
-        let response = server().handle_request(&request.replace_body(Vec::new()), "deadbeef", "stream=control/13/0");
+        let response = server()
+            .handle_request(&request.replace_body(Vec::new()), "deadbeef", "stream=control/13/0")
+            .await;
         assert_eq!(response.header(&SESSION).map(|v| v.as_str()), Some("deadbeef"));
         assert_eq!(response.header(&TRANSPORT).map(|v| v.as_str()), Some("unicast;server_port=47999-48000"));
     }

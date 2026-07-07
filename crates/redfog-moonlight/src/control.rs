@@ -117,10 +117,16 @@ impl ControlMessage {
         }
         let message_type = u16::from_le_bytes([buffer[0], buffer[1]]);
         let length = u16::from_le_bytes([buffer[2], buffer[3]]) as usize;
-        if length != buffer.len() - 4 {
+        // Real clients (confirmed live against moonlight-qt) send trailing
+        // bytes past what `length` claims — e.g. `PeriodicPing` (0x0200)
+        // arrives as a 10-byte packet with `length=4`, not the 8 bytes
+        // moonlight-common-rust's own (buggy) serializer would produce.
+        // Trust `length` and ignore anything after it, only rejecting a
+        // packet that's genuinely truncated.
+        if length > buffer.len() - 4 {
             return Err(format!("control message length mismatch: header says {length}, buffer has {}", buffer.len() - 4));
         }
-        let payload = &buffer[4..];
+        let payload = &buffer[4..4 + length];
 
         if message_type == CONTROL_MSG_ENCRYPTED {
             let decrypted = decrypt_wrapper(payload, key)?;
@@ -140,10 +146,10 @@ impl ControlMessage {
                     return Err("input data message too short".to_string());
                 }
                 let event_len = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
-                if event_len != payload.len() - 4 {
+                if event_len > payload.len() - 4 {
                     return Err(format!("input event length mismatch: header says {event_len}, have {}", payload.len() - 4));
                 }
-                Ok(Self::InputData(payload[4..].to_vec()))
+                Ok(Self::InputData(payload[4..4 + event_len].to_vec()))
             }
             CONTROL_MSG_REQUEST_IDR_FRAME | CONTROL_MSG_INVALIDATE_REFERENCE_FRAMES => Ok(Self::RequestIdrFrame),
             _ => Ok(Self::Other),

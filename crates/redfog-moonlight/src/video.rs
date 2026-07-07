@@ -40,6 +40,13 @@ const RTP_FLAG_START_OF_FRAME: u8 = 0x4;
 /// forwarding into a channel) decides how packets actually get sent.
 pub struct VideoPacketizer {
     sequence_number: u32,
+    /// The `frame_index` field in every shard's `NvVideoPacket` header. Real
+    /// decoders use this to detect frame boundaries/completeness and to drop
+    /// stale/duplicate data — it must increment once per access unit, not
+    /// stay fixed. Confirmed live: leaving every frame at index 0 streamed
+    /// real bytes end to end (client received/ACKed them) but never
+    /// displayed anything beyond (if that) the very first frame.
+    frame_number: u32,
 }
 
 impl Default for VideoPacketizer {
@@ -50,11 +57,17 @@ impl Default for VideoPacketizer {
 
 impl VideoPacketizer {
     pub fn new() -> Self {
-        Self { sequence_number: 0 }
+        // Real hosts start frame numbering at 1, not 0 — confirmed against
+        // moonlight-common-rust's own `VideoPayloader` ("Frame Index Starts
+        // at 1!"). 0 may be treated as a sentinel/invalid value by strict
+        // depacketizers.
+        Self { sequence_number: 0, frame_number: 1 }
     }
 
     /// Packetize one encoded access unit. Returns the shards to send, in order.
-    pub fn packetize(&mut self, encoded_data: &[u8], is_key_frame: bool, frame_number: u32, rtp_timestamp: u32) -> Vec<Vec<u8>> {
+    pub fn packetize(&mut self, encoded_data: &[u8], is_key_frame: bool, rtp_timestamp: u32) -> Vec<Vec<u8>> {
+        let frame_number = self.frame_number;
+        self.frame_number = self.frame_number.wrapping_add(1);
         let requested_shard_payload_size = REQUESTED_PACKET_SIZE - NV_VIDEO_PACKET_SIZE;
         let packet_data_len = VIDEO_FRAME_HEADER_SIZE + encoded_data.len();
 
@@ -215,7 +228,7 @@ mod tests {
     fn single_shard_frame_has_start_and_end_flags() {
         let mut packetizer = VideoPacketizer::new();
         let encoded = vec![0xAB; 100]; // well under one shard's payload capacity
-        let shards = packetizer.packetize(&encoded, true, 1, 1000);
+        let shards = packetizer.packetize(&encoded, true, 1000);
         assert_eq!(shards.len(), 1);
 
         let shard = &shards[0];
@@ -233,7 +246,7 @@ mod tests {
         let mut packetizer = VideoPacketizer::new();
         let payload_capacity = REQUESTED_PACKET_SIZE - NV_VIDEO_PACKET_SIZE;
         let encoded = vec![0xCD; payload_capacity * 2 + 10]; // spans 3 shards
-        let shards = packetizer.packetize(&encoded, false, 42, 2000);
+        let shards = packetizer.packetize(&encoded, false, 2000);
         assert_eq!(shards.len(), 3);
 
         let flags = |i: usize| shards[i][NV_PACKET_OFFSET + 8];
@@ -247,10 +260,10 @@ mod tests {
         assert_eq!(seq(1), seq(0) + 1);
         assert_eq!(seq(2), seq(1) + 1);
 
-        // frame_index (NvVideoPacket) matches the frame number on every shard.
+        // frame_index (NvVideoPacket) is the same (first call -> 1) on every shard.
         for shard in &shards {
             let frame_index = u32::from_le_bytes(shard[NV_PACKET_OFFSET + 4..NV_PACKET_OFFSET + 8].try_into().unwrap());
-            assert_eq!(frame_index, 42);
+            assert_eq!(frame_index, 1);
         }
 
         // Reassembling payloads from all shards must reproduce [frame_header ++ encoded_data].
@@ -262,11 +275,17 @@ mod tests {
     }
 
     #[test]
-    fn sequence_number_persists_across_packetize_calls() {
+    fn sequence_number_and_frame_number_persist_across_packetize_calls() {
         let mut packetizer = VideoPacketizer::new();
-        let shards1 = packetizer.packetize(&[0u8; 10], true, 1, 0);
-        let shards2 = packetizer.packetize(&[0u8; 10], false, 2, 0);
+        let shards1 = packetizer.packetize(&[0u8; 10], true, 0);
+        let shards2 = packetizer.packetize(&[0u8; 10], false, 0);
         let seq = |shards: &[Vec<u8>], i: usize| u16::from_be_bytes([shards[i][2], shards[i][3]]);
         assert_eq!(seq(&shards2, 0), seq(&shards1, 0) + 1);
+
+        let frame_index = |shards: &[Vec<u8>], i: usize| {
+            u32::from_le_bytes(shards[i][NV_PACKET_OFFSET + 4..NV_PACKET_OFFSET + 8].try_into().unwrap())
+        };
+        assert_eq!(frame_index(&shards1, 0), 1);
+        assert_eq!(frame_index(&shards2, 0), 2);
     }
 }

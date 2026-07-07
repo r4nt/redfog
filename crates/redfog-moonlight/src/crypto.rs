@@ -93,7 +93,13 @@ pub fn cert_signature_bytes(pem: &str) -> Result<Vec<u8>, CryptoError> {
 pub fn cert_fingerprint(pem: &str) -> Result<String, CryptoError> {
     let (_, pem_obj) =
         x509_parser::pem::parse_x509_pem(pem.as_bytes()).map_err(|e| format!("invalid PEM: {e}"))?;
-    Ok(hex::encode(Sha256::digest(&pem_obj.contents)))
+    Ok(cert_fingerprint_der(&pem_obj.contents))
+}
+
+/// Same digest as `cert_fingerprint`, but straight from DER bytes — for the
+/// live TLS peer certificate (`CertificateDer`), which never went through PEM.
+pub fn cert_fingerprint_der(der: &[u8]) -> String {
+    hex::encode(Sha256::digest(der))
 }
 
 /// Decrypt an AES-128-GCM control-channel message: `key` is the client's
