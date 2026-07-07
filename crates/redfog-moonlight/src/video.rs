@@ -90,7 +90,16 @@ impl VideoPacketizer {
         for shard_index in 0..nr_data_shards {
             let payload_start = shard_index * requested_shard_payload_size;
             let payload_len = requested_shard_payload_size.min(packet_data_len - payload_start);
-            let mut shard = vec![0u8; PAYLOAD_OFFSET + payload_len];
+            // Every wire packet must be the same fixed size regardless of how
+            // much real data the last shard actually holds — real
+            // depacketizers (confirmed via moonlight-common-rust's
+            // `VideoDepayloader::handle_packet`) reject any packet whose
+            // length doesn't match the negotiated packet size outright, and
+            // with 0 FEC redundancy a single dropped shard means the frame
+            // can never reconstruct. The last shard's short real length is
+            // instead communicated via `last_payload_len` in the frame
+            // header; the rest of its payload here stays zero-padded.
+            let mut shard = vec![0u8; PAYLOAD_OFFSET + requested_shard_payload_size];
 
             write_rtp_header(&mut shard, self.sequence_number as u16, rtp_timestamp);
 
@@ -112,7 +121,13 @@ impl VideoPacketizer {
                 fec_info,
             );
 
-            copy_header_and_data(&mut shard[PAYLOAD_OFFSET..], &frame_header, encoded_data, payload_start, payload_len);
+            copy_header_and_data(
+                &mut shard[PAYLOAD_OFFSET..PAYLOAD_OFFSET + payload_len],
+                &frame_header,
+                encoded_data,
+                payload_start,
+                payload_len,
+            );
 
             self.sequence_number = self.sequence_number.wrapping_add(1);
             packets.push(shard);
@@ -232,7 +247,9 @@ mod tests {
         assert_eq!(shards.len(), 1);
 
         let shard = &shards[0];
-        assert_eq!(shard.len(), PAYLOAD_OFFSET + VIDEO_FRAME_HEADER_SIZE + encoded.len());
+        // Every shard is the same fixed size regardless of real payload length
+        // (real depacketizers reject packets that don't match exactly).
+        assert_eq!(shard.len(), PAYLOAD_OFFSET + REQUESTED_PACKET_SIZE - NV_VIDEO_PACKET_SIZE);
         assert_eq!(shard[0], 0x90); // RTP version/flags byte
         let flags = shard[NV_PACKET_OFFSET + 8];
         assert_eq!(flags, RTP_FLAG_CONTAINS_PIC_DATA | RTP_FLAG_START_OF_FRAME | RTP_FLAG_END_OF_FRAME);
@@ -266,11 +283,20 @@ mod tests {
             assert_eq!(frame_index, 1);
         }
 
-        // Reassembling payloads from all shards must reproduce [frame_header ++ encoded_data].
+        // Every shard (including the last) is the same fixed size.
+        let fixed_shard_len = PAYLOAD_OFFSET + REQUESTED_PACKET_SIZE - NV_VIDEO_PACKET_SIZE;
+        for shard in &shards {
+            assert_eq!(shard.len(), fixed_shard_len);
+        }
+
+        // Reassembling payloads from all shards, truncated to the real data
+        // length (the last shard's tail is zero-padding, not real data),
+        // must reproduce [frame_header ++ encoded_data].
         let mut reassembled = Vec::new();
         for shard in &shards {
             reassembled.extend_from_slice(&shard[PAYLOAD_OFFSET..]);
         }
+        reassembled.truncate(VIDEO_FRAME_HEADER_SIZE + encoded.len());
         assert_eq!(&reassembled[VIDEO_FRAME_HEADER_SIZE..], &encoded[..]);
     }
 
