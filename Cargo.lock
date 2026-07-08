@@ -2827,7 +2827,6 @@ dependencies = [
 [[package]]
 name = "moonlight-common"
 version = "0.1.0"
-source = "git+https://github.com/MrCreativ3001/moonlight-common-rust#06f0d2efbb4e1c769cdd8f8d5a92e00fc192842b"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3792,6 +3791,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "redfog-test-ux"
+version = "0.1.0"
+dependencies = [
+ "eframe",
 ]
 
 [[package]]

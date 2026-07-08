@@ -4,8 +4,23 @@ members = [
     "crates/kwin-input",
     "crates/kwin-viewer",
     "crates/redfog-login",
+    "crates/redfog-test-ux",
     "crates/redfog-core",
     "crates/redfog-moonlight",
     "crates/redfog-server",
 ]
 resolver = "2"
+
+# Dev-only test dependency (redfog-moonlight's integration tests/examples),
+# never shipped in our own server. Patches upstream bugs in its RTSP
+# Transport-header parsing (wrong delimiter, wrong port fallback constant,
+# didn't handle port ranges) that made the ENet control channel unable to
+# connect whenever server_port differed from 47998 — confirmed live. A fix
+# will be proposed upstream separately.
+#
+# Not vendored in git (GPL-3.0-or-later, and we don't want that source
+# checked into this repo's history): run `./scripts/fetch-patched-deps.sh`
+# once to fetch the pinned commit into `vendor/` (gitignored) and apply
+# `patches/moonlight-common-rust-rtsp-port-parsing.patch`.
+[patch."https://github.com/MrCreativ3001/moonlight-common-rust"]
+moonlight-common = { path = "vendor/moonlight-common-rust" }

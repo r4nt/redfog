@@ -24,6 +24,11 @@ pub struct SessionConfig {
     pub bind_addr: IpAddr,
     pub video_port: u16,
     pub audio_port: u16,
+    /// Command to run for the Login stage streamed on `/launch`, before the
+    /// user has authenticated (e.g. `["target/release/redfog-login"]`).
+    /// Overridable so tests can swap in a purpose-built stand-in instead of
+    /// the real login GUI.
+    pub login_app: Vec<String>,
     /// Command to run for the real desktop session once login succeeds
     /// (e.g. `["plasmashell", "--no-respawn"]`).
     pub user_app: Vec<String>,
@@ -159,7 +164,7 @@ impl SessionManager {
 
     fn spawn_session(&self, kind: SessionType, width: u32, height: u32) -> Result<RunningSession, String> {
         let (socket_name, payload): (&str, Vec<String>) = match &kind {
-            SessionType::Login => ("redfog-login-0", vec!["target/release/redfog-login".to_string()]),
+            SessionType::Login => ("redfog-login-0", self.config.login_app.clone()),
             SessionType::User(_) => ("redfog-user-0", self.config.user_app.clone()),
         };
 
@@ -609,8 +614,14 @@ impl ControlEventHandler for SessionManager {
         };
         let fwd = &session.input_forwarder;
         match event {
-            InputEvent::KeyDown { keycode } => fwd.fake_input.keyboard_key(keycode, 1),
-            InputEvent::KeyUp { keycode } => fwd.fake_input.keyboard_key(keycode, 0),
+            InputEvent::KeyDown { keycode } => {
+                tracing::debug!("forwarding KeyDown keycode={keycode}");
+                fwd.fake_input.keyboard_key(keycode, 1)
+            }
+            InputEvent::KeyUp { keycode } => {
+                tracing::debug!("forwarding KeyUp keycode={keycode}");
+                fwd.fake_input.keyboard_key(keycode, 0)
+            }
             InputEvent::MouseMoveRelative { dx, dy } => {
                 tracing::debug!("forwarding MouseMoveRelative dx={dx} dy={dy}");
                 fwd.fake_input.pointer_motion(dx as f64, dy as f64)

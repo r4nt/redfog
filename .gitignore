@@ -13,6 +13,10 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Fetched + locally-patched dependencies (see scripts/fetch-patched-deps.sh
+# and patches/*.patch) — not vendored into git, fetched on demand instead.
+/vendor/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

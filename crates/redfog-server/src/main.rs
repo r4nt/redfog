@@ -45,6 +45,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .split_whitespace()
         .map(str::to_string)
         .collect();
+    let login_app: Vec<String> = std::env::var("REDFOG_LOGIN_APP")
+        .unwrap_or_else(|_| "target/release/redfog-login".to_string())
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
 
     let bind_addr: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
@@ -57,6 +62,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         bind_addr,
         video_port,
         audio_port,
+        login_app,
         user_app,
         bitrate_kbps: 10_000,
     });
