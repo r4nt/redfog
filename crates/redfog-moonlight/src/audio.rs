@@ -67,6 +67,13 @@ impl AudioSender {
         })
     }
 
+    /// See `VideoSender::drain_pending`'s doc comment — same reasoning,
+    /// same bug, same fix.
+    pub fn drain_pending(&self) {
+        let mut buf = [0u8; 1024];
+        while self.socket.try_recv_from(&mut buf).is_ok() {}
+    }
+
     pub async fn wait_for_client(&self) -> Result<SocketAddr, String> {
         let mut buf = [0u8; 1024];
         loop {

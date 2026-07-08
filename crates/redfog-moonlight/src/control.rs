@@ -20,7 +20,9 @@
 //! Layout derived from reading a known-working implementation's wire code
 //! (not vendored), see the plan doc for context.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,6 +61,26 @@ pub struct ControlServer {
     /// server binds once at startup.
     pub key: Arc<std::sync::Mutex<Option<[u8; 16]>>>,
     pub handler: Arc<dyn ControlEventHandler>,
+    /// Bumped by `SessionManager::set_rikey` whenever a new client takes over
+    /// an existing session (reconnect after a closed window, or a plain
+    /// relaunch). Each connected peer is tagged (see `serve`) with whatever
+    /// generation was current at its own `Connect` event; any peer whose tag
+    /// falls behind the latest generation gets disconnected.
+    ///
+    /// This has to be generation-based rather than "disconnect whoever's
+    /// connected right now when notified" — confirmed live: a blanket sweep
+    /// run right after the *new* client's own peer connected disconnected
+    /// that brand-new peer too (it doesn't know it's new), silently killing
+    /// every reconnect's control channel before it could even request a
+    /// keyframe. Tagging by generation means a peer is only ever a
+    /// disconnect target once *another*, later reconnect makes it stale —
+    /// never the one that triggered the sweep it's caught in.
+    ///
+    /// Solves a separate, real problem: a stale peer that never sent ENet's
+    /// own disconnect (e.g. a closed browser tab, confirmed live) keeps
+    /// sending messages encrypted with the old rikey after `key` moves on to
+    /// the new client's, and those fail GCM authentication forever.
+    pub rikey_generation: Arc<AtomicU64>,
 }
 
 impl ControlServer {
@@ -76,14 +98,42 @@ impl ControlServer {
             ..Default::default()
         };
         let mut host = Host::new(config).map_err(|e| format!("failed to create enet host on port {}: {e}", self.port))?;
+        // Which `rikey_generation` was current when each peer connected —
+        // see the field's doc comment for why this can't just be "whoever's
+        // connected right now".
+        let mut peer_generations: HashMap<tokio_enet::PeerId, u64> = HashMap::new();
+        let mut last_seen_generation = self.rikey_generation.load(Ordering::Acquire);
 
         loop {
+            let current_generation = self.rikey_generation.load(Ordering::Acquire);
+            if current_generation != last_seen_generation {
+                let stale: Vec<_> = peer_generations
+                    .iter()
+                    .filter(|(_, &gen)| gen < current_generation)
+                    .map(|(&id, _)| id)
+                    .collect();
+                for peer_id in &stale {
+                    host.disconnect_now(*peer_id, 0);
+                    peer_generations.remove(peer_id);
+                }
+                if !stale.is_empty() {
+                    tracing::info!("control channel: disconnected {} stale peer(s) for session takeover", stale.len());
+                }
+                last_seen_generation = current_generation;
+            }
             match host.service(Duration::from_millis(100)).await {
                 Ok(Some(Event::Connect { peer_id, .. })) => {
                     tracing::info!("control channel: peer {peer_id:?} connected");
+                    // Read fresh, not `last_seen_generation`/`current_generation`
+                    // above — this event may be processed after a *later*
+                    // `set_rikey` than the one this iteration observed, and
+                    // under-tagging would make this peer an immediate
+                    // disconnect target on the very next check.
+                    peer_generations.insert(peer_id, self.rikey_generation.load(Ordering::Acquire));
                 }
                 Ok(Some(Event::Disconnect { peer_id, .. })) => {
                     tracing::info!("control channel: peer {peer_id:?} disconnected");
+                    peer_generations.remove(&peer_id);
                 }
                 Ok(Some(Event::Receive { packet, .. })) => {
                     self.handle_message(packet.data());

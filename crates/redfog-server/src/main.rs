@@ -9,12 +9,9 @@ use redfog_moonlight::rtsp::RtspServer;
 use redfog_moonlight::session::{SessionConfig, SessionManager};
 use redfog_moonlight::tls::ServerIdentity;
 
-const HTTP_PORT: u16 = 47989;
-const HTTPS_PORT: u16 = 47984;
-const RTSP_PORT: u16 = 48010;
-const VIDEO_PORT: u16 = 47998;
-const CONTROL_PORT: u16 = 47999;
-const AUDIO_PORT: u16 = 48000;
+fn env_port(name: &str, default: u16) -> u16 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -25,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     gstreamer::init()?;
 
-    let _headless_runtime = redfog_core::HeadlessRuntime::start(redfog_core::DEFAULT_RUNTIME_DIR)
+    let _headless_runtime = redfog_core::HeadlessRuntime::start(redfog_core::default_runtime_dir())
         .map_err(|e| e as Box<dyn std::error::Error>)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -33,6 +30,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Overridable so a self-contained integration test can run its own
+    // instance, on its own ports, alongside a real redfog-server already
+    // running on the default ones — see redfog-moonlight/tests/.
+    let http_port = env_port("REDFOG_HTTP_PORT", 47989);
+    let https_port = env_port("REDFOG_HTTPS_PORT", 47984);
+    let rtsp_port = env_port("REDFOG_RTSP_PORT", 48010);
+    let video_port = env_port("REDFOG_VIDEO_PORT", 47998);
+    let control_port = env_port("REDFOG_CONTROL_PORT", 47999);
+    let audio_port = env_port("REDFOG_AUDIO_PORT", 48000);
+    // Space-separated, e.g. "glxgears" or "plasmashell --no-respawn".
+    let user_app: Vec<String> = std::env::var("REDFOG_USER_APP")
+        .unwrap_or_else(|_| "plasmashell --no-respawn".to_string())
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+
     let bind_addr: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
 
@@ -42,11 +55,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let session_manager = SessionManager::new(SessionConfig {
         bind_addr,
-        video_port: VIDEO_PORT,
-        audio_port: AUDIO_PORT,
-        // First iteration: fixed "Desktop" app is plasmashell, matching what
-        // proto.sh/kwin-viewer already exercise.
-        user_app: vec!["plasmashell".to_string(), "--no-respawn".to_string()],
+        video_port,
+        audio_port,
+        user_app,
         bitrate_kbps: 10_000,
     });
 
@@ -54,17 +65,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         clients: clients.clone(),
         identity,
         hostname: hostname.clone(),
-        http_port: HTTP_PORT,
-        https_port: HTTPS_PORT,
-        rtsp_port: RTSP_PORT,
+        http_port,
+        https_port,
+        rtsp_port,
         launch_handler: session_manager.clone(),
     });
 
     let rtsp_server = Arc::new(RtspServer {
-        port: RTSP_PORT,
-        video_port: VIDEO_PORT,
-        control_port: CONTROL_PORT,
-        audio_port: AUDIO_PORT,
+        port: rtsp_port,
+        video_port,
+        control_port,
+        audio_port,
         default_width: 1920,
         default_height: 1080,
         default_fps: 60,
@@ -73,14 +84,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let control_server = ControlServer {
-        port: CONTROL_PORT,
+        port: control_port,
         key: session_manager.rikey_cell(),
         handler: session_manager.clone(),
+        rikey_generation: session_manager.rikey_generation(),
     };
 
-    let _discovery = Discovery::spawn(&hostname, bind_addr, HTTP_PORT).map_err(|e| tracing::warn!("mDNS discovery not started: {e}")).ok();
+    let _discovery = Discovery::spawn(&hostname, bind_addr, http_port).map_err(|e| tracing::warn!("mDNS discovery not started: {e}")).ok();
 
-    tracing::info!("redfog-server starting: http={HTTP_PORT} https={HTTPS_PORT} rtsp={RTSP_PORT} video={VIDEO_PORT} control={CONTROL_PORT} audio={AUDIO_PORT}");
+    tracing::info!("redfog-server starting: http={http_port} https={https_port} rtsp={rtsp_port} video={video_port} control={control_port} audio={audio_port}");
 
     tokio::try_join!(
         async { pairing_server.clone().serve_http(bind_addr).await },

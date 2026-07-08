@@ -21,7 +21,15 @@ pub use environment::{ensure_private_dbus_session, HeadlessRuntime};
 
 /// Shared by `HeadlessRuntime::start` and `CompositorSession::spawn` so the
 /// PipeWire runtime dir and the KWin socket dir always agree.
-pub const DEFAULT_RUNTIME_DIR: &str = "/tmp/redfog-runtime";
+///
+/// Overridable via `REDFOG_RUNTIME_DIR` — lets a self-contained integration
+/// test run its own isolated compositor/PipeWire/paired-client-state
+/// instance (see `redfog-moonlight/tests/`) without colliding with a real
+/// `redfog-server` that might already be running on the same machine using
+/// the default path.
+pub fn default_runtime_dir() -> String {
+    std::env::var("REDFOG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp/redfog-runtime".to_string())
+}
 
 // Define fake_input module generated from protocols/fake-input.xml
 pub mod fake_input {
@@ -80,7 +88,7 @@ impl CompositorSession {
         scale: f64,
         payload_args: &[String],
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let runtime = DEFAULT_RUNTIME_DIR.to_string();
+        let runtime = default_runtime_dir();
         let runtime_path = Path::new(&runtime);
         let socket_path = runtime_path.join(socket_name);
 

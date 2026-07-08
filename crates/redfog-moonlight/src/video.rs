@@ -200,6 +200,20 @@ impl VideoSender {
         })
     }
 
+    /// Discards any datagrams already sitting in the socket's receive buffer
+    /// — call before `wait_for_client` when reusing an existing sender for a
+    /// reconnect/takeover. Without this, a stale `PING` the *previous*
+    /// client already sent (UDP has no connection teardown to stop it, and
+    /// nothing was reading from this socket between sessions to consume it)
+    /// gets picked up as if it were the new client's, permanently misrouting
+    /// the stream to the old, now-gone address — confirmed live: a fresh
+    /// reference-client connection received the *old* client's address here
+    /// and got zero video/audio frames for the entire session.
+    pub fn drain_pending(&self) {
+        let mut buf = [0u8; 1024];
+        while self.socket.try_recv_from(&mut buf).is_ok() {}
+    }
+
     /// Blocks until the client's `PING` datagram arrives, recording its
     /// address for subsequent sends. Call once after `PLAY`, before frames
     /// start flowing.

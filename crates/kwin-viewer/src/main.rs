@@ -160,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // PIPEWIRE_REMOTE for CompositorSession::spawn to pick up. Kept alive
     // for the process lifetime and torn down on drop.
     eprintln!("kwin-viewer: starting headless PipeWire runtime...");
-    let _headless_runtime = redfog_core::HeadlessRuntime::start(redfog_core::DEFAULT_RUNTIME_DIR)
+    let _headless_runtime = redfog_core::HeadlessRuntime::start(redfog_core::default_runtime_dir())
         .map_err(|e| e as Box<dyn std::error::Error>)?;
 
     // 1. Spawn Login Compositor

@@ -8,6 +8,7 @@
 //! one is active is rejected, matching a reasonable v1 restriction.
 
 use std::net::IpAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -76,6 +77,12 @@ pub struct SessionManager {
     /// Shared with `control::ControlServer` — see its doc comment for why
     /// this is a cell rather than passed in at construction.
     rikey_cell: Arc<Mutex<Option<[u8; 16]>>>,
+    /// Bumped whenever `rikey_cell` changes for a reconnect/takeover (see
+    /// `set_rikey`) — see `control::ControlServer::rikey_generation`'s doc
+    /// comment for the full reasoning (a plain "disconnect everyone
+    /// connected right now" flag caught the new client's own brand-new peer
+    /// too, confirmed live).
+    rikey_generation: Arc<AtomicU64>,
     /// RTP sequence numbers, frame indices, and the timestamp clock's epoch
     /// must stay continuous across a Login->User handoff — it's the same
     /// wire-level RTSP/video session from the client's perspective, just a
@@ -105,6 +112,7 @@ impl SessionManager {
             spawn_done: Condvar::new(),
             self_ref: OnceLock::new(),
             rikey_cell: Arc::new(Mutex::new(None)),
+            rikey_generation: Arc::new(AtomicU64::new(0)),
             video_packetizer: Mutex::new(Arc::new(Mutex::new(VideoPacketizer::new()))),
             audio_packetizer: Mutex::new(Arc::new(Mutex::new(AudioPacketizer::new()))),
             stream_start: Mutex::new(std::time::Instant::now()),
@@ -117,6 +125,19 @@ impl SessionManager {
     /// session's `rikey` from.
     pub fn rikey_cell(&self) -> Arc<Mutex<Option<[u8; 16]>>> {
         self.rikey_cell.clone()
+    }
+
+    /// Shared with `control::ControlServer` — see the field's doc comment.
+    pub fn rikey_generation(&self) -> Arc<AtomicU64> {
+        self.rikey_generation.clone()
+    }
+
+    /// Sets the active `rikey` for a reconnect/takeover and bumps the
+    /// generation counter so `control::ControlServer` disconnects peers left
+    /// over from before this point — see `rikey_generation`'s doc comment.
+    fn set_rikey(&self, key: [u8; 16]) {
+        *self.rikey_cell.lock().unwrap() = Some(key);
+        self.rikey_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Start a fresh RTP sequence/frame-index/timestamp epoch for a genuinely
@@ -179,7 +200,9 @@ impl SessionManager {
                 let rtp_timestamp = (stream_start.elapsed().as_secs_f64() * 90_000.0) as u32;
                 let shards = video_packetizer.lock().unwrap().packetize(&data, is_key_frame, rtp_timestamp);
                 handle.spawn(async move {
-                    let _ = sender.send_shards(&shards).await;
+                    if let Err(e) = sender.send_shards(&shards).await {
+                        tracing::warn!("video send failed: {e}");
+                    }
                 });
             }
         });
@@ -191,7 +214,9 @@ impl SessionManager {
             let rtp_timestamp = (stream_start.elapsed().as_secs_f64() * 48_000.0) as u32;
             let opus_packet = audio_packetizer.lock().unwrap().packetize(&packet, rtp_timestamp);
             handle.spawn(async move {
-                let _ = sender.send_packet(&opus_packet).await;
+                if let Err(e) = sender.send_packet(&opus_packet).await {
+                    tracing::warn!("audio send failed: {e}");
+                }
             });
         });
 
@@ -250,22 +275,31 @@ impl SessionManager {
     async fn watch_login_exit(self: Arc<Self>) {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let exited = {
+            let status = {
                 let mut shared = self.shared.lock().unwrap();
                 match &mut shared.state {
                     State::Streaming { session } if matches!(session.kind, SessionType::Login) => {
-                        session.compositor.try_wait().ok().flatten().is_some()
+                        session.compositor.try_wait().ok().flatten()
                     }
                     _ => return, // no longer the login session (already handed off, or idle)
                 }
             };
-            if exited {
+            let Some(status) = status else { continue };
+            // A crashed/killed compositor (e.g. the Wayland connection
+            // breaking mid-session — confirmed live) is NOT the same as the
+            // user successfully logging in; `try_wait().is_some()` alone
+            // can't tell those apart. Silently handing off to plasmashell
+            // after a crash previously masked the real failure entirely.
+            if status.success() {
                 tracing::info!("login session exited, handing off to user session");
                 if let Err(e) = self.handoff_to_user() {
                     tracing::error!("failed to hand off to user session: {e}");
                 }
-                return;
+            } else {
+                tracing::error!("login compositor exited unexpectedly ({status}); resetting session instead of handing off");
+                let _ = self.cancel();
             }
+            return;
         }
     }
 
@@ -309,14 +343,19 @@ impl LaunchHandler for SessionManager {
             if timeout_result.timed_out() && matches!(shared.state, State::Spawning) {
                 return Err("timed out waiting for a concurrent launch to finish spawning".to_string());
             }
-            // A client that gave up before RTSP reached PLAY (closed early,
-            // network hiccup, etc.) previously had no way back in short of
-            // an explicit /cancel — the compositor it spawned is still
-            // alive and well, so just let the retry reconnect to it rather
-            // than hard-erroring "a session is already active".
-            if matches!(shared.state, State::Launched { .. }) {
+            // A client reconnecting to an already-active session — either it
+            // gave up before RTSP reached PLAY (closed early, network
+            // hiccup) and is retrying, or a window/tab was closed without a
+            // clean disconnect (browsers don't reliably send one, confirmed
+            // live) and a new window is taking over. Either way the
+            // compositor is still alive and well: keep it running exactly as
+            // is (no respawn, no re-login) and just accept the new client's
+            // key. If already `Streaming`, `on_play` (triggered by this new
+            // client's own RTSP PLAY) re-learns its address instead of
+            // continuing to send to the old, now-gone one.
+            if matches!(shared.state, State::Launched { .. } | State::Streaming { .. }) {
                 drop(shared);
-                *self.rikey_cell.lock().unwrap() = Some(rikey.key);
+                self.set_rikey(rikey.key);
                 return Ok(());
             }
             if !matches!(shared.state, State::Idle) {
@@ -357,6 +396,13 @@ impl LaunchHandler for SessionManager {
                 std::panic::resume_unwind(panic);
             }
         };
+        // Plain `rikey_cell` set, NOT `set_rikey` — this is a genuinely
+        // fresh launch (state was `Idle`), so there's no stale peer to
+        // disconnect, and the client's own brand-new ENet peer often
+        // connects within the same short window right after `/launch`
+        // returns. Flagging a disconnect sweep here caught that new peer
+        // too and killed it immediately after connecting — confirmed live:
+        // broke every single launch, not just reconnects.
         *self.rikey_cell.lock().unwrap() = Some(rikey.key);
         let mut shared = self.shared.lock().unwrap();
         shared.state = State::Launched { session };
@@ -371,28 +417,35 @@ impl LaunchHandler for SessionManager {
 
     fn cancel(&self) -> Result<(), String> {
         let mut shared = self.shared.lock().unwrap();
-        if let State::Launched { session } | State::Streaming { session } = std::mem::replace(&mut shared.state, State::Idle) {
-            // Dropping a GStreamer pipeline while it's still Playing isn't
-            // just a "Trying to dispose element ... but it is in PLAYING"
-            // warning — confirmed live via coredumpctl: it segfaulted the
-            // whole server on every single `/cancel` (a PipeWire/GStreamer
-            // worker thread racing the Rust-side Drop). `handoff_to_user`
-            // already gets this right; `cancel` didn't.
-            use gstreamer::prelude::*;
-            let _ = session.video_pipeline.set_state(gstreamer::State::Null);
-            let _ = session.audio_pipeline.set_state(gstreamer::State::Null);
-            session.compositor.terminate();
-        }
-        // `state` isn't the only thing holding a session's resources alive:
-        // these two `Arc`s (each wrapping a bound UDP socket) live here
-        // separately and `state` being reset above does nothing to them.
-        // Confirmed live: leaving them set kept the old sockets open, so
-        // every session after the first got "Address already in use" on
-        // ports 47998/48000 and streamed nothing.
-        shared.video_sender = None;
-        shared.audio_sender = None;
+        teardown_active_session(&mut shared);
         Ok(())
     }
+}
+
+/// Tears down whatever session is active (if any) and resets `shared.state`
+/// to `Idle`. Caller must already hold the lock. Shared between `/cancel`
+/// and `/launch`'s "take over an already-streaming session" path.
+fn teardown_active_session(shared: &mut Shared) {
+    if let State::Launched { session } | State::Streaming { session } = std::mem::replace(&mut shared.state, State::Idle) {
+        // Dropping a GStreamer pipeline while it's still Playing isn't
+        // just a "Trying to dispose element ... but it is in PLAYING"
+        // warning — confirmed live via coredumpctl: it segfaulted the
+        // whole server on every single `/cancel` (a PipeWire/GStreamer
+        // worker thread racing the Rust-side Drop). `handoff_to_user`
+        // already gets this right; `cancel` didn't.
+        use gstreamer::prelude::*;
+        let _ = session.video_pipeline.set_state(gstreamer::State::Null);
+        let _ = session.audio_pipeline.set_state(gstreamer::State::Null);
+        session.compositor.terminate();
+    }
+    // `state` isn't the only thing holding a session's resources alive:
+    // these two `Arc`s (each wrapping a bound UDP socket) live here
+    // separately and `state` being reset above does nothing to them.
+    // Confirmed live: leaving them set kept the old sockets open, so
+    // every session after the first got "Address already in use" on
+    // ports 47998/48000 and streamed nothing.
+    shared.video_sender = None;
+    shared.audio_sender = None;
 }
 
 impl RtspHandler for SessionManager {
@@ -406,7 +459,20 @@ impl RtspHandler for SessionManager {
         let video_port = self.config.video_port;
         let audio_port = self.config.audio_port;
 
-        let session = {
+        enum PlayKind {
+            /// First PLAY for this launch — pipelines aren't running yet,
+            /// senders need binding.
+            Fresh(RunningSession),
+            /// A new client's PLAY while a previous one was already
+            /// `Streaming` — e.g. a window/tab was closed without a clean
+            /// disconnect and a new window took over via `/launch`'s
+            /// reconnect path. The compositor and pipelines are already
+            /// running and must stay untouched; only the senders' learned
+            /// client address needs to move to the new client.
+            Retake(RunningSession),
+        }
+
+        let kind = {
             let mut shared = self.shared.lock().unwrap();
             // PLAY can race ahead of `/launch` finishing the (slow: KWin +
             // D-Bus + PipeWire) compositor spawn — confirmed live against
@@ -424,40 +490,72 @@ impl RtspHandler for SessionManager {
                 return;
             }
             match std::mem::replace(&mut shared.state, State::Idle) {
-                State::Launched { session } => Some(session),
+                State::Launched { session } => Some(PlayKind::Fresh(session)),
+                State::Streaming { session } => Some(PlayKind::Retake(session)),
                 other => {
                     shared.state = other;
                     None
                 }
             }
         };
-        let Some(session) = session else {
-            tracing::warn!("PLAY received but no session is in Launched state");
+        let Some(kind) = kind else {
+            tracing::warn!("PLAY received but no session is in Launched/Streaming state");
             return;
         };
 
         let this = self.arc_self();
         tokio::spawn(async move {
-            let video_sender = match VideoSender::bind(bind_addr, video_port).await {
-                Ok(s) => Arc::new(s),
-                Err(e) => {
-                    tracing::error!("failed to bind video sender: {e}");
-                    return;
+            let (session, video_sender, audio_sender, is_retake) = match kind {
+                PlayKind::Fresh(session) => {
+                    let video_sender = match VideoSender::bind(bind_addr, video_port).await {
+                        Ok(s) => Arc::new(s),
+                        Err(e) => {
+                            tracing::error!("failed to bind video sender: {e}");
+                            return;
+                        }
+                    };
+                    let audio_sender = match AudioSender::bind(bind_addr, audio_port).await {
+                        Ok(s) => Arc::new(s),
+                        Err(e) => {
+                            tracing::error!("failed to bind audio sender: {e}");
+                            return;
+                        }
+                    };
+                    {
+                        let mut shared = this.shared.lock().unwrap();
+                        shared.video_sender = Some(video_sender.clone());
+                        shared.audio_sender = Some(audio_sender.clone());
+                    }
+                    (session, video_sender, audio_sender, false)
+                }
+                PlayKind::Retake(session) => {
+                    // Reuse the existing, already-bound senders — `PLAY` can
+                    // arrive from the new client on its own new RTSP TCP
+                    // connection before the old one's UDP sockets would ever
+                    // be rebound anyway, and re-binding the same ports here
+                    // would just fail with "Address already in use".
+                    let existing = {
+                        let shared = this.shared.lock().unwrap();
+                        (shared.video_sender.clone(), shared.audio_sender.clone())
+                    };
+                    let (Some(video_sender), Some(audio_sender)) = existing else {
+                        tracing::error!("retaking a Streaming session but its senders are missing — dropping to Idle");
+                        let mut shared = this.shared.lock().unwrap();
+                        shared.state = State::Idle;
+                        return;
+                    };
+                    // The previous client's own stale `PING`(s) may already
+                    // be sitting in these sockets' receive buffers (UDP has
+                    // no teardown to stop them, and nothing's read from
+                    // these sockets since) — without this, `wait_for_client`
+                    // below picks one of those up instead of the new
+                    // client's, permanently misrouting the stream to the
+                    // old, now-gone address. Confirmed live.
+                    video_sender.drain_pending();
+                    audio_sender.drain_pending();
+                    (session, video_sender, audio_sender, true)
                 }
             };
-            let audio_sender = match AudioSender::bind(bind_addr, audio_port).await {
-                Ok(s) => Arc::new(s),
-                Err(e) => {
-                    tracing::error!("failed to bind audio sender: {e}");
-                    return;
-                }
-            };
-
-            {
-                let mut shared = this.shared.lock().unwrap();
-                shared.video_sender = Some(video_sender.clone());
-                shared.audio_sender = Some(audio_sender.clone());
-            }
 
             // `wait_for_client` loops forever if no PING ever arrives (a
             // session that gets abandoned before the client pings). Without
@@ -465,7 +563,9 @@ impl RtspHandler for SessionManager {
             // bound UDP socket) alive indefinitely — confirmed live: a stale
             // session left port 47998 bound, so every later session's own
             // bind failed with "Address already in use" and streamed
-            // nothing at all.
+            // nothing at all. For a retake, the sender keeps sending to the
+            // old (now-gone) client address until this overwrites it with
+            // the new one — harmless, just wasted bandwidth in the meantime.
             tokio::spawn({
                 let video_sender = video_sender.clone();
                 async move {
@@ -487,7 +587,15 @@ impl RtspHandler for SessionManager {
                 }
             });
 
-            this.start_streaming(session);
+            if is_retake {
+                // Pipelines are already Playing and `watch_login_exit` (if
+                // this is a login session) is already running — just put the
+                // session back, don't redo any of `start_streaming`'s setup.
+                let mut shared = this.shared.lock().unwrap();
+                shared.state = State::Streaming { session };
+            } else {
+                this.start_streaming(session);
+            }
         });
     }
 }
@@ -503,7 +611,10 @@ impl ControlEventHandler for SessionManager {
         match event {
             InputEvent::KeyDown { keycode } => fwd.fake_input.keyboard_key(keycode, 1),
             InputEvent::KeyUp { keycode } => fwd.fake_input.keyboard_key(keycode, 0),
-            InputEvent::MouseMoveRelative { dx, dy } => fwd.fake_input.pointer_motion(dx as f64, dy as f64),
+            InputEvent::MouseMoveRelative { dx, dy } => {
+                tracing::debug!("forwarding MouseMoveRelative dx={dx} dy={dy}");
+                fwd.fake_input.pointer_motion(dx as f64, dy as f64)
+            }
             InputEvent::MouseMoveAbsolute { x, y, screen_width, screen_height } => {
                 if screen_width > 0 && screen_height > 0 {
                     // Client viewport coords -> our actual output resolution.

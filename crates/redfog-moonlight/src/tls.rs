@@ -124,7 +124,7 @@ impl ServerIdentity {
 }
 
 pub fn default_state_dir() -> PathBuf {
-    PathBuf::from(redfog_core::DEFAULT_RUNTIME_DIR).join("moonlight")
+    PathBuf::from(redfog_core::default_runtime_dir()).join("moonlight")
 }
 
 /// Requests (but doesn't require, and doesn't validate against any CA) a

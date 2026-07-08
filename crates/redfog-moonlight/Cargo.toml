@@ -46,6 +46,7 @@ tracing = "0.1"
 [dev-dependencies]
 ureq = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nix = { version = "0.26", features = ["signal"] }
 # GPL-3.0-or-later, dev-only: the real reference client implementation, used
 # to validate our server against actual client-side crypto/parsing rather
 # than our own (possibly-biased) reimplementation of both sides.
