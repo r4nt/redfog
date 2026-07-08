@@ -12,3 +12,11 @@ eframe = "0.27"
 # winit's raw DeviceEvent::MouseMotion (backed by zwp_relative_pointer_v1)
 # rather than egui's own PointerMoved (backed by plain wl_pointer.motion).
 winit = "0.29"
+# For examples/sdl2_relative_pointer_check.rs — SDL2 is what Source engine
+# (Portal) actually uses for relative-mouse-mode camera-look via XWayland's
+# X11 pointer-grab path, which is a different KWin code path entirely from
+# native Wayland's zwp_pointer_constraints_v1 (what relative_pointer_check.rs
+# tests). Needed to check whether the earlier "fake_input drops all motion
+# under an active pointer lock" finding (proven for native Wayland) actually
+# generalizes to XWayland/Portal's mechanism, or is unique to native clients.
+sdl2 = "0.38"

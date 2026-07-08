@@ -58,6 +58,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let identity = ServerIdentity::load_or_create(&state_dir).map_err(|e| format!("failed to load server identity: {e}"))?;
     let clients = Arc::new(ClientManager::new(&state_dir, identity.cert_pem.clone(), identity.private_key_pem.clone()));
 
+    let log_mouse_events = std::env::var("REDFOG_LOG_MOUSE_EVENTS").is_ok_and(|v| v != "0");
+
     let session_manager = SessionManager::new(SessionConfig {
         bind_addr,
         video_port,
@@ -65,6 +67,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         login_app,
         user_app,
         bitrate_kbps: 10_000,
+        log_mouse_events,
     });
 
     let pairing_server = Arc::new(PairingServer {

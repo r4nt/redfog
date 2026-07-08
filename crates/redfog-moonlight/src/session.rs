@@ -33,6 +33,11 @@ pub struct SessionConfig {
     /// (e.g. `["plasmashell", "--no-respawn"]`).
     pub user_app: Vec<String>,
     pub bitrate_kbps: u32,
+    /// Logs every mouse input event (move/button/scroll) at `info` level
+    /// when true — separate from `RUST_LOG=debug`, which also floods with
+    /// per-frame video encoder logs. For diagnosing real-client mouse
+    /// behavior (sensitivity, drops, event shape) without that noise.
+    pub log_mouse_events: bool,
 }
 
 struct RunningSession {
@@ -624,9 +629,17 @@ impl ControlEventHandler for SessionManager {
             }
             InputEvent::MouseMoveRelative { dx, dy } => {
                 tracing::debug!("forwarding MouseMoveRelative dx={dx} dy={dy}");
+                if self.config.log_mouse_events {
+                    tracing::info!("mouse event: MouseMoveRelative dx={dx} dy={dy}");
+                }
                 fwd.fake_input.pointer_motion(dx as f64, dy as f64)
             }
             InputEvent::MouseMoveAbsolute { x, y, screen_width, screen_height } => {
+                if self.config.log_mouse_events {
+                    tracing::info!(
+                        "mouse event: MouseMoveAbsolute x={x} y={y} screen_width={screen_width} screen_height={screen_height}"
+                    );
+                }
                 if screen_width > 0 && screen_height > 0 {
                     // Client viewport coords -> our actual output resolution.
                     let scaled_x = x as f64 / screen_width as f64 * session.width as f64;
@@ -634,10 +647,30 @@ impl ControlEventHandler for SessionManager {
                     fwd.fake_input.pointer_motion_absolute(scaled_x, scaled_y);
                 }
             }
-            InputEvent::MouseButtonDown { button } => fwd.fake_input.button(button, 1),
-            InputEvent::MouseButtonUp { button } => fwd.fake_input.button(button, 0),
-            InputEvent::ScrollVertical { amount } => fwd.fake_input.axis(0, amount as f64),
-            InputEvent::ScrollHorizontal { amount } => fwd.fake_input.axis(1, amount as f64),
+            InputEvent::MouseButtonDown { button } => {
+                if self.config.log_mouse_events {
+                    tracing::info!("mouse event: MouseButtonDown button={button}");
+                }
+                fwd.fake_input.button(button, 1)
+            }
+            InputEvent::MouseButtonUp { button } => {
+                if self.config.log_mouse_events {
+                    tracing::info!("mouse event: MouseButtonUp button={button}");
+                }
+                fwd.fake_input.button(button, 0)
+            }
+            InputEvent::ScrollVertical { amount } => {
+                if self.config.log_mouse_events {
+                    tracing::info!("mouse event: ScrollVertical amount={amount}");
+                }
+                fwd.fake_input.axis(0, amount as f64)
+            }
+            InputEvent::ScrollHorizontal { amount } => {
+                if self.config.log_mouse_events {
+                    tracing::info!("mouse event: ScrollHorizontal amount={amount}");
+                }
+                fwd.fake_input.axis(1, amount as f64)
+            }
         }
         let _ = fwd.conn.flush();
     }
