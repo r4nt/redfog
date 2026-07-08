@@ -237,6 +237,86 @@ Session state is persisted across reconnects: if a client drops and reconnects, 
 
 ---
 
+## Input Injection & Production Privilege Model
+
+### Why not `fake_input`
+
+The prototype forwards mouse/keyboard through KWin's `org_kde_kwin_fake_input` Wayland protocol (`pointer_motion`, `keyboard_key`, etc.) — simple to wire up since it's just another Wayland client request from the same process already managing the compositor session. Confirmed via direct testing (spawning a compositor running a client that requests a real pointer lock via `zwp_pointer_constraints_v1`, then calling `fake_input.pointer_motion()` directly): **once a client holds an active pointer lock — exactly the state a game enters for camera-look — `fake_input`'s relative motion events stop reaching that client entirely.** Neither `zwp_relative_pointer_v1` (what games use for raw mouse-look) nor even plain `wl_pointer.motion` gets delivered. Below the lock threshold, `fake_input` is perfectly linear (proven 1:1, no data loss, no latency growth under sustained continuous motion) — the failure is specific to the locked state.
+
+Reference project Wolf (Games on Whales) doesn't hit this because it doesn't use `fake_input` at all: it injects input through a real `uinput` kernel virtual device (`inputtino::Mouse`), which goes through the normal kernel evdev → libinput → compositor pipeline — the same path a real physical mouse takes, correctly generating `zwp_relative_pointer_v1` events for locked clients because the compositor has no way to distinguish it from real hardware. Wolf's own server-side code applies no hidden scaling beyond a user-configurable `mouse_acceleration` multiplier that defaults to `1.0` (identity) — the fix is entirely about the injection *mechanism*, not the math.
+
+**Decision: switch mouse (and likely keyboard) injection to a `uinput` virtual device**, matching Wolf's approach, for both the prototype and production.
+
+### Device access: `/dev/uinput` permissions
+
+`/dev/uinput` defaults to `root:root`, mode `0660` — needs a udev rule granting group access, the same pattern Wolf ships (`85-wolf.rules`):
+
+```
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+```
+
+Whatever user creates the uinput device just needs `input` group membership. No root required for this part.
+
+### Per-session isolation: why not logind seats
+
+The obvious-looking mechanism for isolating concurrent sessions' virtual input devices from each other is systemd-logind's multi-seat support (`loginctl attach <seat> <device>`) — real multi-seat workstations use this to give each physical keyboard/mouse/monitor set its own seat. Investigated and rejected: `loginctl attach` requires *at least one graphics card* to create a new seat, which would mean fabricating a virtual DRM device (e.g. via the `vkms` kernel module) per concurrent session purely to satisfy that rule — unnecessary complexity, since KWin's `--virtual` rendering backend never touches DRM/KMS at all. Confirmed KWin's input backend (`libinput_udev_assign_seat`, plus a "Failed to query Seat session property" string in `libkwin.so`) reads its seat from the logind session it's running under rather than a CLI flag or env var, which would additionally require driving session creation through PAM/`pam_systemd` — real, but avoidable, complexity.
+
+**Decision: use Linux mount-namespace isolation instead**, the same primitive Docker gives Wolf "for free" via containers, but via systemd's native sandboxing rather than a container runtime:
+
+- `PrivateDevices=yes` on the session's systemd unit gives it a private `/dev/` containing only pseudo-devices (`/dev/null`, `/dev/zero`, etc.) — no physical devices visible by default.
+- `BindPaths=/dev/input/eventN:/dev/input/eventN` then bind-mounts in *only* that session's own uinput-created virtual mouse/keyboard node.
+- GPU render nodes (`/dev/dri/renderD*`) get their own `BindPaths=` entry — these are safe to share read/write across concurrent sessions (multiple compositors can use the same render node for offscreen rendering simultaneously), so no per-session isolation needed there.
+
+Result: each session's compositor sees only its own virtual input devices, the same isolation Wolf gets from separate containers, without needing containers, VKMS, or logind seat/PAM machinery at all.
+
+### Privilege separation: broker vs. server
+
+`redfog-server` itself parses untrusted network input directly off the wire (HTTP/RTSP/ENet/TLS/pairing crypto) — it must never run as root; a parsing bug there would otherwise be a full root compromise. Spawning a compositor session as an arbitrary local user (the actual requirement — one server process, dynamic target-user switching, no per-user ports) does need *some* privileged operation, so that operation is isolated into a small, separately-auditable **broker** component:
+
+- `redfog-server` (unprivileged, dedicated service user) handles all protocol/network/video/audio logic, and talks to the broker over a narrow local IPC channel: essentially "start a session for user X" / "session ready at socket Y" / "terminate session for user X".
+- The **broker** creates the uinput device (needs `input` group membership only) and then requests session startup via `systemd-run --uid=<target-user> -p PrivateDevices=yes -p BindPaths=/dev/input/eventN:/dev/input/eventN ...` — letting systemd itself (PID 1, already root, already battle-tested) perform the actual privilege drop and set up `XDG_RUNTIME_DIR`/D-Bus session/logind registration correctly, the same way any `User=` systemd service gets it.
+
+Critically, **the broker itself does not need to run as root.** `systemd-run`'s cross-user unit-start capability is gated by a single polkit action, `org.freedesktop.systemd1.manage-units` (default: `auth_admin`). A polkit rule (`/etc/polkit-1/rules.d/`) can grant this action specifically to a dedicated, unprivileged `redfog-broker` service user — and polkit rules can inspect call details, so the grant can be scoped further to only permit managing units matching a `redfog-session-*` naming pattern, not arbitrary system services. The broker's full privilege footprint ends up being: `input` group membership, plus a narrowly-scoped polkit grant — no root, no `CAP_SETUID`, no special capabilities on the broker process itself. If the broker is ever compromised, the blast radius is "start/stop units named `redfog-session-*`," not "root."
+
+```
+Moonlight client
+      │
+      ▼
+redfog-server (unprivileged service user)
+  - HTTP/RTSP/ENet/pairing/TLS parsing
+  - video/audio encode
+  - IPC: "start session for user X" ──────────┐
+                                               ▼
+                                   redfog-broker (unprivileged, dedicated user)
+                                     - input group → creates uinput mouse/kbd
+                                     - polkit-authorized systemd-run --uid=X
+                                       -p PrivateDevices=yes
+                                       -p BindPaths=<session's uinput node>
+                                               │
+                                               ▼
+                                   systemd (PID 1, root) — actual privilege drop,
+                                   PAM session setup, XDG_RUNTIME_DIR, logind
+                                               │
+                                               ▼
+                                   KWin (--virtual) as user X, isolated /dev
+```
+
+### Authentication: a real graphical login screen, SDDM-style
+
+The broker model raises an obvious question: if spawning a session as user X is itself the privileged, target-user-determining operation, how can a graphical login screen work at all — doesn't showing *any* UI require already knowing which user to spawn it as?
+
+No — the same way SDDM's own greeter doesn't run as whichever user eventually logs in. SDDM's greeter runs under its own dedicated, unprivileged identity, purely to collect a username/password, which a privileged component then checks via PAM *before* the real session is spawned as that authenticated user. Redfog's `redfog-login` (already built, `crates/redfog-login`) fits this pattern directly, with no chicken-and-egg problem:
+
+- The login compositor keeps running under `redfog-server`'s own unprivileged identity, exactly as it does today (`CompositorSession::spawn` + `fake_input`) — it was never spawned "as the target user" to begin with, so nothing about the broker model changes how it's launched.
+- It doesn't need uinput or per-session device isolation either: the pointer-lock bug that motivated the uinput switch only matters for the *game* session afterward. A login form is a plain GUI (absolute mouse, text entry), and `fake_input` is already proven perfectly linear for that case.
+- Today `redfog-login` fakes authentication (accepts any non-empty username/password, `main.rs`) and has no way to report which username was entered — `session.rs`'s `watch_login_exit()` only watches the process exit status. Three concrete changes turn this into the real thing:
+  1. **`redfog-login` reports the submitted credentials** to `redfog-server` over a local channel (a Unix socket, path passed via env var — not stdout, so a password never risks ending up in a log) instead of faking success.
+  2. **The actual PAM check lives in the broker, not in `redfog-login` or `redfog-server`.** Verifying a real Unix password (`pam_unix.so`) needs `/etc/shadow` access (root or `shadow` group) — that privilege has no business being granted to the GUI process rendering inside a network-streamed compositor, or to the network-facing `redfog-server`. The broker already is redfog's one small, audited, privileged component, so its job simply grows to: (a) `pam_authenticate` the submitted credentials, (b) on success, spawn the real "User" session as that username exactly as already designed above.
+  3. **`redfog-server` is pure passthrough for credentials** — it forwards them from `redfog-login` to the broker and relays the broker's accept/reject back to the login UI (so it can show an error and let the user retry), without itself ever needing shadow access or doing anything privilege-sensitive with the password.
+- The Login→User handoff state machine itself is unchanged — same video/audio/control re-pointing already built and tested. The only difference is *who* the target user is (whichever username the broker just authenticated, not implicitly "whoever's running the server") and *how* that session gets spawned (via the broker's `systemd-run --uid=`, not a direct `CompositorSession::spawn` under the server's own identity).
+
+---
+
 ## Technology Stack
 
 | Layer | Technology |
@@ -249,7 +329,7 @@ Session state is persisted across reconnects: if a client drops and reconnects, 
 | Authentication | PAM (`pam` crate) |
 | Discovery | mDNS (`mdns-sd`) + SSDP |
 | IPC (server↔compositor) | D-Bus / Unix socket |
-| Input injection | `uinput` (`uinput` crate) |
+| Input injection | `uinput` virtual devices, isolated per-session via `systemd-run` `PrivateDevices=`/`BindPaths=` (see "Input Injection & Production Privilege Model") |
 
 ---
 

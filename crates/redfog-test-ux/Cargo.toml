@@ -5,3 +5,10 @@ edition = "2021"
 
 [dependencies]
 eframe = "0.27"
+
+[dev-dependencies]
+# Same version eframe 0.27 already pulls in transitively — reused directly
+# here (bypassing egui) for examples/relative_pointer_check.rs, which needs
+# winit's raw DeviceEvent::MouseMotion (backed by zwp_relative_pointer_v1)
+# rather than egui's own PointerMoved (backed by plain wl_pointer.motion).
+winit = "0.29"

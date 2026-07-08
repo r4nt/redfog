@@ -3798,6 +3798,7 @@ name = "redfog-test-ux"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "winit",
 ]
 
 [[package]]
