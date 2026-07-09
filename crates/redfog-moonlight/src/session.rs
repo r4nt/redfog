@@ -120,6 +120,13 @@ pub struct SessionManager {
     /// systemd unit name collisions across successive launch/cancel cycles
     /// within the same `redfog-server` process lifetime.
     next_broker_session_id: AtomicU64,
+    /// Set by `handle_login_report` once `redfog-login`'s reported
+    /// credentials pass the broker's `Authenticate` check — the real
+    /// account `spawn_user_compositor` spawns the User stage as, replacing
+    /// the `"user"` placeholder used before this was wired up (and still
+    /// the fallback when nothing ever reports in, e.g. `redfog-test-ux`'s
+    /// stand-in login stage in tests).
+    authenticated_username: Mutex<Option<String>>,
 }
 
 impl SessionManager {
@@ -139,9 +146,41 @@ impl SessionManager {
             audio_packetizer: Mutex::new(Arc::new(Mutex::new(AudioPacketizer::new()))),
             stream_start: Mutex::new(std::time::Instant::now()),
             next_broker_session_id: AtomicU64::new(0),
+            authenticated_username: Mutex::new(None),
         });
         let _ = this.self_ref.set(Arc::downgrade(&this));
         this
+    }
+
+    /// Validates credentials reported by `redfog-login` (see
+    /// `crate::login_report`) via the broker's real PAM-backed
+    /// `Authenticate`, and remembers the username on success for the
+    /// subsequent User-stage `SpawnSession` call. Without a broker
+    /// configured (standalone use), just requires a non-empty username,
+    /// matching `redfog-login`'s original no-op placeholder behavior.
+    pub async fn handle_login_report(&self, username: String, password: String) -> Result<(), String> {
+        if let Some(broker_socket_path) = &self.config.broker_socket_path {
+            use redfog_broker_protocol::{read_response, write_request, BrokerRequest, BrokerResponse};
+            use tokio::io::BufReader;
+            use tokio::net::UnixStream;
+
+            let stream = UnixStream::connect(broker_socket_path)
+                .await
+                .map_err(|e| format!("failed to connect to broker at {broker_socket_path:?}: {e}"))?;
+            let mut reader = BufReader::new(stream);
+            write_request(&mut reader, &BrokerRequest::Authenticate { username: username.clone(), password })
+                .await
+                .map_err(|e| format!("failed to send Authenticate to broker: {e}"))?;
+            match read_response(&mut reader).await.map_err(|e| format!("failed to read Authenticate response: {e}"))? {
+                BrokerResponse::Authenticate(Ok(())) => {}
+                BrokerResponse::Authenticate(Err(e)) => return Err(e),
+                other => return Err(format!("unexpected broker response to Authenticate: {other:?}")),
+            }
+        } else if username.trim().is_empty() {
+            return Err("Username cannot be empty".to_string());
+        }
+        *self.authenticated_username.lock().unwrap() = Some(username);
+        Ok(())
     }
 
     /// Shared cell for `control::ControlServer` to read the current
@@ -192,9 +231,22 @@ impl SessionManager {
     /// (`Authenticate` then `SpawnSession`, the production path), or
     /// directly otherwise (standalone use without a broker).
     async fn spawn_user_compositor(&self, width: u32, height: u32) -> Result<CompositorSession, String> {
+        // `handle_login_report` sets this once `redfog-login`'s credentials
+        // have already passed the broker's real, password-checked
+        // `Authenticate` — re-sending an empty password through that same
+        // check below would just fail against real PAM, so a real username
+        // here means skip straight to `SpawnSession`. `None` (nothing ever
+        // reported in — standalone use without a broker, or
+        // `redfog-test-ux`'s stand-in login stage in tests) falls back to
+        // the placeholder "user" and the old Authenticate-with-empty-
+        // password call, which is exactly what `REDFOG_BROKER_FAKE_AUTH`
+        // validates.
+        let reported_username = self.authenticated_username.lock().unwrap().clone();
+        let username = reported_username.clone().unwrap_or_else(|| "user".to_string());
+
         let Some(broker_socket_path) = &self.config.broker_socket_path else {
             return CompositorSession::spawn(
-                SessionType::User("user".to_string()),
+                SessionType::User(username),
                 "redfog-user-0",
                 width as i32,
                 height as i32,
@@ -213,20 +265,18 @@ impl SessionManager {
             .map_err(|e| format!("failed to connect to broker at {broker_socket_path:?}: {e}"))?;
         let mut reader = BufReader::new(stream);
 
-        // Credentials are placeholders for now — the real login-screen
-        // credential-reporting IPC (redfog-login -> redfog-server) isn't
-        // wired up yet; this exercises the Authenticate/SpawnSession code
-        // paths themselves, which is what the fake-auth broker validates.
-        write_request(
-            &mut reader,
-            &BrokerRequest::Authenticate { username: "user".to_string(), password: String::new() },
-        )
-        .await
-        .map_err(|e| format!("failed to send Authenticate to broker: {e}"))?;
-        match read_response(&mut reader).await.map_err(|e| format!("failed to read Authenticate response: {e}"))? {
-            BrokerResponse::Authenticate(Ok(())) => {}
-            BrokerResponse::Authenticate(Err(e)) => return Err(format!("broker rejected authentication: {e}")),
-            other => return Err(format!("unexpected broker response to Authenticate: {other:?}")),
+        if reported_username.is_none() {
+            write_request(
+                &mut reader,
+                &BrokerRequest::Authenticate { username: username.clone(), password: String::new() },
+            )
+            .await
+            .map_err(|e| format!("failed to send Authenticate to broker: {e}"))?;
+            match read_response(&mut reader).await.map_err(|e| format!("failed to read Authenticate response: {e}"))? {
+                BrokerResponse::Authenticate(Ok(())) => {}
+                BrokerResponse::Authenticate(Err(e)) => return Err(format!("broker rejected authentication: {e}")),
+                other => return Err(format!("unexpected broker response to Authenticate: {other:?}")),
+            }
         }
 
         let session_id = self.next_broker_session_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string();
@@ -234,7 +284,7 @@ impl SessionManager {
             &mut reader,
             &BrokerRequest::SpawnSession {
                 session_id,
-                username: "user".to_string(),
+                username: username.clone(),
                 width,
                 height,
                 socket_name: "redfog-user-0".to_string(),
@@ -250,7 +300,7 @@ impl SessionManager {
         };
 
         CompositorSession::attach(
-            SessionType::User("user".to_string()),
+            SessionType::User(username),
             "redfog-user-0",
             std::path::PathBuf::from(wayland_socket_path),
             width as i32,

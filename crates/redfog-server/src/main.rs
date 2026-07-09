@@ -4,6 +4,7 @@ use std::sync::Arc;
 use redfog_moonlight::clients::ClientManager;
 use redfog_moonlight::control::ControlServer;
 use redfog_moonlight::discovery::Discovery;
+use redfog_moonlight::login_report::LoginReportServer;
 use redfog_moonlight::pairing::PairingServer;
 use redfog_moonlight::rtsp::RtspServer;
 use redfog_moonlight::session::{SessionConfig, SessionManager};
@@ -61,6 +62,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let log_mouse_events = std::env::var("REDFOG_LOG_MOUSE_EVENTS").is_ok_and(|v| v != "0");
     let broker_socket_path = std::env::var("REDFOG_BROKER_SOCKET").ok().map(std::path::PathBuf::from);
 
+    // Where redfog-login reports the credentials it collects (see
+    // design.md's "Authentication: a real graphical login screen") —
+    // exported as an env var so the Login-stage KWin process (and its
+    // --exit-with-session child, redfog-login) inherit it.
+    let login_socket_path: std::path::PathBuf = std::env::var("REDFOG_LOGIN_SOCKET")
+        .unwrap_or_else(|_| format!("{}/login.sock", redfog_core::default_runtime_dir()))
+        .into();
+    std::env::set_var("REDFOG_LOGIN_SOCKET", &login_socket_path);
+
     let session_manager = SessionManager::new(SessionConfig {
         bind_addr,
         video_port,
@@ -101,6 +111,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         rikey_generation: session_manager.rikey_generation(),
     };
 
+    let login_report_server = Arc::new(LoginReportServer {
+        socket_path: login_socket_path,
+        session_manager: session_manager.clone(),
+    });
+
     let _discovery = Discovery::spawn(&hostname, bind_addr, http_port).map_err(|e| tracing::warn!("mDNS discovery not started: {e}")).ok();
 
     tracing::info!("redfog-server starting: http={http_port} https={https_port} rtsp={rtsp_port} video={video_port} control={control_port} audio={audio_port}");
@@ -110,6 +125,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         async { pairing_server.clone().serve_https(bind_addr).await },
         async { rtsp_server.clone().serve(bind_addr).await },
         async { control_server.serve(bind_addr).await },
+        async { login_report_server.serve().await },
     )?;
 
     Ok(())

@@ -8,4 +8,5 @@ pub mod control;
 pub mod video;
 pub mod audio;
 pub mod discovery;
+pub mod login_report;
 pub mod session;

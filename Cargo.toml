@@ -10,6 +10,7 @@ members = [
     "crates/redfog-server",
     "crates/redfog-broker",
     "crates/redfog-broker-protocol",
+    "crates/redfog-login-protocol",
 ]
 resolver = "2"
 

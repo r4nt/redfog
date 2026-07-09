@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 redfog-core = { path = "../redfog-core" }
 redfog-broker-protocol = { path = "../redfog-broker-protocol" }
+redfog-login-protocol = { path = "../redfog-login-protocol" }
 gstreamer = "0.21"
 
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util"] }

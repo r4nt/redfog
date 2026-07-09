@@ -3840,6 +3840,15 @@ name = "redfog-login"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "redfog-login-protocol",
+ "serde_json",
+]
+
+[[package]]
+name = "redfog-login-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -3866,6 +3875,7 @@ dependencies = [
  "rcgen",
  "redfog-broker-protocol",
  "redfog-core",
+ "redfog-login-protocol",
  "rsa",
  "rtsp-types",
  "rustls",

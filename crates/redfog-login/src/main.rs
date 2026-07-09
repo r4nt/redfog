@@ -1,4 +1,39 @@
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+
 use eframe::egui;
+use redfog_login_protocol::{LoginRequest, LoginResponse};
+
+/// Sends the entered credentials to `redfog-server` over `REDFOG_LOGIN_SOCKET`
+/// and waits for the real PAM-backed verdict (via the broker's `Authenticate`
+/// — see design.md's "Privilege separation: broker vs. server"). Without
+/// this env var set (e.g. standalone use with no broker configured), falls
+/// back to accepting any non-empty username, same as this app's original
+/// no-op placeholder behavior.
+fn authenticate(username: &str, password: &str) -> Result<(), String> {
+    let Ok(socket_path) = std::env::var("REDFOG_LOGIN_SOCKET") else {
+        if username.trim().is_empty() {
+            return Err("Username cannot be empty".to_string());
+        }
+        return Ok(());
+    };
+    let stream = UnixStream::connect(&socket_path).map_err(|e| format!("failed to reach session server: {e}"))?;
+    let mut writer = stream.try_clone().map_err(|e| format!("failed to reach session server: {e}"))?;
+    let request = LoginRequest::Authenticate { username: username.to_string(), password: password.to_string() };
+    let mut line = serde_json::to_string(&request).expect("protocol types always serialize");
+    line.push('\n');
+    writer.write_all(line.as_bytes()).map_err(|e| format!("failed to reach session server: {e}"))?;
+
+    let mut response_line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut response_line)
+        .map_err(|e| format!("failed to read response from session server: {e}"))?;
+    let response: LoginResponse =
+        serde_json::from_str(response_line.trim_end()).map_err(|e| format!("invalid response from session server: {e}"))?;
+    match response {
+        LoginResponse::Authenticate(result) => result,
+    }
+}
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
@@ -64,17 +99,29 @@ impl eframe::App for LoginApp {
                     .show(ui, |ui| {
                         ui.set_max_width(300.0);
                         
+                        let mut submit = false;
+
                         egui::Grid::new("login_form")
                             .num_columns(2)
                             .spacing([10.0, 10.0])
                             .show(ui, |ui| {
                                 ui.label("Username:");
-                                ui.text_edit_singleline(&mut self.username);
+                                let username_resp = ui.text_edit_singleline(&mut self.username);
                                 ui.end_row();
 
                                 ui.label("Password:");
-                                ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                                let password_resp = ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
                                 ui.end_row();
+
+                                // TextEdit doesn't submit on Enter by default —
+                                // `lost_focus()` becomes true exactly when Enter
+                                // commits the field, the standard egui idiom for
+                                // "Enter submits the form".
+                                if (username_resp.lost_focus() || password_resp.lost_focus())
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                {
+                                    submit = true;
+                                }
                             });
                         ui.add_space(15.0);
 
@@ -84,11 +131,16 @@ impl eframe::App for LoginApp {
                         }
 
                         if ui.add_sized([300.0, 30.0], egui::Button::new("Login")).clicked() {
-                            if self.username.trim().is_empty() {
-                                self.error_msg = Some("Username cannot be empty".to_string());
-                            } else {
-                                // Fake auth: accept any non-empty username/password
-                                std::process::exit(0);
+                            submit = true;
+                        }
+
+                        if submit {
+                            match authenticate(&self.username, &self.password) {
+                                Ok(()) => std::process::exit(0),
+                                Err(e) => {
+                                    self.password.clear();
+                                    self.error_msg = Some(e);
+                                }
                             }
                         }
                     });
