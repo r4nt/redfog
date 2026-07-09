@@ -34,6 +34,7 @@ fn main() -> Result<(), eframe::Error> {
             .with_inner_size([400.0, 300.0]),
         ..Default::default()
     };
+
     eframe::run_native(
         "Redfog Test UX",
         options,

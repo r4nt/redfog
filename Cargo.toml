@@ -8,6 +8,8 @@ members = [
     "crates/redfog-core",
     "crates/redfog-moonlight",
     "crates/redfog-server",
+    "crates/redfog-broker",
+    "crates/redfog-broker-protocol",
 ]
 resolver = "2"
 

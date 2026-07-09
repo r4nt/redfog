@@ -38,6 +38,14 @@ pub struct SessionConfig {
     /// per-frame video encoder logs. For diagnosing real-client mouse
     /// behavior (sensitivity, drops, event shape) without that noise.
     pub log_mouse_events: bool,
+    /// Path to redfog-broker's Unix socket. When set, the User session
+    /// (post-login) is spawned via the broker (`Authenticate` then
+    /// `SpawnSession`, see design.md's "Privilege separation: broker vs.
+    /// server") instead of directly via `CompositorSession::spawn` — the
+    /// production path, and what the integration test exercises with a
+    /// fake-auth/force-spawn-user broker. `None` keeps today's direct-spawn
+    /// behavior, for standalone use without a broker.
+    pub broker_socket_path: Option<std::path::PathBuf>,
 }
 
 struct RunningSession {
@@ -108,6 +116,10 @@ pub struct SessionManager {
     video_packetizer: Mutex<Arc<Mutex<VideoPacketizer>>>,
     audio_packetizer: Mutex<Arc<Mutex<AudioPacketizer>>>,
     stream_start: Mutex<std::time::Instant>,
+    /// Unique per-attempt id passed to the broker's `SpawnSession` — avoids
+    /// systemd unit name collisions across successive launch/cancel cycles
+    /// within the same `redfog-server` process lifetime.
+    next_broker_session_id: AtomicU64,
 }
 
 impl SessionManager {
@@ -126,6 +138,7 @@ impl SessionManager {
             video_packetizer: Mutex::new(Arc::new(Mutex::new(VideoPacketizer::new()))),
             audio_packetizer: Mutex::new(Arc::new(Mutex::new(AudioPacketizer::new()))),
             stream_start: Mutex::new(std::time::Instant::now()),
+            next_broker_session_id: AtomicU64::new(0),
         });
         let _ = this.self_ref.set(Arc::downgrade(&this));
         this
@@ -167,18 +180,92 @@ impl SessionManager {
         self.self_ref.get().and_then(Weak::upgrade).expect("self_ref set in new()")
     }
 
-    fn spawn_session(&self, kind: SessionType, width: u32, height: u32) -> Result<RunningSession, String> {
-        let (socket_name, payload): (&str, Vec<String>) = match &kind {
-            SessionType::Login => ("redfog-login-0", self.config.login_app.clone()),
-            SessionType::User(_) => ("redfog-user-0", self.config.user_app.clone()),
+    /// Spawns the Login compositor directly — never goes through the
+    /// broker, since it doesn't need to run as any particular target user
+    /// (see design.md's "Authentication: a real graphical login screen").
+    fn spawn_login_compositor(&self, width: u32, height: u32) -> Result<CompositorSession, String> {
+        CompositorSession::spawn(SessionType::Login, "redfog-login-0", width as i32, height as i32, 1.0, &self.config.login_app)
+            .map_err(|e| format!("failed to spawn redfog-login-0: {e}"))
+    }
+
+    /// Acquires the User compositor — via the broker if configured
+    /// (`Authenticate` then `SpawnSession`, the production path), or
+    /// directly otherwise (standalone use without a broker).
+    async fn spawn_user_compositor(&self, width: u32, height: u32) -> Result<CompositorSession, String> {
+        let Some(broker_socket_path) = &self.config.broker_socket_path else {
+            return CompositorSession::spawn(
+                SessionType::User("user".to_string()),
+                "redfog-user-0",
+                width as i32,
+                height as i32,
+                1.0,
+                &self.config.user_app,
+            )
+            .map_err(|e| format!("failed to spawn redfog-user-0: {e}"));
         };
 
-        let compositor = CompositorSession::spawn(kind.clone(), socket_name, width as i32, height as i32, 1.0, &payload)
-            .map_err(|e| format!("failed to spawn {socket_name}: {e}"))?;
+        use redfog_broker_protocol::{read_response, write_request, BrokerRequest, BrokerResponse};
+        use tokio::io::BufReader;
+        use tokio::net::UnixStream;
+
+        let stream = UnixStream::connect(broker_socket_path)
+            .await
+            .map_err(|e| format!("failed to connect to broker at {broker_socket_path:?}: {e}"))?;
+        let mut reader = BufReader::new(stream);
+
+        // Credentials are placeholders for now — the real login-screen
+        // credential-reporting IPC (redfog-login -> redfog-server) isn't
+        // wired up yet; this exercises the Authenticate/SpawnSession code
+        // paths themselves, which is what the fake-auth broker validates.
+        write_request(
+            &mut reader,
+            &BrokerRequest::Authenticate { username: "user".to_string(), password: String::new() },
+        )
+        .await
+        .map_err(|e| format!("failed to send Authenticate to broker: {e}"))?;
+        match read_response(&mut reader).await.map_err(|e| format!("failed to read Authenticate response: {e}"))? {
+            BrokerResponse::Authenticate(Ok(())) => {}
+            BrokerResponse::Authenticate(Err(e)) => return Err(format!("broker rejected authentication: {e}")),
+            other => return Err(format!("unexpected broker response to Authenticate: {other:?}")),
+        }
+
+        let session_id = self.next_broker_session_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string();
+        write_request(
+            &mut reader,
+            &BrokerRequest::SpawnSession {
+                session_id,
+                username: "user".to_string(),
+                width,
+                height,
+                socket_name: "redfog-user-0".to_string(),
+                payload: self.config.user_app.clone(),
+            },
+        )
+        .await
+        .map_err(|e| format!("failed to send SpawnSession to broker: {e}"))?;
+        let wayland_socket_path = match read_response(&mut reader).await.map_err(|e| format!("failed to read SpawnSession response: {e}"))? {
+            BrokerResponse::SpawnSession(Ok(spawned)) => spawned.wayland_socket_path,
+            BrokerResponse::SpawnSession(Err(e)) => return Err(format!("broker failed to spawn session: {e}")),
+            other => return Err(format!("unexpected broker response to SpawnSession: {other:?}")),
+        };
+
+        CompositorSession::attach(
+            SessionType::User("user".to_string()),
+            "redfog-user-0",
+            std::path::PathBuf::from(wayland_socket_path),
+            width as i32,
+            height as i32,
+            1.0,
+        )
+        .map_err(|e| format!("failed to attach to broker-spawned session: {e}"))
+    }
+
+    fn spawn_session(&self, kind: SessionType, width: u32, height: u32, compositor: CompositorSession) -> Result<RunningSession, String> {
+        let socket_name = compositor.socket_name.clone();
         let input_forwarder =
             InputForwarder::connect(&compositor.socket_path).map_err(|e| format!("failed to connect input forwarder: {e}"))?;
-        let audio_loopback =
-            AudioLoopback::spawn(socket_name).map_err(|e| format!("failed to spawn audio loopback for {socket_name}: {e}"))?;
+        let audio_loopback = AudioLoopback::spawn(&socket_name)
+            .map_err(|e| format!("failed to spawn audio loopback for {socket_name}: {e}"))?;
 
         // GStreamer's appsink callbacks run on GStreamer's own streaming
         // threads, not tokio worker threads — `tokio::spawn` would panic
@@ -302,7 +389,7 @@ impl SessionManager {
             // after a crash previously masked the real failure entirely.
             if status.success() {
                 tracing::info!("login session exited, handing off to user session");
-                if let Err(e) = self.handoff_to_user() {
+                if let Err(e) = self.handoff_to_user().await {
                     tracing::error!("failed to hand off to user session: {e}");
                 }
             } else {
@@ -313,7 +400,7 @@ impl SessionManager {
         }
     }
 
-    fn handoff_to_user(&self) -> Result<(), String> {
+    async fn handoff_to_user(&self) -> Result<(), String> {
         use gstreamer::prelude::*;
         let old_login = {
             let mut shared = self.shared.lock().unwrap();
@@ -331,7 +418,8 @@ impl SessionManager {
         let _ = old_login.audio_pipeline.set_state(gstreamer::State::Null);
         old_login.compositor.terminate();
 
-        let user_session = self.spawn_session(SessionType::User("user".to_string()), width, height)?;
+        let compositor = self.spawn_user_compositor(width, height).await?;
+        let user_session = self.spawn_session(SessionType::User("user".to_string()), width, height, compositor)?;
         self.start_streaming(user_session);
         Ok(())
     }
@@ -387,7 +475,8 @@ impl LaunchHandler for SessionManager {
         // every future `/launch` would just time out waiting on a condvar
         // nothing will ever notify.
         let spawn_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.spawn_session(SessionType::Login, width, height)
+            let compositor = self.spawn_login_compositor(width, height)?;
+            self.spawn_session(SessionType::Login, width, height, compositor)
         }));
         let session = match spawn_result {
             Ok(Ok(session)) => session,
@@ -635,6 +724,7 @@ impl ControlEventHandler for SessionManager {
                 fwd.fake_input.pointer_motion(dx as f64, dy as f64)
             }
             InputEvent::MouseMoveAbsolute { x, y, screen_width, screen_height } => {
+                tracing::debug!("forwarding MouseMoveAbsolute x={x} y={y} screen_width={screen_width} screen_height={screen_height}");
                 if self.config.log_mouse_events {
                     tracing::info!(
                         "mouse event: MouseMoveAbsolute x={x} y={y} screen_width={screen_width} screen_height={screen_height}"

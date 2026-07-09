@@ -274,21 +274,37 @@ Moonlight client
       ▼
 redfog-server (unprivileged service user)
   - HTTP/RTSP/ENet/pairing/TLS parsing
-  - video/audio encode
+  - spawns/owns pipewire+wireplumber, encode pipeline, InputForwarder
   - IPC: "start session for user X" ──────────┐
                                                ▼
                                    redfog-broker (unprivileged, dedicated user)
                                      - polkit-authorized systemd-run --uid=X
+                                     - templated redfog-session@.socket unit:
+                                       binds Wayland socket, SocketUser=redfog-server
+                                     - grants X access to redfog-server's
+                                       existing PipeWire socket (setfacl)
                                                │
                                                ▼
                                    systemd (PID 1, root) — actual privilege drop,
-                                   PAM session setup, XDG_RUNTIME_DIR, logind
+                                   PAM session setup, XDG_RUNTIME_DIR, logind,
+                                   passes pre-bound Wayland socket fd (LISTEN_FDS)
                                                │
                                                ▼
-                                   KWin (--virtual) as user X
-                                     - input via fake_input (own Wayland socket,
-                                       no device-level isolation needed)
+                                   KWin (--virtual --wayland-fd) as user X
+                                     - never calls bind() on the Wayland socket
+                                     - connects out to redfog-server's PipeWire
+                                       socket to publish its screencast stream
+                                     - fake_input via that same Wayland socket
 ```
+
+### Cross-user socket reachability: PipeWire stays with us, Wayland via socket activation
+
+Once KWin runs as target user X (via the broker) while `redfog-server`'s encode pipeline and `InputForwarder` stay in `redfog-server`'s own unprivileged process (as they do today — no new per-session helper process, no new data-plane IPC layer), those two need to keep reaching the compositor's PipeWire and Wayland sockets across that user boundary. The fix differs for each, because they're created by different things:
+
+- **PipeWire socket**: `redfog-server` already spawns the `pipewire`/`wireplumber` daemons itself (`HeadlessRuntime::start()`) — KWin only ever connects to that socket as a client to publish its screencast stream, it never creates it. So there's no cross-user problem to solve here at all: keep running PipeWire/wireplumber under `redfog-server`'s own identity (it's a media-routing daemon, it never needs target-user X's file permissions for anything), and just grant X's KWin process access to connect in — a one-time `setfacl -m u:X:rw <path>` on a socket `redfog-server` already owns, which needs no special privilege since owners can always ACL their own files.
+- **Wayland socket**: different, because KWin genuinely is the server for this protocol — whoever calls `bind()`/`listen()` owns the resulting socket inode. But KWin doesn't have to be the one calling `bind()`: `kwin_wayland --wayland-fd <fd>` accepts an already-bound, listening socket fd instead of creating its own. The clean way to get a pre-bound fd into a `systemd-run --uid=X`-spawned process (not a direct fork/exec from our own process, so plain fd-inheritance doesn't apply) is systemd's own socket activation: a `.socket` unit (templated per session) with `ListenStream=<path>`, `SocketUser=`/`SocketGroup=`/`SocketMode=` fully under our control, paired with the service that starts KWin as user X. Systemd binds the socket itself, with whatever permissions we specify, and hands it to the service via the standard `LISTEN_FDS` mechanism — the socket's ownership is entirely independent of which user the service ends up running as.
+
+Net effect: no ACLs needed for the Wayland socket, no new data-plane IPC layer for either, and `redfog-server`'s existing compositor/encode/input code keeps working essentially unchanged — it just ends up talking to sockets whose permissions were arranged by the broker/systemd rather than created inline by the same process. The cost is packaging: a templated `.socket`+`.service` unit pair per session rather than a single `systemd-run` one-liner, in exchange for not hand-rolling ACL or IPC-relay machinery.
 
 ### Authentication: a real graphical login screen, SDDM-style
 

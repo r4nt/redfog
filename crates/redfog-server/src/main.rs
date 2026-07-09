@@ -59,6 +59,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let clients = Arc::new(ClientManager::new(&state_dir, identity.cert_pem.clone(), identity.private_key_pem.clone()));
 
     let log_mouse_events = std::env::var("REDFOG_LOG_MOUSE_EVENTS").is_ok_and(|v| v != "0");
+    let broker_socket_path = std::env::var("REDFOG_BROKER_SOCKET").ok().map(std::path::PathBuf::from);
 
     let session_manager = SessionManager::new(SessionConfig {
         bind_addr,
@@ -67,6 +68,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         login_app,
         user_app,
         bitrate_kbps: 10_000,
+        broker_socket_path,
         log_mouse_events,
     });
 

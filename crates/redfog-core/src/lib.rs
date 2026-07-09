@@ -74,7 +74,11 @@ pub struct CompositorSession {
     pub session_type: SessionType,
     pub socket_name: String,
     pub socket_path: PathBuf,
-    kwin_process: Child,
+    /// `None` for a session spawned by redfog-broker (KWin runs under a
+    /// systemd unit we don't own a child handle for) — see `attach()`.
+    /// `terminate()`/`try_wait()` handle that case by being a no-op; the
+    /// caller is responsible for asking the broker to tear it down.
+    kwin_process: Option<Child>,
     pub capture_session: CaptureSession,
     pub pipewire_node_id: u32,
 }
@@ -128,10 +132,43 @@ impl CompositorSession {
             }
         }
 
-        let mut child = cmd.stdout(Stdio::inherit())
+        let child = cmd.stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()?;
 
+        Self::wait_and_attach(session_type, socket_name, socket_path, width, height, scale, Some(child), &runtime, &pw_sock)
+    }
+
+    /// For a session already spawned by redfog-broker (KWin running under a
+    /// templated systemd unit, its Wayland socket bound via systemd socket
+    /// activation — see design.md's "Cross-user socket reachability")
+    /// — connects to that already-existing socket instead of spawning
+    /// `kwin_wayland` ourselves.
+    pub fn attach(
+        session_type: SessionType,
+        socket_name: &str,
+        socket_path: PathBuf,
+        width: i32,
+        height: i32,
+        scale: f64,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let runtime = default_runtime_dir();
+        let pw_sock = std::env::var("PIPEWIRE_REMOTE").unwrap_or_else(|_| "pipewire-0".to_string());
+        Self::wait_and_attach(session_type, socket_name, socket_path, width, height, scale, None, &runtime, &pw_sock)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wait_and_attach(
+        session_type: SessionType,
+        socket_name: &str,
+        socket_path: PathBuf,
+        width: i32,
+        height: i32,
+        scale: f64,
+        mut child: Option<Child>,
+        runtime: &str,
+        pw_sock: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Wait for compositor Wayland socket file to appear
         let mut found = false;
         for _ in 0..60 {
@@ -143,7 +180,9 @@ impl CompositorSession {
         }
 
         if !found {
-            child.kill().ok();
+            if let Some(child) = &mut child {
+                child.kill().ok();
+            }
             return Err(format!("KWin Wayland socket {:?} failed to appear", socket_path).into());
         }
 
@@ -172,12 +211,17 @@ impl CompositorSession {
     }
 
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
-        self.kwin_process.try_wait()
+        match &mut self.kwin_process {
+            Some(child) => child.try_wait(),
+            None => Ok(None), // broker-owned; caller tracks liveness separately
+        }
     }
 
     pub fn terminate(mut self) {
-        self.kwin_process.kill().ok();
-        self.kwin_process.wait().ok();
+        if let Some(mut child) = self.kwin_process.take() {
+            child.kill().ok();
+            child.wait().ok();
+        }
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }

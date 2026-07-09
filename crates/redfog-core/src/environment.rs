@@ -81,12 +81,60 @@ impl HeadlessRuntime {
             let _ = std::fs::remove_file(stale);
         }
 
-        let pipewire = Command::new("pipewire")
-            .env("XDG_RUNTIME_DIR", &runtime_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("failed to spawn pipewire: {e}"))?;
+        // By default, libpipewire-module-access assigns new clients on the
+        // regular pipewire-0 socket "default" (restricted) access, and they
+        // wait forever for wireplumber to explicitly upgrade it — which
+        // never happens for a client connecting under a different uid than
+        // this (private, headless-only) PipeWire instance runs as. Confirmed
+        // live: a broker-spawned KWin, granted socket-file access via ACL,
+        // still hung on "Failed to connect PipeWire context" without this.
+        // Since this instance is already fully isolated from the user's real
+        // desktop PipeWire (own XDG_RUNTIME_DIR, own D-Bus session, nothing
+        // else ever shares it), granting "unrestricted" to all clients on it
+        // is safe — there's nothing else on it to protect against.
+        //
+        // This instance is already entirely bespoke, so rather than merge a
+        // drop-in into the system's config search path (uncertain semantics,
+        // and would also make it depend on $HOME/$XDG_CONFIG_HOME, which
+        // this deliberately isolated setup otherwise doesn't touch), it owns
+        // a self-contained config directory outright: the system's default
+        // pipewire.conf copied in once, plus our own override on top, with
+        // PIPEWIRE_CONFIG_DIR pointed at nothing else. No dependency on the
+        // real user's config space at all, in either direction.
+        let pipewire_config_dir = runtime_dir.join("pipewire-config");
+        std::fs::create_dir_all(pipewire_config_dir.join("pipewire.conf.d"))?;
+        const SYSTEM_PIPEWIRE_CONF: &str = "/usr/share/pipewire/pipewire.conf";
+        std::fs::copy(SYSTEM_PIPEWIRE_CONF, pipewire_config_dir.join("pipewire.conf"))
+            .map_err(|e| format!("failed to copy {SYSTEM_PIPEWIRE_CONF} into {pipewire_config_dir:?}: {e}"))?;
+        // Specifying access.socket at all switches libpipewire-module-access
+        // out of its "legacy" mode (which defaults every client to
+        // unrestricted with no config at all) into explicit socket-based
+        // mode — where any socket *not* listed here falls back to
+        // "default" (restricted). pipewire-0-manager (wireplumber's own
+        // socket) must stay listed as unrestricted too, or this would
+        // silently break wireplumber's ability to manage the graph at all
+        // — confirmed live: omitting it here still left KWin unable to
+        // connect, even with pipewire-0 itself correctly set.
+        std::fs::write(
+            pipewire_config_dir.join("pipewire.conf.d/99-redfog-unrestricted-access.conf"),
+            "module.access.args = {\n    access.socket = {\n        pipewire-0 = \"unrestricted\"\n        pipewire-0-manager = \"unrestricted\"\n    }\n}\n",
+        )?;
+
+        // TEMPORARY debugging aid for the cross-UID PipeWire access
+        // investigation (see design.md) — un-suppresses PipeWire's own
+        // stdout/stderr and adds verbosity so its actual server-side
+        // rejection reason is visible, instead of only KWin's generic
+        // "Failed to connect PipeWire context" wrapper message. Remove once
+        // that's understood.
+        let debug_pipewire = std::env::var_os("REDFOG_DEBUG_PIPEWIRE_LOG").is_some();
+        let mut pipewire_cmd = Command::new("pipewire");
+        pipewire_cmd.env("XDG_RUNTIME_DIR", &runtime_dir).env("PIPEWIRE_CONFIG_DIR", &pipewire_config_dir);
+        if debug_pipewire {
+            pipewire_cmd.arg("-v").arg("-v").stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        } else {
+            pipewire_cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        let pipewire = pipewire_cmd.spawn().map_err(|e| format!("failed to spawn pipewire: {e}"))?;
 
         if !wait_for_path(&pipewire_socket, Duration::from_secs(10)) {
             return Err("PipeWire socket did not appear within 10s".into());
