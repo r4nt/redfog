@@ -242,7 +242,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         0
                     };
 
-                    engine.pipeline = redfog_core::make_pipeline(active_node, frame_store.clone(), move |changed| {
+                    engine.pipeline = redfog_core::make_pipeline(redfog_core::VideoSource::PipeWireNode(active_node), frame_store.clone(), move |changed| {
                         if changed {
                             let _ = proxy_clone.send_event(UserEvent::FrameSizeChanged);
                         } else {
@@ -340,7 +340,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                          engine.pipeline.set_state(gst::State::Null).ok();
                                          let proxy_clone = event_loop_proxy.clone();
                                          engine.pipeline = redfog_core::make_pipeline(
-                                             user_session_opt.as_ref().unwrap().pipewire_node_id,
+                                             redfog_core::VideoSource::PipeWireNode(user_session_opt.as_ref().unwrap().pipewire_node_id),
                                              frame_store.clone(),
                                              move |changed| {
                                                  if changed {
@@ -394,7 +394,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             0
                         };
 
-                        engine.pipeline = redfog_core::make_pipeline(active_node, frame_store.clone(), move |changed| {
+                        engine.pipeline = redfog_core::make_pipeline(redfog_core::VideoSource::PipeWireNode(active_node), frame_store.clone(), move |changed| {
                             if changed {
                                 let _ = proxy_clone.send_event(UserEvent::FrameSizeChanged);
                             } else {

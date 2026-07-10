@@ -83,7 +83,60 @@ pub struct CompositorSession {
     pub pipewire_node_id: u32,
 }
 
+/// A video frame source for [`make_pipeline`]/[`make_encoder_pipeline`] —
+/// either a PipeWire node to connect to via `pipewiresrc` (KWin's
+/// `CaptureSession`, which claims a virtual output and registers it in
+/// PipeWire itself), or an already-constructed GStreamer source element,
+/// for backends where the compositor *is* the GStreamer element (e.g.
+/// gst-wayland-display's `waylanddisplaysrc`, which has no PipeWire
+/// involvement at all — it hands raw frames straight to the pipeline).
+pub enum VideoSource {
+    PipeWireNode(u32),
+    Element(gst::Element),
+}
+
+impl VideoSource {
+    fn into_element(self) -> gst::Element {
+        match self {
+            VideoSource::PipeWireNode(node_id) => gst::ElementFactory::make("pipewiresrc")
+                .name("src")
+                .property("path", node_id.to_string())
+                .property("do-timestamp", true)
+                .build()
+                .expect("pipewiresrc should always be available"),
+            VideoSource::Element(el) => el,
+        }
+    }
+}
+
+/// Where compositor input events go — implemented differently per backend.
+/// KWin's [`InputForwarder`] sends these over `org_kde_kwin_fake_input`, a
+/// Wayland protocol; a gst-wayland-display backend would instead send
+/// `CustomUpstream` GStreamer events (`MouseMoveRelative`, `KeyboardKey`,
+/// etc. — see gst-wayland-display's `gst-plugin-wayland-display/src/
+/// waylandsrc/imp.rs`) to its `waylanddisplaysrc` element. Method shapes
+/// here mirror `OrgKdeKwinFakeInput`'s directly, since both backends'
+/// underlying event vocabularies already match closely.
+pub trait InputSink: Send {
+    fn keyboard_key(&mut self, keycode: u32, pressed: bool);
+    fn pointer_motion(&mut self, dx: f64, dy: f64);
+    fn pointer_motion_absolute(&mut self, x: f64, y: f64);
+    fn button(&mut self, button: u32, pressed: bool);
+    fn axis(&mut self, axis: u32, value: f64);
+    /// Apply queued events — required for Wayland's fake_input (an explicit
+    /// `wl_display_flush`), a no-op for backends whose event delivery is
+    /// already synchronous (e.g. `GstElement::send_event`).
+    fn flush(&mut self) {}
+}
+
 impl CompositorSession {
+    /// The abstracted form of `pipewire_node_id`, for callers that build
+    /// pipelines via [`make_pipeline`]/[`make_encoder_pipeline`] against
+    /// [`VideoSource`] rather than a raw node id.
+    pub fn video_source(&self) -> VideoSource {
+        VideoSource::PipeWireNode(self.pipewire_node_id)
+    }
+
     pub fn spawn(
         session_type: SessionType,
         socket_name: &str,
@@ -254,6 +307,27 @@ impl InputForwarder {
     }
 }
 
+impl InputSink for InputForwarder {
+    fn keyboard_key(&mut self, keycode: u32, pressed: bool) {
+        self.fake_input.keyboard_key(keycode, pressed as u32);
+    }
+    fn pointer_motion(&mut self, dx: f64, dy: f64) {
+        self.fake_input.pointer_motion(dx, dy);
+    }
+    fn pointer_motion_absolute(&mut self, x: f64, y: f64) {
+        self.fake_input.pointer_motion_absolute(x, y);
+    }
+    fn button(&mut self, button: u32, pressed: bool) {
+        self.fake_input.button(button, pressed as u32);
+    }
+    fn axis(&mut self, axis: u32, value: f64) {
+        self.fake_input.axis(axis, value);
+    }
+    fn flush(&mut self) {
+        let _ = self.conn.flush();
+    }
+}
+
 #[derive(Debug)]
 pub struct Frame {
     pub width: u32,
@@ -273,7 +347,7 @@ impl StreamingEngine {
         on_frame: impl Fn(bool) + Send + Sync + 'static,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let input_forwarder = InputForwarder::connect(&initial_session.socket_path)?;
-        let pipeline = make_pipeline(initial_session.pipewire_node_id, frame_store, on_frame);
+        let pipeline = make_pipeline(initial_session.video_source(), frame_store, on_frame);
         pipeline.set_state(gst::State::Playing)?;
         Ok(Self { pipeline, input_forwarder })
     }
@@ -292,23 +366,25 @@ impl StreamingEngine {
 }
 
 pub fn make_pipeline<F>(
-    node_id: u32,
+    source: VideoSource,
     frame_store: Arc<Mutex<Option<Frame>>>,
     on_frame: F,
 ) -> gst::Pipeline
 where
     F: Fn(bool) + Send + Sync + 'static,
 {
-    let desc = format!(
-        "pipewiresrc name=src path={node_id} do-timestamp=true \
-         ! videoconvert \
-         ! video/x-raw,format=BGRx \
-         ! appsink name=sink sync=false"
-    );
-    let pipeline = gst::parse_launch(&desc)
-        .expect("pipeline parse failed")
-        .dynamic_cast::<gst::Pipeline>()
-        .unwrap();
+    let src = source.into_element();
+    let downstream = gst::parse_bin_from_description(
+        "videoconvert ! video/x-raw,format=BGRx ! appsink name=sink sync=false",
+        true,
+    )
+    .expect("downstream bin parse failed");
+
+    let pipeline = gst::Pipeline::new();
+    pipeline.add(&src).expect("failed to add source to pipeline");
+    pipeline.add(&downstream).expect("failed to add downstream bin to pipeline");
+    src.link(&downstream).expect("failed to link source to downstream bin");
+
     let appsink = pipeline
         .by_name("sink").unwrap()
         .dynamic_cast::<gst_app::AppSink>().unwrap();
@@ -346,23 +422,27 @@ const ENCODER_ELEMENT_NAME: &str = "enc";
 /// hardware encoding is worth the complexity (see project notes on the
 /// NVIDIA GBM issue — encoding is a separate GPU path from KWin's virtual
 /// backend rendering, so it isn't necessarily blocked by the same bug).
-pub fn make_encoder_pipeline<F>(node_id: u32, bitrate_kbps: u32, on_access_unit: F) -> gst::Pipeline
+pub fn make_encoder_pipeline<F>(source: VideoSource, bitrate_kbps: u32, on_access_unit: F) -> gst::Pipeline
 where
     F: Fn(Vec<u8>, bool) + Send + Sync + 'static,
 {
-    let desc = format!(
-        "pipewiresrc name=src path={node_id} do-timestamp=true \
-         ! videoconvert \
+    let src = source.into_element();
+    let downstream_desc = format!(
+        "videoconvert \
          ! video/x-raw,format=I420 \
          ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
                    byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
          ! video/x-h264,stream-format=byte-stream,alignment=au \
          ! appsink name=sink sync=false"
     );
-    let pipeline = gst::parse_launch(&desc)
-        .expect("encoder pipeline parse failed")
-        .dynamic_cast::<gst::Pipeline>()
-        .unwrap();
+    let downstream = gst::parse_bin_from_description(&downstream_desc, true)
+        .expect("downstream encoder bin parse failed");
+
+    let pipeline = gst::Pipeline::new();
+    pipeline.add(&src).expect("failed to add source to pipeline");
+    pipeline.add(&downstream).expect("failed to add downstream bin to pipeline");
+    src.link(&downstream).expect("failed to link source to downstream bin");
+
     let appsink = pipeline
         .by_name("sink").unwrap()
         .dynamic_cast::<gst_app::AppSink>().unwrap();

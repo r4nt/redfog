@@ -2049,6 +2049,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gst-backend"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "redfog-core",
+ "softbuffer",
+ "winit",
+]
+
+[[package]]
 name = "gstreamer"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

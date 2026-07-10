@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use redfog_core::{AudioLoopback, CompositorSession, InputForwarder, SessionType};
+use redfog_core::{AudioLoopback, CompositorSession, InputForwarder, InputSink, SessionType};
 
 use crate::audio::{AudioPacketizer, AudioSender};
 use crate::control::{ControlEventHandler, InputEvent};
@@ -53,7 +53,7 @@ struct RunningSession {
     width: u32,
     height: u32,
     compositor: CompositorSession,
-    input_forwarder: InputForwarder,
+    input_forwarder: Box<dyn InputSink>,
     video_pipeline: gstreamer::Pipeline,
     audio_pipeline: gstreamer::Pipeline,
     _audio_loopback: AudioLoopback,
@@ -312,8 +312,9 @@ impl SessionManager {
 
     fn spawn_session(&self, kind: SessionType, width: u32, height: u32, compositor: CompositorSession) -> Result<RunningSession, String> {
         let socket_name = compositor.socket_name.clone();
-        let input_forwarder =
-            InputForwarder::connect(&compositor.socket_path).map_err(|e| format!("failed to connect input forwarder: {e}"))?;
+        let input_forwarder: Box<dyn InputSink> = Box::new(
+            InputForwarder::connect(&compositor.socket_path).map_err(|e| format!("failed to connect input forwarder: {e}"))?,
+        );
         let audio_loopback = AudioLoopback::spawn(&socket_name)
             .map_err(|e| format!("failed to spawn audio loopback for {socket_name}: {e}"))?;
 
@@ -338,7 +339,7 @@ impl SessionManager {
         // per-frame increment, since frames aren't encoded at a perfectly
         // even interval.
         let stream_start = *self.stream_start.lock().unwrap();
-        let video_pipeline = redfog_core::make_encoder_pipeline(compositor.pipewire_node_id, bitrate, {
+        let video_pipeline = redfog_core::make_encoder_pipeline(compositor.video_source(), bitrate, {
             let handle = handle.clone();
             let this = this.clone();
             move |data, is_key_frame| {
@@ -756,22 +757,22 @@ impl ControlEventHandler for SessionManager {
             State::Streaming { session } => session,
             _ => return,
         };
-        let fwd = &session.input_forwarder;
+        let fwd = &mut session.input_forwarder;
         match event {
             InputEvent::KeyDown { keycode } => {
                 tracing::debug!("forwarding KeyDown keycode={keycode}");
-                fwd.fake_input.keyboard_key(keycode, 1)
+                fwd.keyboard_key(keycode, true)
             }
             InputEvent::KeyUp { keycode } => {
                 tracing::debug!("forwarding KeyUp keycode={keycode}");
-                fwd.fake_input.keyboard_key(keycode, 0)
+                fwd.keyboard_key(keycode, false)
             }
             InputEvent::MouseMoveRelative { dx, dy } => {
                 tracing::debug!("forwarding MouseMoveRelative dx={dx} dy={dy}");
                 if self.config.log_mouse_events {
                     tracing::info!("mouse event: MouseMoveRelative dx={dx} dy={dy}");
                 }
-                fwd.fake_input.pointer_motion(dx as f64, dy as f64)
+                fwd.pointer_motion(dx as f64, dy as f64)
             }
             InputEvent::MouseMoveAbsolute { x, y, screen_width, screen_height } => {
                 tracing::debug!("forwarding MouseMoveAbsolute x={x} y={y} screen_width={screen_width} screen_height={screen_height}");
@@ -784,35 +785,35 @@ impl ControlEventHandler for SessionManager {
                     // Client viewport coords -> our actual output resolution.
                     let scaled_x = x as f64 / screen_width as f64 * session.width as f64;
                     let scaled_y = y as f64 / screen_height as f64 * session.height as f64;
-                    fwd.fake_input.pointer_motion_absolute(scaled_x, scaled_y);
+                    fwd.pointer_motion_absolute(scaled_x, scaled_y);
                 }
             }
             InputEvent::MouseButtonDown { button } => {
                 if self.config.log_mouse_events {
                     tracing::info!("mouse event: MouseButtonDown button={button}");
                 }
-                fwd.fake_input.button(button, 1)
+                fwd.button(button, true)
             }
             InputEvent::MouseButtonUp { button } => {
                 if self.config.log_mouse_events {
                     tracing::info!("mouse event: MouseButtonUp button={button}");
                 }
-                fwd.fake_input.button(button, 0)
+                fwd.button(button, false)
             }
             InputEvent::ScrollVertical { amount } => {
                 if self.config.log_mouse_events {
                     tracing::info!("mouse event: ScrollVertical amount={amount}");
                 }
-                fwd.fake_input.axis(0, amount as f64)
+                fwd.axis(0, amount as f64)
             }
             InputEvent::ScrollHorizontal { amount } => {
                 if self.config.log_mouse_events {
                     tracing::info!("mouse event: ScrollHorizontal amount={amount}");
                 }
-                fwd.fake_input.axis(1, amount as f64)
+                fwd.axis(1, amount as f64)
             }
         }
-        let _ = fwd.conn.flush();
+        fwd.flush();
     }
 
     fn on_request_idr_frame(&self) {

@@ -12,6 +12,7 @@ members = [
     "crates/redfog-broker-protocol",
     "crates/redfog-login-protocol",
     "crates/redfog-session-init",
+    "crates/gst-backend",
 ]
 resolver = "2"
 
