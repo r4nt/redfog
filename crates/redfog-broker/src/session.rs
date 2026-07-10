@@ -12,6 +12,7 @@
 //! without granting root.
 
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Mutex;
@@ -225,23 +226,69 @@ impl SessionManager {
         ] {
             grant_acl(username, &path, perm, what).await;
         }
+        // dbus-run-session gives KWin (and whatever it spawns via
+        // --exit-with-session, e.g. plasmashell) its own private, ephemeral
+        // D-Bus session bus — without this, a systemd service running as
+        // `username` falls back to that user's *real* D-Bus session bus
+        // (the well-known /run/user/<uid>/bus), which already has a real
+        // plasmashell registered on org.kde.plasmashell if the user has an
+        // actual desktop session running. Confirmed live: klimek's real
+        // desktop already owns that name. The direct-spawn path
+        // (`CompositorSession::spawn`) doesn't need this itself since
+        // `redfog-server`'s own `ensure_private_dbus_session()` already
+        // wraps its *entire* process tree — but this systemd unit is a
+        // separate process tree that never goes through that.
         let mut exec_start = format!(
-            "{kwin_path} --virtual --width {width} --height {height} --scale 1 \
+            "dbus-run-session -- {kwin_path} --virtual --width {width} --height {height} --scale 1 \
              --no-lockscreen --wayland-fd 3 --socket {socket_name} --xwayland"
         );
         if !payload.is_empty() {
-            // systemd's ExecStart= splits on whitespace unless quoted —
-            // double-quote each arg so paths/args containing spaces survive.
-            // `--` separates the session command from its own args, same
-            // convention as CompositorSession::spawn.
-            let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
-            exec_start.push_str(&format!(" --exit-with-session {}", quote(&payload[0])));
-            if payload.len() > 1 {
-                exec_start.push_str(" --");
-                for arg in &payload[1..] {
-                    exec_start.push_str(&format!(" {}", quote(arg)));
-                }
+            // `--exit-with-session` takes exactly *one* value, which KWin
+            // itself shell-splits (KShell::splitArgs) into program+args —
+            // confirmed by reading main_wayland.cpp. The `-- <args>` we used
+            // to append here was never reaching that split at all; it was
+            // parsed by *systemd's* ExecStart= as trailing arguments to
+            // dbus-run-session/kwin_wayland's own argv, landing in KWin's
+            // separate `--applications-to-start` feature instead — a
+            // pre-existing bug (confirmed live: `plasmashell --no-respawn`
+            // always ran as bare `plasmashell`, `--no-respawn` silently
+            // dropped every time).
+            //
+            // Writing a wrapper *script* file and pointing --exit-with-session
+            // at that single path (no embedded args/quoting at all) sidesteps
+            // that entirely, and also gives us a place to run
+            // dbus-update-activation-environment first: a D-Bus-exec-activated
+            // service Plasma Shell hard-depends on (kactivitymanagerd)
+            // defaults to X11/xcb and crashes unless the session bus's own
+            // activation environment has WAYLAND_DISPLAY — confirmed live via
+            // "Could not load the Qt platform plugin xcb" / "Aborting shell
+            // load: the activity manager daemon is not running". Nothing
+            // sets that by default; the original prototype (proto.sh) did
+            // this exact call by hand. It must run *inside* this session's
+            // own dbus-run-session bus, which only exists once KWin's
+            // --exit-with-session mechanism actually fires (i.e. once the
+            // compositor is already fully up) — so doing it here, right
+            // before exec'ing the real payload, gets that ordering for free,
+            // no separate wait-for-socket polling needed.
+            fn shell_quote(s: &str) -> String {
+                format!("'{}'", s.replace('\'', r"'\''"))
             }
+            let payload_cmd = payload.iter().map(|arg| shell_quote(arg)).collect::<Vec<_>>().join(" ");
+            let session_script = format!(
+                "#!/bin/sh\n\
+                 dbus-update-activation-environment --systemd WAYLAND_DISPLAY={socket_name} XDG_RUNTIME_DIR={runtime_dir} PIPEWIRE_REMOTE={pipewire_socket_path}\n\
+                 exec {payload_cmd}\n"
+            );
+            let session_script_path = format!("{runtime_dir}/session-start.sh");
+            std::fs::write(&session_script_path, session_script)
+                .map_err(|e| format!("failed to write {session_script_path}: {e}"))?;
+            let mut perms = std::fs::metadata(&session_script_path)
+                .map_err(|e| format!("failed to stat {session_script_path}: {e}"))?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&session_script_path, perms)
+                .map_err(|e| format!("failed to chmod {session_script_path}: {e}"))?;
+            exec_start.push_str(&format!(" --exit-with-session {session_script_path}"));
         }
         let service_unit = format!(
             "[Service]\n\
