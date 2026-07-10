@@ -290,15 +290,24 @@ impl SessionManager {
                 .map_err(|e| format!("failed to chmod {session_script_path}: {e}"))?;
             exec_start.push_str(&format!(" --exit-with-session {session_script_path}"));
         }
+        let home_dir = home_dir_for(username).await?;
         let service_unit = format!(
             "[Service]\n\
              Type=simple\n\
              User={username}\n\
+             WorkingDirectory={home_dir}\n\
              Environment=XDG_RUNTIME_DIR={runtime_dir}\n\
              Environment=PIPEWIRE_REMOTE={pipewire_socket_path}\n\
              Environment=KWIN_PLATFORM=virtual\n\
              Environment=KWIN_WAYLAND_NO_PERMISSION_CHECKS=1\n\
              Environment=LIBGL_ALWAYS_SOFTWARE=1\n\
+             Environment=XDG_SESSION_TYPE=wayland\n\
+             Environment=XDG_CURRENT_DESKTOP=KDE\n\
+             Environment=DESKTOP_SESSION=plasma\n\
+             Environment=KDE_FULL_SESSION=true\n\
+             Environment=KDE_SESSION_VERSION=6\n\
+             Environment=XDG_DATA_DIRS=/usr/local/share:/usr/share\n\
+             Environment=XDG_CONFIG_DIRS=/etc/xdg\n\
              ExecStart={exec_start}\n"
         );
 
@@ -385,6 +394,30 @@ async fn run_systemctl(args: &[&str]) -> Result<(), String> {
 
 fn current_username() -> Result<String, String> {
     std::env::var("USER").map_err(|e| e.to_string())
+}
+
+/// Looks up `username`'s home directory via NSS (`getent passwd`), rather
+/// than assuming `/home/{username}` or relying on systemd's `%h` specifier
+/// — confirmed live that `%h` in a *system* unit's `WorkingDirectory=`
+/// resolves against the service manager's own context (root), not
+/// `User=`, landing new sessions in `/root` instead of the target user's
+/// actual home.
+async fn home_dir_for(username: &str) -> Result<String, String> {
+    let output = tokio::process::Command::new("getent")
+        .args(["passwd", username])
+        .output()
+        .await
+        .map_err(|e| format!("failed to run getent passwd {username}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("getent passwd {username} exited with {}", output.status));
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    line.trim()
+        .split(':')
+        .nth(5)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("could not parse home directory from getent passwd {username} output: {line:?}"))
 }
 
 fn which_kwin_wayland() -> Option<String> {
