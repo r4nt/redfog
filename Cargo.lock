@@ -3806,6 +3806,7 @@ dependencies = [
 name = "redfog-broker"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "pam",
  "redfog-broker-protocol",
  "tokio",
@@ -3907,6 +3908,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "redfog-session-init"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "pam",
 ]
 
 [[package]]

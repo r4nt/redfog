@@ -1,0 +1,12 @@
+[package]
+name = "redfog-session-init"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "redfog-session-init"
+path = "src/main.rs"
+
+[dependencies]
+pam = "0.8"
+nix = { version = "0.26", features = ["process", "user"] }
