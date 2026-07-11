@@ -41,8 +41,12 @@ impl LoginReportServer {
             let request: LoginRequest = serde_json::from_str(line.trim_end())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let response = match request {
-                LoginRequest::Authenticate { username, password } => {
-                    LoginResponse::Authenticate(self.session_manager.handle_login_report(username, password).await)
+                LoginRequest::Authenticate { username, password, backend } => {
+                    let result = match backend.parse::<session_backend::Backend>() {
+                        Ok(backend) => self.session_manager.handle_login_report(username, password, backend).await,
+                        Err(e) => Err(e),
+                    };
+                    LoginResponse::Authenticate(result)
                 }
             };
             let mut response_line = serde_json::to_string(&response).expect("protocol types always serialize");

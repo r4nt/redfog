@@ -138,6 +138,13 @@ pub struct SessionManager {
     /// the fallback when nothing ever reports in, e.g. `redfog-test-ux`'s
     /// stand-in login stage in tests).
     authenticated_username: Mutex<Option<String>>,
+    /// Set alongside `authenticated_username` — the backend chosen on the
+    /// login screen itself for the *User* stage (the Login stage already
+    /// rendered by the time this is known, so it always uses
+    /// `config.backend` regardless — see `spawn_login_compositor`).
+    /// `None` (falls back to `config.backend`) when nothing ever reports
+    /// in, same reasoning as `authenticated_username`.
+    selected_backend: Mutex<Option<Backend>>,
 }
 
 impl SessionManager {
@@ -158,6 +165,7 @@ impl SessionManager {
             stream_start: Mutex::new(std::time::Instant::now()),
             next_broker_session_id: AtomicU64::new(0),
             authenticated_username: Mutex::new(None),
+            selected_backend: Mutex::new(None),
         });
         let _ = this.self_ref.set(Arc::downgrade(&this));
         this
@@ -165,11 +173,12 @@ impl SessionManager {
 
     /// Validates credentials reported by `redfog-login` (see
     /// `crate::login_report`) via the broker's real PAM-backed
-    /// `Authenticate`, and remembers the username on success for the
-    /// subsequent User-stage `SpawnSession` call. Without a broker
+    /// `Authenticate`, and remembers the username and chosen `backend` on
+    /// success for the subsequent User-stage spawn. Without a broker
     /// configured (standalone use), just requires a non-empty username,
-    /// matching `redfog-login`'s original no-op placeholder behavior.
-    pub async fn handle_login_report(&self, username: String, password: String) -> Result<(), String> {
+    /// matching `redfog-login`'s original no-op placeholder behavior — the
+    /// backend is still remembered either way.
+    pub async fn handle_login_report(&self, username: String, password: String, backend: Backend) -> Result<(), String> {
         if let Some(broker_socket_path) = &self.config.broker_socket_path {
             use redfog_broker_protocol::{read_response, write_request, BrokerRequest, BrokerResponse};
             use tokio::io::BufReader;
@@ -191,6 +200,7 @@ impl SessionManager {
             return Err("Username cannot be empty".to_string());
         }
         *self.authenticated_username.lock().unwrap() = Some(username);
+        *self.selected_backend.lock().unwrap() = Some(backend);
         Ok(())
     }
 
@@ -254,14 +264,18 @@ impl SessionManager {
         // validates.
         let reported_username = self.authenticated_username.lock().unwrap().clone();
         let username = reported_username.clone().unwrap_or_else(|| "user".to_string());
+        // Chosen on the login screen itself — falls back to the server's
+        // own startup default (config.backend / REDFOG_BACKEND) when
+        // nothing was ever reported in, same reasoning as `username` above.
+        let backend = self.selected_backend.lock().unwrap().unwrap_or(self.config.backend);
 
         let Some(broker_socket_path) = &self.config.broker_socket_path else {
-            return session_backend::spawn_user_compositor_direct(self.config.backend, &username, &self.config.user_app, width, height);
+            return session_backend::spawn_user_compositor_direct(backend, &username, &self.config.user_app, width, height);
         };
 
         let session_id = self.next_broker_session_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string();
         session_backend::spawn_user_compositor_via_broker(
-            self.config.backend,
+            backend,
             broker_socket_path,
             session_id,
             &username,

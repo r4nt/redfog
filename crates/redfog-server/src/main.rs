@@ -81,10 +81,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let log_mouse_events = std::env::var("REDFOG_LOG_MOUSE_EVENTS").is_ok_and(|v| v != "0");
     let broker_socket_path = std::env::var("REDFOG_BROKER_SOCKET").ok().map(std::path::PathBuf::from);
-    let backend = match std::env::var("REDFOG_BACKEND").as_deref() {
-        Ok("gst-wayland-display") => redfog_moonlight::session::Backend::GstWaylandDisplay,
-        Ok("kwin") | Err(_) => redfog_moonlight::session::Backend::Kwin,
-        Ok(other) => return Err(format!("unknown REDFOG_BACKEND {other:?} (expected \"kwin\" or \"gst-wayland-display\")").into()),
+    // The server-startup default — used for the Login stage always (it
+    // renders before any choice is known), and as the User-stage fallback
+    // when nothing is selected on the login screen itself (standalone use,
+    // or a login stage that doesn't report one — see
+    // SessionManager::handle_login_report).
+    let backend = match std::env::var("REDFOG_BACKEND") {
+        Ok(s) => s.parse::<redfog_moonlight::session::Backend>()?,
+        Err(_) => redfog_moonlight::session::Backend::default(),
     };
 
     // Where redfog-login reports the credentials it collects (see

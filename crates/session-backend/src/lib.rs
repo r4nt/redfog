@@ -33,6 +33,30 @@ pub enum Backend {
     GstWaylandDisplay,
 }
 
+impl Backend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Backend::Kwin => "kwin",
+            Backend::GstWaylandDisplay => "gst-wayland-display",
+        }
+    }
+}
+
+/// Wire/env-var representation — `"kwin"` / `"gst-wayland-display"`, the
+/// same strings `REDFOG_BACKEND` already used before this existed (see
+/// `redfog-server::main`) and now also what a login screen reports over
+/// `redfog-login-protocol`.
+impl std::str::FromStr for Backend {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "kwin" => Ok(Backend::Kwin),
+            "gst-wayland-display" => Ok(Backend::GstWaylandDisplay),
+            other => Err(format!("unknown backend {other:?} (expected \"kwin\" or \"gst-wayland-display\")")),
+        }
+    }
+}
+
 /// Which compositor backend produced a session's video/input surface — the
 /// two variants differ in *who* owns the compositor and its socket.
 ///

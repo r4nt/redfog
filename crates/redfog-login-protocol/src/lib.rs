@@ -14,7 +14,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LoginRequest {
-    Authenticate { username: String, password: String },
+    /// `backend` is `"kwin"` or `"gst-wayland-display"` — same strings
+    /// `REDFOG_BACKEND` uses (see `session_backend::Backend`'s `FromStr`/
+    /// `as_str`) — kept as a plain `String` here rather than depending on
+    /// that crate's `Backend` type directly, since `redfog-login` is a
+    /// minimal `eframe` GUI with no reason to pull in `session-backend`'s
+    /// much heavier dependency graph (gstreamer, redfog-core, ...) just for
+    /// one enum.
+    Authenticate { username: String, password: String, backend: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

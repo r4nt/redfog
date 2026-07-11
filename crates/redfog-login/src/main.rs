@@ -4,13 +4,35 @@ use std::os::unix::net::UnixStream;
 use eframe::egui;
 use redfog_login_protocol::{LoginRequest, LoginResponse};
 
-/// Sends the entered credentials to `redfog-server` over `REDFOG_LOGIN_SOCKET`
-/// and waits for the real PAM-backed verdict (via the broker's `Authenticate`
-/// — see design.md's "Privilege separation: broker vs. server"). Without
-/// this env var set (e.g. standalone use with no broker configured), falls
-/// back to accepting any non-empty username, same as this app's original
-/// no-op placeholder behavior.
-fn authenticate(username: &str, password: &str) -> Result<(), String> {
+/// Which compositor the User stage (post-login) should use — mirrors
+/// `session_backend::Backend` exactly (same wire strings, see `as_str`),
+/// but redeclared locally rather than depending on that crate: it pulls in
+/// gstreamer/redfog-core/etc., far more than this minimal `eframe` GUI
+/// otherwise needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Kwin,
+    GstWaylandDisplay,
+}
+
+impl Backend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Backend::Kwin => "kwin",
+            Backend::GstWaylandDisplay => "gst-wayland-display",
+        }
+    }
+}
+
+/// Sends the entered credentials (and the chosen `backend` for the
+/// subsequent User stage — see `SessionManager::handle_login_report`) to
+/// `redfog-server` over `REDFOG_LOGIN_SOCKET` and waits for the real
+/// PAM-backed verdict (via the broker's `Authenticate` — see design.md's
+/// "Privilege separation: broker vs. server"). Without this env var set
+/// (e.g. standalone use with no broker configured), falls back to accepting
+/// any non-empty username, same as this app's original no-op placeholder
+/// behavior — the backend choice is simply never reported in that case.
+fn authenticate(username: &str, password: &str, backend: Backend) -> Result<(), String> {
     let Ok(socket_path) = std::env::var("REDFOG_LOGIN_SOCKET") else {
         if username.trim().is_empty() {
             return Err("Username cannot be empty".to_string());
@@ -19,7 +41,7 @@ fn authenticate(username: &str, password: &str) -> Result<(), String> {
     };
     let stream = UnixStream::connect(&socket_path).map_err(|e| format!("failed to reach session server: {e}"))?;
     let mut writer = stream.try_clone().map_err(|e| format!("failed to reach session server: {e}"))?;
-    let request = LoginRequest::Authenticate { username: username.to_string(), password: password.to_string() };
+    let request = LoginRequest::Authenticate { username: username.to_string(), password: password.to_string(), backend: backend.as_str().to_string() };
     let mut line = serde_json::to_string(&request).expect("protocol types always serialize");
     line.push('\n');
     writer.write_all(line.as_bytes()).map_err(|e| format!("failed to reach session server: {e}"))?;
@@ -52,6 +74,7 @@ fn main() -> Result<(), eframe::Error> {
 struct LoginApp {
     username: String,
     password: String,
+    backend: Backend,
     error_msg: Option<String>,
 }
 
@@ -60,6 +83,7 @@ impl Default for LoginApp {
         Self {
             username: String::new(),
             password: String::new(),
+            backend: Backend::Kwin,
             error_msg: None,
         }
     }
@@ -123,6 +147,13 @@ impl eframe::App for LoginApp {
                                     submit = true;
                                 }
                             });
+                        ui.add_space(10.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Session:");
+                            ui.radio_value(&mut self.backend, Backend::Kwin, "KDE Plasma");
+                            ui.radio_value(&mut self.backend, Backend::GstWaylandDisplay, "Sway");
+                        });
                         ui.add_space(15.0);
 
                         if let Some(ref err) = self.error_msg {
@@ -135,7 +166,7 @@ impl eframe::App for LoginApp {
                         }
 
                         if submit {
-                            match authenticate(&self.username, &self.password) {
+                            match authenticate(&self.username, &self.password, self.backend) {
                                 Ok(()) => std::process::exit(0),
                                 Err(e) => {
                                     self.password.clear();
