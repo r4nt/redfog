@@ -17,10 +17,30 @@ fn env_port(name: &str, default: u16) -> u16 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
+    // rustls::ServerConfig::builder() (pairing.rs's HTTPS server) picks the
+    // process-default CryptoProvider automatically, but only if exactly one
+    // is compiled in — with both `ring` and `aws-lc-rs` linked (workspace
+    // feature unification pulls in `ring` transitively via dev-only test
+    // deps; `tls.rs`'s own `AcceptAnyClientCert` already hardcodes
+    // `aws_lc_rs`) that auto-detection is ambiguous and panics at startup.
+    // Installing explicitly here makes the pick unambiguous regardless of
+    // what else happens to be linked in.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("no CryptoProvider installed yet");
+
     // Must run before anything else touches D-Bus: re-execs the whole
     // process inside dbus-run-session on first launch.
     redfog_core::ensure_private_dbus_session();
 
+    // For Backend::GstWaylandDisplay: waylanddisplaysrc isn't installed
+    // system-wide, so it won't be on GStreamer's default plugin search path
+    // — must be set before gstreamer::init(), same as viewer does.
+    if let Ok(plugin_dir) = std::env::var("REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR") {
+        let existing = std::env::var("GST_PLUGIN_PATH").unwrap_or_default();
+        let combined = if existing.is_empty() { plugin_dir } else { format!("{plugin_dir}:{existing}") };
+        std::env::set_var("GST_PLUGIN_PATH", combined);
+    }
     gstreamer::init()?;
 
     let _headless_runtime = redfog_core::HeadlessRuntime::start(redfog_core::default_runtime_dir())
@@ -61,6 +81,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let log_mouse_events = std::env::var("REDFOG_LOG_MOUSE_EVENTS").is_ok_and(|v| v != "0");
     let broker_socket_path = std::env::var("REDFOG_BROKER_SOCKET").ok().map(std::path::PathBuf::from);
+    let backend = match std::env::var("REDFOG_BACKEND").as_deref() {
+        Ok("gst-wayland-display") => redfog_moonlight::session::Backend::GstWaylandDisplay,
+        Ok("kwin") | Err(_) => redfog_moonlight::session::Backend::Kwin,
+        Ok(other) => return Err(format!("unknown REDFOG_BACKEND {other:?} (expected \"kwin\" or \"gst-wayland-display\")").into()),
+    };
 
     // Where redfog-login reports the credentials it collects (see
     // design.md's "Authentication: a real graphical login screen") —
@@ -80,6 +105,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         bitrate_kbps: 10_000,
         broker_socket_path,
         log_mouse_events,
+        backend,
     });
 
     let pairing_server = Arc::new(PairingServer {

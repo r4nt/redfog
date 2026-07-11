@@ -457,12 +457,31 @@ async fn send_input_retrying(stream: &MoonlightStream, event: ClientInputEvent) 
 /// not queued, not retried server-side, just lost. Waiting longer doesn't
 /// help if the one send happened to land in that window; resending until
 /// the server actually reports having received it does.
-async fn send_input_until_seen(server: &TestServer, stream: &MoonlightStream, event: ClientInputEvent, needle: &str, timeout: Duration) {
+async fn send_input_until_seen(stdout_lines: &Arc<Mutex<Vec<String>>>, stream: &MoonlightStream, event: ClientInputEvent, needle: &str, timeout: Duration) {
+    send_input_until_new_seen(stdout_lines, stream, event, needle, 0, timeout).await;
+}
+
+/// Like `send_input_until_seen`, but requires `needle`'s occurrence count to
+/// exceed `min_count` rather than merely appearing — needed wherever the
+/// same text can legitimately appear more than once (e.g. across a
+/// `Backend::GstWaylandDisplay` Login->User handoff, both stages log
+/// "TESTUX[wayland-1]: ...", unlike Kwin's per-stage socket names) so a
+/// stale match from a previous stage/connection doesn't trivially satisfy
+/// the wait without actually proving the input reached the *current* one.
+async fn send_input_until_new_seen(
+    stdout_lines: &Arc<Mutex<Vec<String>>>,
+    stream: &MoonlightStream,
+    event: ClientInputEvent,
+    needle: &str,
+    min_count: usize,
+    timeout: Duration,
+) {
+    let count = |needle: &str| stdout_lines.lock().unwrap().iter().filter(|line| line.contains(needle)).count();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         send_input_retrying(stream, event.clone()).await;
         if tokio::time::timeout(Duration::from_millis(300), async {
-            while !server.stdout_contains(needle) {
+            while count(needle) <= min_count {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
@@ -471,7 +490,7 @@ async fn send_input_until_seen(server: &TestServer, stream: &MoonlightStream, ev
         {
             return;
         }
-        assert!(tokio::time::Instant::now() < deadline, "timed out resending input, waiting for {needle:?} in redfog-server's output");
+        assert!(tokio::time::Instant::now() < deadline, "timed out resending input, waiting for a new {needle:?} in redfog-server's output");
     }
 }
 
@@ -575,7 +594,7 @@ async fn real_client_connects_reconnects_and_sends_input() {
     // all, so it'd never see the event even though the compositor correctly
     // received and forwarded it. ----
     send_input_until_seen(
-        &server,
+        &server.stdout_lines,
         &stream,
         ClientInputEvent::MouseMoveAbsolute { x: 640, y: 360, reference_width: 1280, reference_height: 720 },
         "TESTUX[redfog-login-0]: pointer_moved",
@@ -626,7 +645,7 @@ async fn real_client_connects_reconnects_and_sends_input() {
     // here is unknown/undefined, same reasoning as the Login-stage move
     // above. ----
     send_input_until_seen(
-        &server,
+        &server.stdout_lines,
         &stream,
         ClientInputEvent::MouseMoveAbsolute { x: 640, y: 360, reference_width: 1280, reference_height: 720 },
         "TESTUX[redfog-user-0]: pointer_moved",
@@ -668,4 +687,208 @@ async fn real_client_connects_reconnects_and_sends_input() {
     server
         .wait_for_new_stdout("TESTUX[redfog-user-0]: pointer_moved", pointer_moved_before_reconnect, Duration::from_secs(5))
         .await;
+}
+
+/// Standalone (no broker at all — Login never uses one regardless of
+/// backend, and without `broker_socket_path` set the User stage falls back
+/// to the same direct-spawn path) smoke test for `Backend::GstWaylandDisplay`
+/// — proves `spawn_gst_compositor`/`spawn_gst_payload_in_background`'s
+/// direct-spawn branch, `VideoSource::Element`, `GstInputSink`, and the
+/// Login->User handoff all work through the real client/RTSP/video/input
+/// path, the same way `real_client_connects_reconnects_and_sends_input`
+/// proves it for Kwin. Deliberately lighter than that test (no reconnect
+/// coverage) — the broker-spawned (`SpawnPayload`) User-stage path needs
+/// real root (setfacl/PAM privilege drop, no fake-spawn equivalent exists
+/// for it yet) and is covered separately, manually, via
+/// `redfog-broker/examples/spawn_payload_test.rs`.
+struct GstTestServer {
+    _process: ServerProcess,
+    http_port: u16,
+    stdout_lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl GstTestServer {
+    fn spawn() -> Self {
+        let plugin_dir = std::env::var("REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR").expect(
+            "REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR must be set to gst-wayland-display's built \
+             gstreamer-1.0 plugin dir to run this test — see scripts/run-gst-viewer.sh",
+        );
+
+        let runtime_dir = std::env::temp_dir().join(format!("redfog-it-gst-runtime-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+
+        let http_port = pick_free_port();
+        let https_port = pick_free_port();
+        let rtsp_port = pick_free_port();
+        let video_port = pick_free_port();
+        let control_port = pick_free_port();
+        let audio_port = pick_free_port();
+
+        let test_ux = workspace_binary("redfog-test-ux");
+        let test_ux = test_ux.to_str().unwrap();
+
+        let stdout_lines = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let mut cmd = Command::new(workspace_binary("redfog-server"));
+        cmd.env("REDFOG_RUNTIME_DIR", &runtime_dir)
+            .env("REDFOG_BACKEND", "gst-wayland-display")
+            .env("REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR", &plugin_dir)
+            .env("REDFOG_GST_RENDER_NODE", "software")
+            .env("REDFOG_HTTP_PORT", http_port.to_string())
+            .env("REDFOG_HTTPS_PORT", https_port.to_string())
+            .env("REDFOG_RTSP_PORT", rtsp_port.to_string())
+            .env("REDFOG_VIDEO_PORT", video_port.to_string())
+            .env("REDFOG_CONTROL_PORT", control_port.to_string())
+            .env("REDFOG_AUDIO_PORT", audio_port.to_string())
+            .env("REDFOG_LOGIN_APP", test_ux)
+            .env("REDFOG_USER_APP", test_ux)
+            .env("RUST_LOG", "redfog_moonlight=debug,redfog_server=debug,gst_backend=debug")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+
+        let mut process = ServerProcess { child: cmd.spawn().expect("spawn redfog-server"), runtime_dir };
+
+        {
+            let stdout = process.child.stdout.take().unwrap();
+            let stdout_lines = stdout_lines.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    println!("[redfog-server] {line}");
+                    stdout_lines.lock().unwrap().push(line);
+                }
+            });
+        }
+        {
+            let stderr = process.child.stderr.take().unwrap();
+            let stdout_lines = stdout_lines.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    eprintln!("[redfog-server] {line}");
+                    stdout_lines.lock().unwrap().push(line);
+                }
+            });
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if std::net::TcpStream::connect(("127.0.0.1", http_port)).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "redfog-server never came up on port {http_port}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        GstTestServer { _process: process, http_port, stdout_lines }
+    }
+
+    fn count_stdout(&self, needle: &str) -> usize {
+        self.stdout_lines.lock().unwrap().iter().filter(|line| line.contains(needle)).count()
+    }
+
+    /// Waits for `needle`'s occurrence count to exceed `baseline` — needed
+    /// here since the same text can legitimately appear more than once
+    /// (`Backend::GstWaylandDisplay`'s Login and User stages both log
+    /// "TESTUX[wayland-1]: ..." — same fixed socket name for both, unlike
+    /// Kwin's per-stage "redfog-login-0"/"redfog-user-0" — so a plain "does
+    /// it appear" check would trivially pass on a stale match from the
+    /// *other* stage).
+    async fn wait_for_new_stdout(&self, needle: &str, baseline: usize, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.count_stdout(needle) <= baseline {
+            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for a new {needle:?} in redfog-server's output");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gst_wayland_display_backend_smoke_test() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+    let server = GstTestServer::spawn();
+
+    let client_identity = ServerIdentity::generate().expect("generate client identity");
+    let client_identifier = ClientIdentifier::from_pem(pem::parse(&client_identity.cert_pem).unwrap());
+    let client_secret = ClientSecret::from_pem(pem::parse(&client_identity.private_key_pem).unwrap());
+
+    let host = MoonlightHost::<TokioHyperClient>::new("127.0.0.1".to_string(), server.http_port, Some("it-client-gst".to_string()))
+        .expect("construct MoonlightHost");
+
+    let pin = PairPin::new_random(&RustCryptoBackend).expect("generate pin");
+    let pin_str = pin.to_string();
+    let http_port = server.http_port;
+    let submit_task = tokio::task::spawn_blocking(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        ureq::post(&format!("http://127.0.0.1:{http_port}/submit-pin"))
+            .send_form(&[("uniqueid", "it-client-gst"), ("pin", &pin_str)])
+            .expect("submit-pin request");
+    });
+    host.pair(&client_identifier, &client_secret, "gst-backend-smoke-test".to_string(), pin, RustCryptoBackend)
+        .await
+        .expect("pairing must succeed");
+    submit_task.await.unwrap();
+
+    let mut settings = default_stream_settings();
+    let server_version = host.version().await.expect("server version");
+    let gfe_version = host.gfe_version().await.expect("gfe version");
+    let codec_support = host.server_codec_mode_support().await.expect("codec support");
+    settings.adjust_for_server(server_version, &gfe_version, codec_support).expect("settings compatible");
+
+    // ---- Login stage. ----
+    let stream_config = host
+        .start_stream(1, &settings, AesKey::new_random(&RustCryptoBackend).expect("aes key"), AesIv(1), "")
+        .await
+        .expect("launch must succeed");
+    let crypto_backend = Arc::new(RustCryptoBackend);
+    let stream = MoonlightStream::connect(stream_config, settings.clone(), crypto_backend.clone(), video_capabilities())
+        .await
+        .expect("stream must connect");
+
+    // Both Login and User stages use waylanddisplaysrc's one fixed socket
+    // name ("wayland-1" — see spawn_gst_compositor), unlike Kwin's per-stage
+    // "redfog-login-0"/"redfog-user-0" — so redfog-test-ux logs the same
+    // "TESTUX[wayland-1]: ..." prefix regardless of stage, and every check
+    // below needs a count baseline to distinguish "already seen from the
+    // Login stage" from "a new one from the User stage after handoff".
+    let started_count = server.count_stdout("TESTUX[wayland-1]: started");
+    server.wait_for_new_stdout("TESTUX[wayland-1]: started", started_count, Duration::from_secs(15)).await;
+
+    let pointer_moved_count = server.count_stdout("TESTUX[wayland-1]: pointer_moved");
+    send_input_until_new_seen(
+        &server.stdout_lines,
+        &stream,
+        ClientInputEvent::MouseMoveAbsolute { x: 640, y: 360, reference_width: 1280, reference_height: 720 },
+        "TESTUX[wayland-1]: pointer_moved",
+        pointer_moved_count,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let (login_frames, _) = poll_frames_tracking_gaps(&stream, tokio::time::sleep(Duration::from_secs(2))).await;
+    assert!(login_frames > 0, "expected video frames from the Login-stage test UX (gst-wayland-display backend)");
+
+    // ---- Trigger Login->User handoff (redfog-test-ux exits on 'Q'). ----
+    let started_count = server.count_stdout("TESTUX[wayland-1]: started");
+    send_key(&stream, VK_Q, true).await;
+    send_key(&stream, VK_Q, false).await;
+    let (handoff_frames, max_gap) = poll_frames_tracking_gaps(&stream, async {
+        server.wait_for_new_stdout("TESTUX[wayland-1]: started", started_count, Duration::from_secs(15)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    })
+    .await;
+    assert!(handoff_frames > 0, "expected video frames to keep flowing across the Login->User handoff (gst-wayland-display backend)");
+    assert!(max_gap < Duration::from_secs(3), "video stalled for {max_gap:?} across the handoff (gst-wayland-display backend)");
+
+    let pointer_moved_count = server.count_stdout("TESTUX[wayland-1]: pointer_moved");
+    send_input_until_new_seen(
+        &server.stdout_lines,
+        &stream,
+        ClientInputEvent::MouseMoveAbsolute { x: 640, y: 360, reference_width: 1280, reference_height: 720 },
+        "TESTUX[wayland-1]: pointer_moved",
+        pointer_moved_count,
+        Duration::from_secs(10),
+    )
+    .await;
 }

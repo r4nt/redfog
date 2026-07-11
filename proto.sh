@@ -14,7 +14,7 @@
 # NOTE: D-Bus session isolation and PipeWire/wireplumber bring-up (described
 # below) now live in redfog-core::environment (ensure_private_dbus_session,
 # HeadlessRuntime) since a future moonlight-style server needs the identical
-# setup. kwin-viewer performs this itself on startup; proto.sh just builds
+# setup. viewer performs this itself on startup; proto.sh just builds
 # and launches it. The discoveries are kept here for reference.
 #
 # ── DISCOVERIES FROM BRING-UP ───────────────────────────────────────────────
@@ -129,7 +129,6 @@ HOST_DISPLAY="${DISPLAY:-}"
 LOG_DIR="/tmp/redfog-proto"
 WIDTH=1920
 HEIGHT=1080
-SCALE=1.0
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -213,31 +212,38 @@ info "Video sink: $VIDEO_SINK"
 mkdir -p "$LOG_DIR"
 
 # PipeWire, wireplumber, and D-Bus session isolation are now brought up by
-# kwin-viewer itself via redfog-core::environment (ensure_private_dbus_session,
+# viewer itself via redfog-core::environment (ensure_private_dbus_session,
 # HeadlessRuntime) — see the note at the top of this script.
 
 # ── 1. Build Binaries ────────────────────────────────────────────────────────
 
 if [[ $OPT_SKIP_BUILD == 0 ]]; then
-    info "Building kwin-capture, kwin-input, kwin-viewer and redfog-login..."
+    info "Building kwin-capture, kwin-input, viewer and redfog-login..."
     cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" \
-        -p kwin-capture -p kwin-input -p kwin-viewer -p redfog-login --release 2>"$LOG_DIR/cargo.log" \
+        -p kwin-capture -p kwin-input -p viewer -p redfog-login --release 2>"$LOG_DIR/cargo.log" \
         || { cat "$LOG_DIR/cargo.log" >&2; die "cargo build failed"; }
 else
     info "Skipping build (--skip-build)"
 fi
 
-VIEWER_BIN="$SCRIPT_DIR/target/release/kwin-viewer"
+VIEWER_BIN="$SCRIPT_DIR/target/release/viewer"
 
-# ── 2. Run kwin-viewer ────────────────────────────────────────────────────────
+# ── 2. Run viewer ────────────────────────────────────────────────────────────
 
 DAMAGE_APP="${OPT_APP:-alacritty}"
 if [[ $OPT_NO_ALACRITTY -ne 0 ]]; then
     DAMAGE_APP=""
 fi
 
-info "Running managed kwin-viewer session..."
+info "Running managed viewer session (backend=kwin, mode=handoff)..."
 
-# kwin-viewer brings up its own private D-Bus session and PipeWire/wireplumber
-# (see redfog-core::environment), so it just runs directly on the host display.
-REDFOG_SCALE="$SCALE" "$VIEWER_BIN" "$PREVIEW_W" "$PREVIEW_H" "$DAMAGE_APP"
+# viewer brings up its own private D-Bus session and PipeWire/wireplumber
+# (see redfog-core::environment), so it just runs directly on the host
+# display. No REDFOG_SCALE equivalent any more — the unified viewer dropped
+# that knob (it was never wired into production anyway; CompositorSession
+# always spawns at scale 1.0 outside this script).
+VIEWER_ARGS=(--backend kwin --mode handoff --width "$PREVIEW_W" --height "$PREVIEW_H")
+if [[ -n "$DAMAGE_APP" ]]; then
+    VIEWER_ARGS+=(-- "$DAMAGE_APP")
+fi
+"$VIEWER_BIN" "${VIEWER_ARGS[@]}"

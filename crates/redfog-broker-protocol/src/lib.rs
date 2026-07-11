@@ -21,6 +21,25 @@ pub enum BrokerRequest {
     /// since it also becomes the session's `WAYLAND_DISPLAY` (which the
     /// caller's own `CompositorSession`-equivalent bookkeeping keys off of).
     SpawnSession { session_id: String, username: String, width: u32, height: u32, socket_name: String, payload: Vec<String> },
+    /// For backends where the *caller* (not the broker) already created and
+    /// owns the compositor/Wayland socket — e.g. redfog-moonlight embedding
+    /// a `gst-wayland-display` pipeline directly in its own process, unlike
+    /// KWin, which the broker spawns and owns itself (see `SpawnSession`).
+    /// The broker's job shrinks to: grant `username` access to an
+    /// already-existing `socket_path`/`runtime_dir`, then spawn `payload`
+    /// (e.g. `["sway"]`) as that user pointed at it — no compositor of its
+    /// own to create. `argv`/`env` are the exact command shape to run,
+    /// typically from a backend crate's own command-building helper (e.g.
+    /// `gst_backend::command_and_env`) so the broker doesn't need to know
+    /// backend-specific details like D-Bus wrapping.
+    SpawnPayload {
+        session_id: String,
+        username: String,
+        socket_path: String,
+        runtime_dir: String,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+    },
     TerminateSession { session_id: String },
 }
 
@@ -28,6 +47,7 @@ pub enum BrokerRequest {
 pub enum BrokerResponse {
     Authenticate(Result<(), String>),
     SpawnSession(Result<SpawnedSession, String>),
+    SpawnPayload(Result<(), String>),
     TerminateSession(Result<(), String>),
 }
 

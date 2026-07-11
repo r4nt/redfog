@@ -2,7 +2,6 @@
 members = [
     "crates/kwin-capture",
     "crates/kwin-input",
-    "crates/kwin-viewer",
     "crates/redfog-login",
     "crates/redfog-test-ux",
     "crates/redfog-core",
@@ -13,6 +12,8 @@ members = [
     "crates/redfog-login-protocol",
     "crates/redfog-session-init",
     "crates/gst-backend",
+    "crates/session-backend",
+    "crates/viewer",
 ]
 resolver = "2"
 

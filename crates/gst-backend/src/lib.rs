@@ -129,8 +129,14 @@ impl Default for NestedSessionConfig {
     }
 }
 
-/// Spawns [`NestedSessionConfig::command`] with `WAYLAND_DISPLAY` pointed at
-/// `waylanddisplaysrc`'s socket, wrapped in `dbus-run-session` so it gets
+/// Builds the argv (program + args) and env pairs [`spawn_nested_session`]
+/// runs directly via `Command` — split out so a caller that needs to launch
+/// this through a *different* mechanism (e.g. `redfog-broker` spawning it
+/// as another user via its own privilege-drop helper, rather than as the
+/// current process) can reuse the exact same command shape instead of
+/// re-deriving it. Pure — does not touch the filesystem or spawn anything.
+///
+/// Wraps [`NestedSessionConfig::command`] in `dbus-run-session` so it gets
 /// its own private D-Bus session bus — same reasoning as the KWin backend's
 /// use of `dbus-run-session` (see `redfog-broker/src/session.rs`): Sway
 /// itself doesn't hard-require D-Bus, but plenty of ordinary apps run
@@ -168,27 +174,45 @@ impl Default for NestedSessionConfig {
 /// development. [`NestedSessionConfig::glx_vendor`] is a separate,
 /// *nested-app* rendering concern (not outer-compositor GPU compositing at
 /// all) — see its own doc comment.
+pub fn command_and_env(
+    config: &NestedSessionConfig,
+    runtime_dir: &str,
+    socket_name: &str,
+) -> Result<(Vec<String>, Vec<(String, String)>), String> {
+    if config.command.is_empty() {
+        return Err("NestedSessionConfig::command must not be empty".to_string());
+    }
+    let mut argv = vec!["dbus-run-session".to_string(), "--".to_string()];
+    argv.extend(config.command.iter().cloned());
+
+    let mut env = vec![
+        ("XDG_RUNTIME_DIR".to_string(), runtime_dir.to_string()),
+        ("WAYLAND_DISPLAY".to_string(), socket_name.to_string()),
+        ("XDG_SESSION_TYPE".to_string(), "wayland".to_string()),
+        ("XDG_SESSION_DESKTOP".to_string(), config.desktop_name.clone()),
+        ("XDG_CURRENT_DESKTOP".to_string(), config.desktop_name.clone()),
+        ("SWAYSOCK".to_string(), format!("{runtime_dir}/sway.socket")),
+    ];
+    if let Some(vendor) = &config.glx_vendor {
+        env.push(("__GLX_VENDOR_LIBRARY_NAME".to_string(), vendor.clone()));
+    }
+    Ok((argv, env))
+}
+
+/// Spawns [`NestedSessionConfig::command`] directly, as the current process
+/// (same user, same environment otherwise) — see [`command_and_env`] if you
+/// need the same command shape launched some other way instead.
 pub fn spawn_nested_session(
     config: &NestedSessionConfig,
     runtime_dir: &str,
     socket_name: &str,
 ) -> Result<Child, String> {
-    if config.command.is_empty() {
-        return Err("NestedSessionConfig::command must not be empty".to_string());
-    }
-    let mut cmd = Command::new("dbus-run-session");
-    cmd.arg("--")
-        .args(&config.command)
-        .env("XDG_RUNTIME_DIR", runtime_dir)
-        .env("WAYLAND_DISPLAY", socket_name)
-        .env("XDG_SESSION_TYPE", "wayland")
-        .env("XDG_SESSION_DESKTOP", &config.desktop_name)
-        .env("XDG_CURRENT_DESKTOP", &config.desktop_name)
-        .env("SWAYSOCK", format!("{runtime_dir}/sway.socket"))
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    if let Some(vendor) = &config.glx_vendor {
-        cmd.env("__GLX_VENDOR_LIBRARY_NAME", vendor);
+    let (argv, env) = command_and_env(config, runtime_dir, socket_name)?;
+    let (program, args) = argv.split_first().expect("command_and_env always returns a non-empty argv");
+    let mut cmd = Command::new(program);
+    cmd.args(args).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    for (key, value) in &env {
+        cmd.env(key, value);
     }
     cmd.spawn().map_err(|e| format!("failed to spawn nested session {config:?}: {e}", config = config.command))
 }

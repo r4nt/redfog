@@ -27,6 +27,9 @@ enum ActiveSession {
     DirectChild { child: Child },
     /// `REDFOG_BROKER_PAM_SPAWN` mode — see `spawn_via_pam`.
     DirectPam { child: Child },
+    /// See `spawn_payload` — a payload run against a socket the *caller*
+    /// (not the broker) created and owns.
+    Payload { child: Child },
 }
 
 pub struct SessionManager {
@@ -489,6 +492,69 @@ impl SessionManager {
         Ok(wayland_socket_path)
     }
 
+    /// Grants `username` access to a socket/runtime dir the *caller*
+    /// already created and owns (e.g. redfog-moonlight embedding a
+    /// `gst-wayland-display` pipeline directly in its own process), then
+    /// spawns `argv` (with `env` applied) as that user pointed at it — the
+    /// "just grant + spawn" counterpart to `spawn_via_pam`'s "create
+    /// everything, including the compositor, then spawn". See
+    /// `BrokerRequest::SpawnPayload`'s doc comment for the broader picture.
+    pub async fn spawn_payload(
+        &self,
+        session_id: &str,
+        username: &str,
+        socket_path: &str,
+        runtime_dir: &str,
+        argv: &[String],
+        env: &[(String, String)],
+    ) -> Result<(), String> {
+        let (_uid, _gid, home_dir) = resolve_user(username).await?;
+
+        // Unlike spawn_via_pam's runtime dir (which the broker creates and
+        // chowns fully to the target user), this one is owned by the
+        // caller and needs to *stay* that way — grant access instead of
+        // transferring ownership. A default ACL (`-d`) is required too,
+        // since the payload itself creates new files/sockets directly
+        // inside it (Sway's own IPC socket, Xwayland's socket) — a plain
+        // `-m` grant only covers files that already exist at grant time.
+        for args in [
+            vec!["-m".to_string(), format!("u:{username}:rwx"), runtime_dir.to_string()],
+            vec!["-d".to_string(), "-m".to_string(), format!("u:{username}:rwx"), runtime_dir.to_string()],
+            vec!["-m".to_string(), format!("u:{username}:rw"), socket_path.to_string()],
+        ] {
+            match tokio::process::Command::new("setfacl").args(&args).output().await {
+                Ok(output) if output.status.success() => tracing::info!("setfacl {} succeeded", args.join(" ")),
+                Ok(output) => tracing::warn!(
+                    "setfacl {} exited with {}: {}",
+                    args.join(" "),
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                Err(e) => tracing::warn!("failed to run setfacl {}: {e}", args.join(" ")),
+            }
+        }
+
+        ensure_pam_session_service()?;
+        let session_init_path = session_init_path()?;
+        let mut cmd = tokio::process::Command::new(&session_init_path);
+        cmd.arg(username).arg("--").args(argv);
+        cmd.env_clear()
+            .env("HOME", &home_dir)
+            .env("USER", username)
+            .env("LOGNAME", username)
+            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin")
+            .current_dir(&home_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+
+        let child = cmd.spawn().map_err(|e| format!("failed to spawn {session_init_path:?}: {e}"))?;
+        self.active.lock().unwrap().insert(session_id.to_string(), ActiveSession::Payload { child });
+        Ok(())
+    }
+
     pub async fn terminate(&self, session_id: &str) -> Result<(), String> {
         let session = self
             .active
@@ -498,7 +564,9 @@ impl SessionManager {
             .ok_or_else(|| format!("no active session {session_id}"))?;
 
         match session {
-            ActiveSession::DirectChild { mut child } | ActiveSession::DirectPam { mut child } => {
+            ActiveSession::DirectChild { mut child }
+            | ActiveSession::DirectPam { mut child }
+            | ActiveSession::Payload { mut child } => {
                 let _ = child.kill().await;
             }
             ActiveSession::Systemd { unit_name } => {

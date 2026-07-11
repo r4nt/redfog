@@ -2054,8 +2054,6 @@ version = "0.1.0"
 dependencies = [
  "gstreamer",
  "redfog-core",
- "softbuffer",
- "winit",
 ]
 
 [[package]]
@@ -2650,21 +2648,6 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-scanner",
-]
-
-[[package]]
-name = "kwin-viewer"
-version = "0.1.0"
-dependencies = [
- "gstreamer",
- "gstreamer-app",
- "kwin-capture",
- "redfog-core",
- "softbuffer",
- "wayland-backend",
- "wayland-client",
- "wayland-scanner",
- "winit",
 ]
 
 [[package]]
@@ -3895,6 +3878,7 @@ dependencies = [
  "sdp-types",
  "serde",
  "serde_json",
+ "session-backend",
  "sha2",
  "tokio",
  "tokio-enet",
@@ -3915,6 +3899,7 @@ dependencies = [
  "rand",
  "redfog-core",
  "redfog-moonlight",
+ "rustls",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4311,6 +4296,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "session-backend"
+version = "0.1.0"
+dependencies = [
+ "gst-backend",
+ "gstreamer",
+ "redfog-broker-protocol",
+ "redfog-core",
+ "tokio",
 ]
 
 [[package]]
@@ -5193,6 +5189,18 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "viewer"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "redfog-core",
+ "session-backend",
+ "softbuffer",
+ "tokio",
+ "winit",
+]
 
 [[package]]
 name = "waker-fn"

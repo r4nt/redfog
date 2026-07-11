@@ -3,12 +3,6 @@ name = "gst-backend"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "gst-viewer"
-path = "src/bin/gst-viewer.rs"
-
 [dependencies]
 redfog-core = { path = "../redfog-core" }
 gstreamer = "0.21"
-winit = "0.29"
-softbuffer = "0.4"

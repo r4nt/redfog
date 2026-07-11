@@ -1,0 +1,12 @@
+[package]
+name = "viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+redfog-core = { path = "../redfog-core" }
+session-backend = { path = "../session-backend" }
+gstreamer = "0.21"
+winit = "0.29"
+softbuffer = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread"] }

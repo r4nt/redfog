@@ -66,6 +66,11 @@ async fn handle_connection(
                     .map(|wayland_socket_path| redfog_broker_protocol::SpawnedSession { wayland_socket_path });
                 BrokerResponse::SpawnSession(result)
             }
+            BrokerRequest::SpawnPayload { session_id, username, socket_path, runtime_dir, argv, env } => {
+                tracing::info!("spawning payload for session {session_id}, user {username}, against caller-owned socket {socket_path}");
+                let result = sessions.spawn_payload(&session_id, &username, &socket_path, &runtime_dir, &argv, &env).await;
+                BrokerResponse::SpawnPayload(result)
+            }
             BrokerRequest::TerminateSession { session_id } => {
                 tracing::info!("terminating session {session_id}");
                 BrokerResponse::TerminateSession(sessions.terminate(&session_id).await)

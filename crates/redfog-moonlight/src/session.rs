@@ -1,5 +1,5 @@
 //! Login -> User `CompositorSession` handoff state machine, driven by RTSP
-//! events. The RTSP-driven analogue of `kwin-viewer`'s winit-loop handoff:
+//! events. The RTSP-driven analogue of `viewer`'s `--mode handoff` winit-loop:
 //! `/launch` spawns the Login compositor and streams it; once it exits
 //! (login succeeded), we spawn the User compositor and repoint the video/
 //! audio/input pipelines at it — same two-session dance, different trigger.
@@ -8,11 +8,14 @@
 //! one is active is rejected, matching a reasonable v1 restriction.
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use redfog_core::{AudioLoopback, CompositorSession, InputForwarder, InputSink, SessionType};
+use redfog_core::{AudioLoopback, InputSink, SessionType};
+pub use session_backend::Backend;
+use session_backend::SpawnedCompositor;
 
 use crate::audio::{AudioPacketizer, AudioSender};
 use crate::control::{ControlEventHandler, InputEvent};
@@ -30,7 +33,8 @@ pub struct SessionConfig {
     /// the real login GUI.
     pub login_app: Vec<String>,
     /// Command to run for the real desktop session once login succeeds
-    /// (e.g. `["plasmashell", "--no-respawn"]`).
+    /// (e.g. `["plasmashell", "--no-respawn"]`, or `["sway"]` for the
+    /// gst-wayland-display backend).
     pub user_app: Vec<String>,
     pub bitrate_kbps: u32,
     /// Logs every mouse input event (move/button/scroll) at `info` level
@@ -40,19 +44,26 @@ pub struct SessionConfig {
     pub log_mouse_events: bool,
     /// Path to redfog-broker's Unix socket. When set, the User session
     /// (post-login) is spawned via the broker (`Authenticate` then
-    /// `SpawnSession`, see design.md's "Privilege separation: broker vs.
-    /// server") instead of directly via `CompositorSession::spawn` — the
-    /// production path, and what the integration test exercises with a
-    /// fake-auth/force-spawn-user broker. `None` keeps today's direct-spawn
-    /// behavior, for standalone use without a broker.
+    /// `SpawnSession`/`SpawnPayload` depending on `backend`, see design.md's
+    /// "Privilege separation: broker vs. server") instead of directly via
+    /// `CompositorSession::spawn` — the production path, and what the
+    /// integration test exercises with a fake-auth/force-spawn-user broker.
+    /// `None` keeps today's direct-spawn behavior, for standalone use
+    /// without a broker.
     pub broker_socket_path: Option<std::path::PathBuf>,
+    pub backend: Backend,
 }
+
+// `Backend`/`SpawnedCompositor` themselves live in `session-backend` now —
+// shared with `viewer`'s standalone debug tooling, see its doc comments for
+// the ownership model of each variant and why `SpawnedCompositor::terminate`/
+// `try_wait`/`video_source`/`input_sink` are as simple as they are.
 
 struct RunningSession {
     kind: SessionType,
     width: u32,
     height: u32,
-    compositor: CompositorSession,
+    compositor: SpawnedCompositor,
     input_forwarder: Box<dyn InputSink>,
     video_pipeline: gstreamer::Pipeline,
     audio_pipeline: gstreamer::Pipeline,
@@ -222,15 +233,15 @@ impl SessionManager {
     /// Spawns the Login compositor directly — never goes through the
     /// broker, since it doesn't need to run as any particular target user
     /// (see design.md's "Authentication: a real graphical login screen").
-    fn spawn_login_compositor(&self, width: u32, height: u32) -> Result<CompositorSession, String> {
-        CompositorSession::spawn(SessionType::Login, "redfog-login-0", width as i32, height as i32, 1.0, &self.config.login_app)
-            .map_err(|e| format!("failed to spawn redfog-login-0: {e}"))
+    fn spawn_login_compositor(&self, width: u32, height: u32) -> Result<SpawnedCompositor, String> {
+        session_backend::spawn_login_compositor(self.config.backend, &self.config.login_app, width, height)
     }
 
     /// Acquires the User compositor — via the broker if configured
-    /// (`Authenticate` then `SpawnSession`, the production path), or
-    /// directly otherwise (standalone use without a broker).
-    async fn spawn_user_compositor(&self, width: u32, height: u32) -> Result<CompositorSession, String> {
+    /// (`Authenticate` then `SpawnSession`/`SpawnPayload` depending on
+    /// `backend`, the production path), or directly otherwise (standalone
+    /// use without a broker).
+    async fn spawn_user_compositor(&self, width: u32, height: u32) -> Result<SpawnedCompositor, String> {
         // `handle_login_report` sets this once `redfog-login`'s credentials
         // have already passed the broker's real, password-checked
         // `Authenticate` — re-sending an empty password through that same
@@ -245,78 +256,40 @@ impl SessionManager {
         let username = reported_username.clone().unwrap_or_else(|| "user".to_string());
 
         let Some(broker_socket_path) = &self.config.broker_socket_path else {
-            return CompositorSession::spawn(
-                SessionType::User(username),
-                "redfog-user-0",
-                width as i32,
-                height as i32,
-                1.0,
-                &self.config.user_app,
-            )
-            .map_err(|e| format!("failed to spawn redfog-user-0: {e}"));
+            return session_backend::spawn_user_compositor_direct(self.config.backend, &username, &self.config.user_app, width, height);
         };
-
-        use redfog_broker_protocol::{read_response, write_request, BrokerRequest, BrokerResponse};
-        use tokio::io::BufReader;
-        use tokio::net::UnixStream;
-
-        let stream = UnixStream::connect(broker_socket_path)
-            .await
-            .map_err(|e| format!("failed to connect to broker at {broker_socket_path:?}: {e}"))?;
-        let mut reader = BufReader::new(stream);
-
-        if reported_username.is_none() {
-            write_request(
-                &mut reader,
-                &BrokerRequest::Authenticate { username: username.clone(), password: String::new() },
-            )
-            .await
-            .map_err(|e| format!("failed to send Authenticate to broker: {e}"))?;
-            match read_response(&mut reader).await.map_err(|e| format!("failed to read Authenticate response: {e}"))? {
-                BrokerResponse::Authenticate(Ok(())) => {}
-                BrokerResponse::Authenticate(Err(e)) => return Err(format!("broker rejected authentication: {e}")),
-                other => return Err(format!("unexpected broker response to Authenticate: {other:?}")),
-            }
-        }
 
         let session_id = self.next_broker_session_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string();
-        write_request(
-            &mut reader,
-            &BrokerRequest::SpawnSession {
-                session_id,
-                username: username.clone(),
-                width,
-                height,
-                socket_name: "redfog-user-0".to_string(),
-                payload: self.config.user_app.clone(),
-            },
+        session_backend::spawn_user_compositor_via_broker(
+            self.config.backend,
+            broker_socket_path,
+            session_id,
+            &username,
+            "",
+            reported_username.is_some(),
+            &self.config.user_app,
+            width,
+            height,
         )
         .await
-        .map_err(|e| format!("failed to send SpawnSession to broker: {e}"))?;
-        let wayland_socket_path = match read_response(&mut reader).await.map_err(|e| format!("failed to read SpawnSession response: {e}"))? {
-            BrokerResponse::SpawnSession(Ok(spawned)) => spawned.wayland_socket_path,
-            BrokerResponse::SpawnSession(Err(e)) => return Err(format!("broker failed to spawn session: {e}")),
-            other => return Err(format!("unexpected broker response to SpawnSession: {other:?}")),
-        };
-
-        CompositorSession::attach(
-            SessionType::User(username),
-            "redfog-user-0",
-            std::path::PathBuf::from(wayland_socket_path),
-            width as i32,
-            height as i32,
-            1.0,
-        )
-        .map_err(|e| format!("failed to attach to broker-spawned session: {e}"))
     }
 
-    fn spawn_session(&self, kind: SessionType, width: u32, height: u32, compositor: CompositorSession) -> Result<RunningSession, String> {
-        let socket_name = compositor.socket_name.clone();
-        let input_forwarder: Box<dyn InputSink> = Box::new(
-            InputForwarder::connect(&compositor.socket_path).map_err(|e| format!("failed to connect input forwarder: {e}"))?,
-        );
-        let audio_loopback = AudioLoopback::spawn(&socket_name)
-            .map_err(|e| format!("failed to spawn audio loopback for {socket_name}: {e}"))?;
+    fn spawn_session(&self, kind: SessionType, width: u32, height: u32, compositor: SpawnedCompositor) -> Result<RunningSession, String> {
+        // Not derived from compositor.socket_name(): for Backend::Kwin that
+        // happens to already be unique per stage ("redfog-login-0" /
+        // "redfog-user-0"), but for Backend::GstWaylandDisplay it's always
+        // literally "wayland-1" (waylanddisplaysrc's own fixed socket name
+        // — see spawn_gst_compositor) — using it here would collide the
+        // Login and User stages' pw-loopback sink names during handoff,
+        // since the old Login session isn't dropped (and its AudioLoopback
+        // torn down) until after the new User one is already spawned.
+        let audio_session_name = match &kind {
+            SessionType::Login => "redfog-login-0".to_string(),
+            SessionType::User(_) => "redfog-user-0".to_string(),
+        };
+        let input_forwarder = compositor.input_sink()?;
+        let audio_loopback = AudioLoopback::spawn(&audio_session_name)
+            .map_err(|e| format!("failed to spawn audio loopback for {audio_session_name}: {e}"))?;
 
         // GStreamer's appsink callbacks run on GStreamer's own streaming
         // threads, not tokio worker threads — `tokio::spawn` would panic
@@ -380,12 +353,79 @@ impl SessionManager {
         })
     }
 
-    /// Bring the encoder/audio pipelines to PLAYING and, if this is the
-    /// Login session, spawn the background task watching for it to exit.
+    /// For `Backend::GstWaylandDisplay`: fires a background task that waits
+    /// for the compositor's Wayland socket to actually exist (it doesn't
+    /// until the pipeline built around it reaches Playing — see
+    /// `spawn_gst_compositor`'s doc comment) and then spawns the nested
+    /// payload — directly if this is the Login stage or a standalone
+    /// (no-broker) User stage, via the broker's `SpawnPayload` otherwise.
+    /// No-op for `Backend::Kwin` (its payload is already running by the
+    /// time this is called, via KWin's own `--exit-with-session`).
+    ///
+    /// A background task rather than something `start_streaming` awaits
+    /// inline: `RunningSession`/`SpawnedCompositor::GstWaylandDisplay`
+    /// hold a `gstreamer::Element` directly, and something about that
+    /// combination — confirmed live, `SpawnedCompositor: Send` and
+    /// `SessionManager: Sync` both hold in isolation, yet an `async fn`
+    /// taking `&self` and an owned `RunningSession` still isn't — defeats
+    /// `tokio::spawn`'s `Send` bound once threaded through
+    /// `watch_login_exit`. Firing a fresh, independent task here sidesteps
+    /// it entirely; the task reaches back into `self.shared` under its own
+    /// lock once done, exactly like `watch_login_exit` already does,
+    /// rather than holding any owned/borrowed session state across an
+    /// await itself.
+    fn spawn_gst_payload_in_background(&self, kind: SessionType, runtime_dir: String, socket_path: PathBuf, socket_name: String) {
+        let this = self.arc_self();
+        tokio::spawn(async move {
+            let (payload, username) = match &kind {
+                SessionType::Login => (this.config.login_app.clone(), None),
+                SessionType::User(username) => (this.config.user_app.clone(), Some(username.clone())),
+            };
+            let nested_config = session_backend::NestedSessionConfig { command: payload, ..Default::default() };
+
+            // Login always spawns directly (never via broker, see
+            // spawn_login_compositor's doc comment) — as does a standalone
+            // User stage with no broker configured at all. Only a
+            // broker-configured User stage goes through SpawnPayload.
+            let broker = match (&this.config.broker_socket_path, &username) {
+                (_, None) | (None, Some(_)) => None,
+                (Some(broker_socket_path), Some(username)) => {
+                    let session_id = this.next_broker_session_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string();
+                    Some((broker_socket_path.as_path(), session_id, username.clone()))
+                }
+            };
+
+            let spawned_child = match session_backend::spawn_gst_payload(&runtime_dir, &socket_path, &socket_name, &nested_config, broker, Duration::from_secs(10)).await {
+                Ok(child) => child,
+                Err(e) => {
+                    tracing::error!("failed to spawn gst-wayland-display payload: {e}");
+                    return;
+                }
+            };
+
+            let mut shared = this.shared.lock().unwrap();
+            if let State::Streaming { session } = &mut shared.state {
+                if session.kind == kind {
+                    if let SpawnedCompositor::GstWaylandDisplay { payload_process, .. } = &mut session.compositor {
+                        *payload_process = spawned_child;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Bring the encoder/audio pipelines to PLAYING, spawn the nested
+    /// payload for `Backend::GstWaylandDisplay` (a no-op for `Backend::Kwin`
+    /// — its payload is already running), and if this is the Login
+    /// session, spawn the background task watching for it to exit.
     fn start_streaming(&self, session: RunningSession) {
         use gstreamer::prelude::*;
         let _ = session.video_pipeline.set_state(gstreamer::State::Playing);
         let _ = session.audio_pipeline.set_state(gstreamer::State::Playing);
+
+        if let SpawnedCompositor::GstWaylandDisplay { runtime_dir, socket_path, socket_name, .. } = &session.compositor {
+            self.spawn_gst_payload_in_background(session.kind.clone(), runtime_dir.clone(), socket_path.clone(), socket_name.clone());
+        }
 
         for (name, pipeline) in [("video", session.video_pipeline.clone()), ("audio", session.audio_pipeline.clone())] {
             let bus = pipeline.bus().unwrap();
