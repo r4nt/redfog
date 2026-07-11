@@ -2,37 +2,25 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
 use eframe::egui;
-use redfog_login_protocol::{LoginRequest, LoginResponse};
+use redfog_login_protocol::{LoginRequest, LoginResponse, SessionPreset};
 
-/// Which compositor the User stage (post-login) should use — mirrors
-/// `session_backend::Backend` exactly (same wire strings, see `as_str`),
-/// but redeclared locally rather than depending on that crate: it pulls in
-/// gstreamer/redfog-core/etc., far more than this minimal `eframe` GUI
-/// otherwise needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Backend {
-    Kwin,
-    GstWaylandDisplay,
-}
+/// The login screen's "Custom" entry sends this literal sentinel instead of
+/// a preset name — see `SessionManager::handle_login_report`'s doc comment
+/// for what it means (resolve the target user's own
+/// `~/.config/redfog/session.toml` via the broker instead of a fixed
+/// operator-defined preset).
+const USER_CONFIGURED: &str = "user-configured";
 
-impl Backend {
-    fn as_str(self) -> &'static str {
-        match self {
-            Backend::Kwin => "kwin",
-            Backend::GstWaylandDisplay => "gst-wayland-display",
-        }
-    }
-}
-
-/// Sends the entered credentials (and the chosen `backend` for the
-/// subsequent User stage — see `SessionManager::handle_login_report`) to
-/// `redfog-server` over `REDFOG_LOGIN_SOCKET` and waits for the real
-/// PAM-backed verdict (via the broker's `Authenticate` — see design.md's
-/// "Privilege separation: broker vs. server"). Without this env var set
-/// (e.g. standalone use with no broker configured), falls back to accepting
-/// any non-empty username, same as this app's original no-op placeholder
-/// behavior — the backend choice is simply never reported in that case.
-fn authenticate(username: &str, password: &str, backend: Backend) -> Result<(), String> {
+/// Sends the entered credentials (and the chosen session name — either one
+/// of `presets`' `name`s, or [`USER_CONFIGURED`] — see
+/// `SessionManager::handle_login_report`) to `redfog-server` over
+/// `REDFOG_LOGIN_SOCKET` and waits for the real PAM-backed verdict (via the
+/// broker's `Authenticate` — see design.md's "Privilege separation: broker
+/// vs. server"). Without this env var set (e.g. standalone use with no
+/// broker configured), falls back to accepting any non-empty username, same
+/// as this app's original no-op placeholder behavior — the session choice
+/// is simply never reported in that case.
+fn authenticate(username: &str, password: &str, session: &str) -> Result<(), String> {
     let Ok(socket_path) = std::env::var("REDFOG_LOGIN_SOCKET") else {
         if username.trim().is_empty() {
             return Err("Username cannot be empty".to_string());
@@ -41,7 +29,7 @@ fn authenticate(username: &str, password: &str, backend: Backend) -> Result<(), 
     };
     let stream = UnixStream::connect(&socket_path).map_err(|e| format!("failed to reach session server: {e}"))?;
     let mut writer = stream.try_clone().map_err(|e| format!("failed to reach session server: {e}"))?;
-    let request = LoginRequest::Authenticate { username: username.to_string(), password: password.to_string(), backend: backend.as_str().to_string() };
+    let request = LoginRequest::Authenticate { username: username.to_string(), password: password.to_string(), session: session.to_string() };
     let mut line = serde_json::to_string(&request).expect("protocol types always serialize");
     line.push('\n');
     writer.write_all(line.as_bytes()).map_err(|e| format!("failed to reach session server: {e}"))?;
@@ -67,23 +55,40 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "Redfog Login",
         options,
-        Box::new(|_cc| Box::new(LoginApp::default())),
+        Box::new(|_cc| Box::new(LoginApp::new())),
     )
 }
 
 struct LoginApp {
     username: String,
     password: String,
-    backend: Backend,
+    /// The operator-configured session list — see
+    /// `redfog_login_protocol::load_presets`'s doc comment for why this
+    /// reads the same file `redfog-server` did directly, rather than
+    /// fetching it over `REDFOG_LOGIN_SOCKET`.
+    presets: Vec<SessionPreset>,
+    /// Either one of `presets`' `name`s, or [`USER_CONFIGURED`] — see
+    /// `authenticate`'s doc comment.
+    session_name: String,
     error_msg: Option<String>,
 }
 
-impl Default for LoginApp {
-    fn default() -> Self {
+impl LoginApp {
+    fn new() -> Self {
+        let path = std::env::var("REDFOG_SESSIONS_CONFIG").unwrap_or_else(|_| redfog_login_protocol::DEFAULT_SESSIONS_CONFIG_PATH.to_string());
+        let presets = match redfog_login_protocol::load_presets(&path) {
+            Ok(presets) => presets,
+            Err(e) => {
+                eprintln!("redfog-login: failed to load {path}: {e} — falling back to built-in defaults");
+                redfog_login_protocol::default_presets()
+            }
+        };
+        let session_name = presets.first().map(|p| p.name.clone()).unwrap_or_else(|| USER_CONFIGURED.to_string());
         Self {
             username: String::new(),
             password: String::new(),
-            backend: Backend::Kwin,
+            presets,
+            session_name,
             error_msg: None,
         }
     }
@@ -151,8 +156,14 @@ impl eframe::App for LoginApp {
 
                         ui.horizontal(|ui| {
                             ui.label("Session:");
-                            ui.radio_value(&mut self.backend, Backend::Kwin, "KDE Plasma");
-                            ui.radio_value(&mut self.backend, Backend::GstWaylandDisplay, "Sway");
+                            let selected_text = if self.session_name == USER_CONFIGURED { "Custom" } else { &self.session_name };
+                            egui::ComboBox::from_id_source("session_picker").selected_text(selected_text).show_ui(ui, |ui| {
+                                for preset in &self.presets {
+                                    ui.selectable_value(&mut self.session_name, preset.name.clone(), &preset.name);
+                                }
+                                ui.selectable_value(&mut self.session_name, USER_CONFIGURED.to_string(), "Custom")
+                                    .on_hover_text("Reads ~/.config/redfog/session.toml");
+                            });
                         });
                         ui.add_space(15.0);
 
@@ -166,7 +177,7 @@ impl eframe::App for LoginApp {
                         }
 
                         if submit {
-                            match authenticate(&self.username, &self.password, self.backend) {
+                            match authenticate(&self.username, &self.password, &self.session_name) {
                                 Ok(()) => std::process::exit(0),
                                 Err(e) => {
                                     self.password.clear();

@@ -91,6 +91,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => redfog_moonlight::session::Backend::default(),
     };
 
+    // The login screen's session picker (see redfog_login_protocol's own
+    // doc comment for why redfog-login reads this same file directly
+    // rather than fetching the list over the wire). Exported so the
+    // Login-stage process tree — specifically redfog-login itself — reads
+    // the exact file this process resolved, not a possibly-different
+    // independently-resolved default.
+    let sessions_config_path = std::env::var("REDFOG_SESSIONS_CONFIG").unwrap_or_else(|_| redfog_login_protocol::DEFAULT_SESSIONS_CONFIG_PATH.to_string());
+    std::env::set_var("REDFOG_SESSIONS_CONFIG", &sessions_config_path);
+    let session_presets = redfog_login_protocol::load_presets(&sessions_config_path)?;
+    // Fail fast at startup on a typo'd backend name, rather than only once
+    // someone happens to pick that specific preset on the login screen.
+    for preset in &session_presets {
+        preset
+            .backend
+            .parse::<redfog_moonlight::session::Backend>()
+            .map_err(|e| format!("{sessions_config_path}: session {:?}: {e}", preset.name))?;
+    }
+
     // Where redfog-login reports the credentials it collects (see
     // design.md's "Authentication: a real graphical login screen") —
     // exported as an env var so the Login-stage KWin process (and its
@@ -110,6 +128,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         broker_socket_path,
         log_mouse_events,
         backend,
+        session_presets,
     });
 
     let pairing_server = Arc::new(PairingServer {

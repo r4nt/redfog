@@ -41,6 +41,17 @@ pub enum BrokerRequest {
         env: Vec<(String, String)>,
     },
     TerminateSession { session_id: String },
+    /// Reads `~/.config/redfog/session.toml` for `username` — the backing
+    /// mechanism for the login screen's "User Configured" session option
+    /// (see design.md's session-picker notes and `UserSessionConfig`'s doc
+    /// comment). Only the broker can do this: `redfog-server` doesn't run
+    /// as `username` and that file is expected to live under normal `700`
+    /// home-directory permissions. No caller-supplied path — always exactly
+    /// that one file, so there's no traversal surface. Callers must already
+    /// have authenticated `username` (via `Authenticate`) before sending
+    /// this — it's gated on proof of identity, not used to decide what to
+    /// show an unauthenticated party.
+    ReadUserSessionConfig { username: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +60,33 @@ pub enum BrokerResponse {
     SpawnSession(Result<SpawnedSession, String>),
     SpawnPayload(Result<(), String>),
     TerminateSession(Result<(), String>),
+    /// `Ok(None)` means the file doesn't exist (not an error — the option
+    /// is offered even to users who haven't created one yet; the caller
+    /// should surface a clear "no ~/.config/redfog/session.toml found"
+    /// error at that point instead).
+    ReadUserSessionConfig(Result<Option<UserSessionConfig>, String>),
+}
+
+/// The User stage's backend/payload, as configured by the target user
+/// themselves in `~/.config/redfog/session.toml` (TOML) — chosen when
+/// picking "User Configured" on the login screen instead of one of the
+/// operator-defined presets. Mirrors `session_backend::NestedSessionConfig`
+/// + `Backend` in shape, but redeclared here (plain strings, no enum)
+/// rather than depending on that crate: this crate is the server<->broker
+/// wire protocol, and `session_backend` pulls in gstreamer/redfog-core —
+/// far more than a plain config-file schema needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserSessionConfig {
+    /// `"kwin"` or `"gst-wayland-display"` — same strings `REDFOG_BACKEND`
+    /// uses (see `session_backend::Backend`'s `FromStr`/`as_str`).
+    pub backend: String,
+    pub payload: Vec<String>,
+    /// gst-wayland-display-only — see `NestedSessionConfig`'s fields of the
+    /// same name. Ignored for `backend = "kwin"`.
+    #[serde(default)]
+    pub desktop_name: Option<String>,
+    #[serde(default)]
+    pub glx_vendor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

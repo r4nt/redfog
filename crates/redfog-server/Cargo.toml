@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 redfog-core = { path = "../redfog-core" }
 redfog-moonlight = { path = "../redfog-moonlight" }
+redfog-login-protocol = { path = "../redfog-login-protocol" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"

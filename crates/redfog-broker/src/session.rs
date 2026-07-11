@@ -555,6 +555,23 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Backing implementation for `BrokerRequest::ReadUserSessionConfig` —
+    /// see its doc comment for why only the broker can do this (root reads
+    /// past normal `700` home-directory permissions; `resolve_user` is the
+    /// same helper `spawn_via_pam`/`spawn_payload` already use). `Ok(None)`
+    /// for a missing file is the expected, common case (most users won't
+    /// have created one), not an error.
+    pub async fn read_user_session_config(&self, username: &str) -> Result<Option<redfog_broker_protocol::UserSessionConfig>, String> {
+        let (_uid, _gid, home_dir) = resolve_user(username).await?;
+        let path = std::path::Path::new(&home_dir).join(".config/redfog/session.toml");
+        let contents = match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("failed to read {path:?}: {e}")),
+        };
+        toml::from_str(&contents).map(Some).map_err(|e| format!("failed to parse {path:?}: {e}"))
+    }
+
     pub async fn terminate(&self, session_id: &str) -> Result<(), String> {
         let session = self
             .active

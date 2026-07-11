@@ -1,0 +1,40 @@
+# redfog's login-screen session picker — see redfog_login_protocol's
+# load_presets() and SessionPreset for the authoritative schema/docs.
+#
+# Install at /etc/redfog/sessions.toml (or point REDFOG_SESSIONS_CONFIG at
+# a different path) to customize what redfog-login's dropdown offers. If
+# this file doesn't exist at all, redfog-server/redfog-login fall back to
+# just the first two entries below (today's built-in defaults) — you only
+# need this file if you want to add, remove, or change entries.
+#
+# `redfog-server` validates every entry's `backend` at startup and refuses
+# to start if one is invalid — a typo here fails loudly immediately,
+# instead of only once someone happens to pick that specific entry.
+#
+# Not listed here at all: the login screen always also offers one more,
+# hardcoded "Custom" entry that reads the *logging-in user's own*
+# ~/.config/redfog/session.toml (same shape as one [[session]] block below,
+# minus `name`) instead of any operator-configured preset — see
+# BrokerRequest::ReadUserSessionConfig.
+
+[[session]]
+name = "KDE Plasma"
+backend = "kwin"
+payload = ["plasmashell", "--no-respawn"]
+
+[[session]]
+name = "Sway"
+backend = "gst-wayland-display"
+payload = ["sway"]
+desktop_name = "sway"
+
+# gst-wayland-display-only: __GLX_VENDOR_LIBRARY_NAME for the nested
+# session's own apps — needed on machines with more than one GLVND EGL
+# vendor file installed (see NestedSessionConfig::glx_vendor's doc comment).
+# Omit entirely on a machine that doesn't need it (most don't).
+[[session]]
+name = "Sway (NVIDIA)"
+backend = "gst-wayland-display"
+payload = ["sway", "-c", "/etc/redfog/sway-nvidia.conf"]
+desktop_name = "sway"
+glx_vendor = "nvidia"

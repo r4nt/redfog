@@ -3803,6 +3803,7 @@ dependencies = [
  "pam",
  "redfog-broker-protocol",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3843,6 +3844,7 @@ name = "redfog-login-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "toml",
 ]
 
 [[package]]
@@ -3898,6 +3900,7 @@ dependencies = [
  "gstreamer",
  "rand",
  "redfog-core",
+ "redfog-login-protocol",
  "redfog-moonlight",
  "rustls",
  "tokio",

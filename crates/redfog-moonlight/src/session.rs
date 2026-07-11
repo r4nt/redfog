@@ -52,6 +52,13 @@ pub struct SessionConfig {
     /// without a broker.
     pub broker_socket_path: Option<std::path::PathBuf>,
     pub backend: Backend,
+    /// Operator-configured, named session options offered on the login
+    /// screen (see `redfog_login_protocol::load_presets`) — what a
+    /// `LoginRequest::Authenticate.session` name other than
+    /// `"user-configured"` resolves against. Loaded once at startup;
+    /// `redfog-login`'s own copy comes from independently reading the same
+    /// file, not from this — see `load_presets`'s doc comment for why.
+    pub session_presets: Vec<redfog_login_protocol::SessionPreset>,
 }
 
 // `Backend`/`SpawnedCompositor` themselves live in `session-backend` now —
@@ -138,13 +145,28 @@ pub struct SessionManager {
     /// the fallback when nothing ever reports in, e.g. `redfog-test-ux`'s
     /// stand-in login stage in tests).
     authenticated_username: Mutex<Option<String>>,
-    /// Set alongside `authenticated_username` — the backend chosen on the
-    /// login screen itself for the *User* stage (the Login stage already
-    /// rendered by the time this is known, so it always uses
-    /// `config.backend` regardless — see `spawn_login_compositor`).
-    /// `None` (falls back to `config.backend`) when nothing ever reports
-    /// in, same reasoning as `authenticated_username`.
-    selected_backend: Mutex<Option<Backend>>,
+    /// Set alongside `authenticated_username` — the fully-resolved User
+    /// stage the login screen chose (the Login stage already rendered by
+    /// the time this is known, so it always uses `config.backend`/
+    /// `config.login_app` regardless — see `spawn_login_compositor`).
+    /// `None` (falls back to `config.backend`/`config.user_app`) when
+    /// nothing ever reports in, same reasoning as `authenticated_username`.
+    selected_session: Mutex<Option<SelectedSession>>,
+}
+
+/// The User stage's backend/payload as resolved by `handle_login_report` —
+/// either one of the two fixed presets (`config.user_app` unchanged, a
+/// fixed default `desktop_name`, no `glx_vendor`), or read from the target
+/// user's own `~/.config/redfog/session.toml` when they picked "Custom" on
+/// the login screen (`BrokerRequest::ReadUserSessionConfig`). Either way,
+/// by the time this exists it's a complete, concrete session — callers
+/// never need to know which source it came from.
+#[derive(Clone)]
+struct SelectedSession {
+    backend: Backend,
+    user_app: Vec<String>,
+    desktop_name: String,
+    glx_vendor: Option<String>,
 }
 
 impl SessionManager {
@@ -165,7 +187,7 @@ impl SessionManager {
             stream_start: Mutex::new(std::time::Instant::now()),
             next_broker_session_id: AtomicU64::new(0),
             authenticated_username: Mutex::new(None),
-            selected_backend: Mutex::new(None),
+            selected_session: Mutex::new(None),
         });
         let _ = this.self_ref.set(Arc::downgrade(&this));
         this
@@ -173,12 +195,20 @@ impl SessionManager {
 
     /// Validates credentials reported by `redfog-login` (see
     /// `crate::login_report`) via the broker's real PAM-backed
-    /// `Authenticate`, and remembers the username and chosen `backend` on
-    /// success for the subsequent User-stage spawn. Without a broker
-    /// configured (standalone use), just requires a non-empty username,
-    /// matching `redfog-login`'s original no-op placeholder behavior — the
-    /// backend is still remembered either way.
-    pub async fn handle_login_report(&self, username: String, password: String, backend: Backend) -> Result<(), String> {
+    /// `Authenticate`, then resolves `session_name` — either the literal
+    /// `"user-configured"` sentinel (the login screen's "Custom" entry) or
+    /// the `name` of one of `config.session_presets` — into a concrete
+    /// [`SelectedSession`] for the subsequent User-stage spawn. The
+    /// `"user-configured"` case round-trips through the broker's
+    /// `ReadUserSessionConfig`, gated behind the `Authenticate` above
+    /// having already succeeded (never used to decide what an
+    /// unauthenticated party sees). Without a broker configured
+    /// (standalone use), just requires a non-empty username, matching
+    /// `redfog-login`'s original no-op placeholder behavior — the session
+    /// is still resolved and remembered either way, though
+    /// `"user-configured"` has no user to read a config for in that case
+    /// and is rejected.
+    pub async fn handle_login_report(&self, username: String, password: String, session_name: String) -> Result<(), String> {
         if let Some(broker_socket_path) = &self.config.broker_socket_path {
             use redfog_broker_protocol::{read_response, write_request, BrokerRequest, BrokerResponse};
             use tokio::io::BufReader;
@@ -199,8 +229,55 @@ impl SessionManager {
         } else if username.trim().is_empty() {
             return Err("Username cannot be empty".to_string());
         }
+
+        let selected = if session_name == "user-configured" {
+            let broker_socket_path = self
+                .config
+                .broker_socket_path
+                .as_ref()
+                .ok_or_else(|| "\"Custom\" requires a broker (no REDFOG_BROKER_SOCKET configured)".to_string())?;
+            use redfog_broker_protocol::{read_response, write_request, BrokerRequest, BrokerResponse};
+            use tokio::io::BufReader;
+            use tokio::net::UnixStream;
+
+            let stream = UnixStream::connect(broker_socket_path)
+                .await
+                .map_err(|e| format!("failed to connect to broker at {broker_socket_path:?}: {e}"))?;
+            let mut reader = BufReader::new(stream);
+            write_request(&mut reader, &BrokerRequest::ReadUserSessionConfig { username: username.clone() })
+                .await
+                .map_err(|e| format!("failed to send ReadUserSessionConfig to broker: {e}"))?;
+            let user_config = match read_response(&mut reader).await.map_err(|e| format!("failed to read ReadUserSessionConfig response: {e}"))? {
+                BrokerResponse::ReadUserSessionConfig(Ok(Some(config))) => config,
+                BrokerResponse::ReadUserSessionConfig(Ok(None)) => {
+                    return Err("no ~/.config/redfog/session.toml found — create one to use \"Custom\", or pick a preset session".to_string())
+                }
+                BrokerResponse::ReadUserSessionConfig(Err(e)) => return Err(e),
+                other => return Err(format!("unexpected broker response to ReadUserSessionConfig: {other:?}")),
+            };
+            SelectedSession {
+                backend: user_config.backend.parse()?,
+                user_app: user_config.payload,
+                desktop_name: user_config.desktop_name.unwrap_or_else(|| "sway".to_string()),
+                glx_vendor: user_config.glx_vendor,
+            }
+        } else {
+            let preset = self
+                .config
+                .session_presets
+                .iter()
+                .find(|p| p.name == session_name)
+                .ok_or_else(|| format!("unknown session {session_name:?} (was the sessions config changed after the login screen started?)"))?;
+            SelectedSession {
+                backend: preset.backend.parse()?,
+                user_app: preset.payload.clone(),
+                desktop_name: preset.desktop_name.clone().unwrap_or_else(|| "sway".to_string()),
+                glx_vendor: preset.glx_vendor.clone(),
+            }
+        };
+
         *self.authenticated_username.lock().unwrap() = Some(username);
-        *self.selected_backend.lock().unwrap() = Some(backend);
+        *self.selected_session.lock().unwrap() = Some(selected);
         Ok(())
     }
 
@@ -265,12 +342,14 @@ impl SessionManager {
         let reported_username = self.authenticated_username.lock().unwrap().clone();
         let username = reported_username.clone().unwrap_or_else(|| "user".to_string());
         // Chosen on the login screen itself — falls back to the server's
-        // own startup default (config.backend / REDFOG_BACKEND) when
+        // own startup default (config.backend/config.user_app) when
         // nothing was ever reported in, same reasoning as `username` above.
-        let backend = self.selected_backend.lock().unwrap().unwrap_or(self.config.backend);
+        let selected = self.selected_session.lock().unwrap().clone();
+        let backend = selected.as_ref().map(|s| s.backend).unwrap_or(self.config.backend);
+        let user_app = selected.as_ref().map(|s| s.user_app.clone()).unwrap_or_else(|| self.config.user_app.clone());
 
         let Some(broker_socket_path) = &self.config.broker_socket_path else {
-            return session_backend::spawn_user_compositor_direct(backend, &username, &self.config.user_app, width, height);
+            return session_backend::spawn_user_compositor_direct(backend, &username, &user_app, width, height);
         };
 
         let session_id = self.next_broker_session_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string();
@@ -281,7 +360,7 @@ impl SessionManager {
             &username,
             "",
             reported_username.is_some(),
-            &self.config.user_app,
+            &user_app,
             width,
             height,
         )
@@ -391,11 +470,22 @@ impl SessionManager {
     fn spawn_gst_payload_in_background(&self, kind: SessionType, runtime_dir: String, socket_path: PathBuf, socket_name: String) {
         let this = self.arc_self();
         tokio::spawn(async move {
-            let (payload, username) = match &kind {
-                SessionType::Login => (this.config.login_app.clone(), None),
-                SessionType::User(username) => (this.config.user_app.clone(), Some(username.clone())),
+            // Login always uses config.login_app / the default nested
+            // config — there's no selection to honor yet at that stage
+            // (see spawn_login_compositor's doc comment). The User stage
+            // uses whatever handle_login_report resolved, presets and
+            // "Custom" alike — see SelectedSession's doc comment.
+            let selected = this.selected_session.lock().unwrap().clone();
+            let (nested_config, username) = match &kind {
+                SessionType::Login => (session_backend::NestedSessionConfig { command: this.config.login_app.clone(), ..Default::default() }, None),
+                SessionType::User(username) => {
+                    let nested_config = match selected {
+                        Some(s) => session_backend::NestedSessionConfig { command: s.user_app, desktop_name: s.desktop_name, glx_vendor: s.glx_vendor },
+                        None => session_backend::NestedSessionConfig { command: this.config.user_app.clone(), ..Default::default() },
+                    };
+                    (nested_config, Some(username.clone()))
+                }
             };
-            let nested_config = session_backend::NestedSessionConfig { command: payload, ..Default::default() };
 
             // Login always spawns directly (never via broker, see
             // spawn_login_compositor's doc comment) — as does a standalone
@@ -874,6 +964,27 @@ impl ControlEventHandler for SessionManager {
         let shared = self.shared.lock().unwrap();
         if let State::Streaming { session } = &shared.state {
             redfog_core::request_keyframe(&session.video_pipeline);
+        }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::Backend;
+
+    /// The checked-in example config must actually load and have valid
+    /// `backend` values — the same validation `redfog-server`'s own
+    /// startup code does (see its `main.rs`), kept here rather than in
+    /// `redfog-login-protocol` since that crate deliberately doesn't
+    /// depend on `session-backend`'s `Backend` type (see its own doc
+    /// comments on `SessionPreset::backend`/`load_presets`).
+    #[test]
+    fn checked_in_example_sessions_config_is_valid() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/sessions.toml.example");
+        let presets = redfog_login_protocol::load_presets(path).expect("config/sessions.toml.example should parse");
+        assert!(!presets.is_empty());
+        for preset in &presets {
+            preset.backend.parse::<Backend>().unwrap_or_else(|e| panic!("config/sessions.toml.example: session {:?}: {e}", preset.name));
         }
     }
 }

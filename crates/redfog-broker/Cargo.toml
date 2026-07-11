@@ -10,3 +10,4 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 redfog-broker-protocol = { path = "../redfog-broker-protocol" }
+toml = "0.8"
