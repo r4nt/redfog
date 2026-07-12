@@ -17,10 +17,12 @@
 //! non-async winit event loop in `viewer`) means this crate can't
 //! reintroduce that bug — it never owns the choice of executor.
 
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
 
+use gstreamer::prelude::*;
 use redfog_core::{CompositorSession, InputSink, SessionType, VideoSource};
 
 pub use gst_backend::NestedSessionConfig;
@@ -57,8 +59,12 @@ impl std::str::FromStr for Backend {
     }
 }
 
-/// Which compositor backend produced a session's video/input surface — the
-/// two variants differ in *who* owns the compositor and its socket.
+/// Which compositor backend produced a session's video/input surface —
+/// [`Backend`] selects between the first two for the *User* stage; the
+/// third, [`Self::HeadlessLogin`], is what the *Login* stage always uses
+/// instead, regardless of `Backend` (see [`spawn_login_compositor`]'s doc
+/// comment for why Login doesn't need — and no longer even offers — a
+/// choice here at all).
 ///
 /// `Kwin`: broker-owned end-to-end (when spawned via the broker) or
 /// caller-owned (direct spawn) — either way, `CompositorSession` itself
@@ -72,6 +78,12 @@ impl std::str::FromStr for Backend {
 /// its `payload_process` field is filled in later, by [`spawn_gst_payload`],
 /// not at construction time (the payload's own Wayland socket doesn't exist
 /// until the pipeline built around `element` reaches at least `Paused`).
+///
+/// `HeadlessLogin`: no compositor, no Wayland socket, no KWin or
+/// gst-wayland-display at all — `redfog-login` renders its own frames
+/// in-process (`tiny-skia`/`embedded-graphics`) and ships them over a
+/// plain Unix stream (`redfog_login_protocol::render`) straight into a
+/// GStreamer `appsrc`, which is what `element` here actually is.
 pub enum SpawnedCompositor {
     Kwin(CompositorSession),
     GstWaylandDisplay {
@@ -85,6 +97,20 @@ pub enum SpawnedCompositor {
         /// `kwin_process: None` for a broker-attached session.
         payload_process: Option<Child>,
     },
+    HeadlessLogin {
+        child: Child,
+        /// The `appsrc` element frames are pushed into — see
+        /// [`spawn_login_compositor`]'s background reader thread.
+        element: gstreamer::Element,
+        /// A live handle to the same connection the reader thread reads
+        /// frames from — `try_clone()`'d again by `input_sink()` for
+        /// writing input events back the other way (see
+        /// `HeadlessLoginInputSink`). Kept here (not just handed off
+        /// entirely to the reader thread) so `terminate()` can
+        /// `shutdown()` it to stop that thread cleanly.
+        input_stream: UnixStream,
+        reader_thread: Option<std::thread::JoinHandle<()>>,
+    },
 }
 
 impl SpawnedCompositor {
@@ -92,13 +118,17 @@ impl SpawnedCompositor {
         match self {
             Self::Kwin(session) => session.video_source(),
             Self::GstWaylandDisplay { element, .. } => VideoSource::Element(element.clone()),
+            Self::HeadlessLogin { element, .. } => VideoSource::Element(element.clone()),
         }
     }
 
     /// KWin needs an explicit, fallible Wayland-protocol connection step;
     /// gst-wayland-display doesn't (`send_event` works on the element
     /// directly, no protocol handshake) — safe to call before the
-    /// compositor's socket even exists, unlike KWin's.
+    /// compositor's socket even exists, unlike KWin's. `HeadlessLogin`'s
+    /// connection already exists by construction time (see
+    /// `spawn_login_compositor`), so this is infallible in practice for it
+    /// too — only `try_clone()`'s I/O error path can fail at all.
     pub fn input_sink(&self) -> Result<Box<dyn InputSink>, String> {
         match self {
             Self::Kwin(session) => Ok(Box::new(
@@ -106,6 +136,10 @@ impl SpawnedCompositor {
                     .map_err(|e| format!("failed to connect input forwarder: {e}"))?,
             )),
             Self::GstWaylandDisplay { element, .. } => Ok(Box::new(gst_backend::GstInputSink::new(element.clone()))),
+            Self::HeadlessLogin { input_stream, .. } => {
+                let stream = input_stream.try_clone().map_err(|e| format!("failed to clone login frame stream: {e}"))?;
+                Ok(Box::new(HeadlessLoginInputSink { stream }))
+            }
         }
     }
 
@@ -114,6 +148,7 @@ impl SpawnedCompositor {
             Self::Kwin(session) => session.try_wait(),
             Self::GstWaylandDisplay { payload_process: Some(child), .. } => child.try_wait(),
             Self::GstWaylandDisplay { payload_process: None, .. } => Ok(None),
+            Self::HeadlessLogin { child, .. } => child.try_wait(),
         }
     }
 
@@ -123,6 +158,17 @@ impl SpawnedCompositor {
             Self::GstWaylandDisplay { mut payload_process, .. } => {
                 if let Some(mut child) = payload_process.take() {
                     let _ = child.kill();
+                }
+            }
+            Self::HeadlessLogin { mut child, input_stream, reader_thread, .. } => {
+                // Unblocks the reader thread's blocking read (see
+                // spawn_login_compositor) so it actually exits instead of
+                // hanging around past the process it was serving.
+                let _ = input_stream.shutdown(std::net::Shutdown::Both);
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(t) = reader_thread {
+                    let _ = t.join();
                 }
             }
         }
@@ -135,22 +181,51 @@ impl SpawnedCompositor {
     /// afterward (KWin's `pipewiresrc` needs a fresh element per resize
     /// anyway — see `VideoSource::into_element` — so this is safe to do
     /// unconditionally when `true`; doing it when `false` would be either a
-    /// no-op or, for `GstWaylandDisplay`, actively wrong — see
-    /// `spawn_gst_compositor`'s doc comment on why its `VideoSource::Element`
-    /// can't just be re-added to a new pipeline).
+    /// no-op or, for `GstWaylandDisplay`/`HeadlessLogin`, actively wrong —
+    /// see `spawn_gst_compositor`'s doc comment on why its
+    /// `VideoSource::Element` can't just be re-added to a new pipeline).
     ///
-    /// A documented no-op for `GstWaylandDisplay`, not a limitation callers
-    /// need to special-case per backend themselves: `waylanddisplaysrc`'s
-    /// capsfilter caps are fixed once built (no width/height property to
-    /// change live — see `gst_backend::make_source_element`'s doc comment).
+    /// A documented no-op for `GstWaylandDisplay`/`HeadlessLogin`, not a
+    /// limitation callers need to special-case per backend themselves:
+    /// neither has a width/height that can change live (`waylanddisplaysrc`'s
+    /// capsfilter caps are fixed once built — see `gst_backend::
+    /// make_source_element`'s doc comment; `redfog-login`'s own canvas size
+    /// is likewise fixed for the process's lifetime).
     pub fn resize(&self, width: i32, height: i32) -> bool {
         match self {
             Self::Kwin(session) => {
                 session.capture_session.resize(width, height);
                 true
             }
-            Self::GstWaylandDisplay { .. } => false,
+            Self::GstWaylandDisplay { .. } | Self::HeadlessLogin { .. } => false,
         }
+    }
+}
+
+/// [`InputSink`] for [`SpawnedCompositor::HeadlessLogin`] — ships each call
+/// straight to `redfog-login` as a [`redfog_login_protocol::render::
+/// LoginInputEvent`], for it to apply to its own UI state directly (there's
+/// no compositor/XKB left to do keymap translation, so `redfog-login`
+/// itself maps evdev keycodes to characters — see its own doc comments).
+struct HeadlessLoginInputSink {
+    stream: UnixStream,
+}
+
+impl InputSink for HeadlessLoginInputSink {
+    fn keyboard_key(&mut self, keycode: u32, pressed: bool) {
+        let _ = redfog_login_protocol::render::write_input(&mut self.stream, &redfog_login_protocol::render::LoginInputEvent::KeyboardKey { keycode, pressed });
+    }
+    fn pointer_motion(&mut self, dx: f64, dy: f64) {
+        let _ = redfog_login_protocol::render::write_input(&mut self.stream, &redfog_login_protocol::render::LoginInputEvent::MouseMoveRelative { dx, dy });
+    }
+    fn pointer_motion_absolute(&mut self, x: f64, y: f64) {
+        let _ = redfog_login_protocol::render::write_input(&mut self.stream, &redfog_login_protocol::render::LoginInputEvent::MouseMoveAbsolute { x, y });
+    }
+    fn button(&mut self, button: u32, pressed: bool) {
+        let _ = redfog_login_protocol::render::write_input(&mut self.stream, &redfog_login_protocol::render::LoginInputEvent::MouseButton { button, pressed });
+    }
+    fn axis(&mut self, axis: u32, value: f64) {
+        let _ = redfog_login_protocol::render::write_input(&mut self.stream, &redfog_login_protocol::render::LoginInputEvent::MouseAxis { axis, value });
     }
 }
 
@@ -187,16 +262,119 @@ pub fn spawn_gst_compositor(width: u32, height: u32, label: &str) -> Result<Spaw
     })
 }
 
-/// Spawns the Login compositor directly — this stage never goes through a
-/// broker, since it doesn't need to run as any particular target user (see
-/// design.md's "Authentication: a real graphical login screen").
-pub fn spawn_login_compositor(backend: Backend, login_app: &[String], width: u32, height: u32) -> Result<SpawnedCompositor, String> {
-    match backend {
-        Backend::Kwin => CompositorSession::spawn(SessionType::Login, "redfog-login-0", width as i32, height as i32, 1.0, login_app)
-            .map(SpawnedCompositor::Kwin)
-            .map_err(|e| format!("failed to spawn redfog-login-0: {e}")),
-        Backend::GstWaylandDisplay => spawn_gst_compositor(width, height, "redfog-login-0"),
+/// Spawns the Login compositor — always [`SpawnedCompositor::HeadlessLogin`],
+/// regardless of [`Backend`]: unlike the User stage, Login never needs to
+/// match whatever backend ends up chosen there (the two stages' video/audio
+/// pipelines are torn down and rebuilt from scratch at handoff regardless —
+/// see `redfog-moonlight::session`'s `handoff_to_user` — so there was never
+/// a technical reason for them to match, only historical accident from when
+/// `Backend` was a single global choice both stages inherited). This also
+/// means Login never goes through a broker at all — it doesn't need to run
+/// as any particular target user (see design.md's "Authentication: a real
+/// graphical login screen") — and, now, doesn't depend on KWin or
+/// gst-wayland-display being installed/built at all either.
+///
+/// `redfog-login` is entirely first-party code (see its own module doc
+/// comments): rather than needing a real compositor just to host one small
+/// form, it renders its own frames (`tiny-skia`/`embedded-graphics`, no
+/// GPU) and ships them over a plain Unix stream
+/// (`redfog_login_protocol::render`) straight into a GStreamer `appsrc` —
+/// this function's whole job is standing that stream up: bind a socket,
+/// spawn `login_app` pointed at it via env vars, accept the one connection
+/// it makes, then hand frames arriving on it to a background thread that
+/// pushes them into the `appsrc`.
+pub fn spawn_login_compositor(login_app: &[String], width: u32, height: u32) -> Result<SpawnedCompositor, String> {
+    if login_app.is_empty() {
+        return Err("login_app must not be empty".to_string());
     }
+
+    let socket_path = format!("{}/login-frame-{}.sock", redfog_core::default_runtime_dir(), std::process::id());
+    if let Some(parent) = Path::new(&socket_path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create {parent:?}: {e}"))?;
+    }
+    let _ = std::fs::remove_file(&socket_path); // stale socket from a previous run
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).map_err(|e| format!("failed to bind login frame socket {socket_path}: {e}"))?;
+    listener.set_nonblocking(true).map_err(|e| format!("failed to set login frame socket nonblocking: {e}"))?;
+
+    let mut cmd = std::process::Command::new(&login_app[0]);
+    cmd.args(&login_app[1..]);
+    cmd.env("REDFOG_LOGIN_FRAME_SOCKET", &socket_path);
+    cmd.env("REDFOG_LOGIN_WIDTH", width.to_string());
+    cmd.env("REDFOG_LOGIN_HEIGHT", height.to_string());
+    cmd.stdout(std::process::Stdio::inherit()).stderr(std::process::Stdio::inherit());
+    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn {login_app:?}: {e}"))?;
+
+    // Poll-accept with a timeout — matches the polling style already used
+    // elsewhere in this codebase (e.g. gst_backend::wait_for_wayland_socket)
+    // rather than a blocking accept with no bound, so a login_app that
+    // fails to even start (bad path, missing library, ...) doesn't hang
+    // this call forever.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(format!("{login_app:?} exited before connecting to the login frame socket ({status})"));
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return Err(format!("{login_app:?} never connected to the login frame socket within 10s"));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("failed to accept login frame connection: {e}")),
+        }
+    };
+    let _ = std::fs::remove_file(&socket_path); // no longer needed once connected
+    stream.set_nonblocking(false).map_err(|e| format!("failed to set login frame stream blocking: {e}"))?;
+
+    let appsrc = gstreamer::ElementFactory::make("appsrc")
+        .name("login-appsrc")
+        .property("format", gstreamer::Format::Time)
+        .property("is-live", true)
+        .property("block", false)
+        .build()
+        .map_err(|e| format!("failed to create appsrc element: {e}"))?;
+    let caps = gstreamer::Caps::builder("video/x-raw")
+        .field("format", "RGBA")
+        .field("width", width as i32)
+        .field("height", height as i32)
+        .field("framerate", gstreamer::Fraction::new(30, 1))
+        .build();
+    appsrc.set_property("caps", &caps);
+
+    let app_src = appsrc
+        .clone()
+        .dynamic_cast::<gstreamer_app::AppSrc>()
+        .map_err(|_| "appsrc element factory didn't produce an AppSrc".to_string())?;
+
+    let reader_stream = stream.try_clone().map_err(|e| format!("failed to clone login frame stream: {e}"))?;
+    let reader_thread = std::thread::spawn(move || {
+        let mut reader = reader_stream;
+        loop {
+            match redfog_login_protocol::render::read_message(&mut reader) {
+                Ok(Some(redfog_login_protocol::render::Message::Frame { rgba, .. })) => {
+                    let mut buffer = gstreamer::Buffer::with_size(rgba.len()).expect("buffer allocation");
+                    {
+                        let buffer_mut = buffer.get_mut().expect("freshly allocated buffer is never shared");
+                        buffer_mut.copy_from_slice(0, &rgba).expect("buffer sized exactly for rgba");
+                    }
+                    if app_src.push_buffer(buffer).is_err() {
+                        break; // pipeline gone/EOS
+                    }
+                }
+                Ok(Some(redfog_login_protocol::render::Message::Input(_))) => {} // wrong direction on this stream, ignore
+                Ok(None) => break,                                                // redfog-login exited/closed the connection
+                Err(e) => {
+                    tracing::warn!("login frame socket read error: {e}");
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(SpawnedCompositor::HeadlessLogin { child, element: appsrc, input_stream: stream, reader_thread: Some(reader_thread) })
 }
 
 /// Spawns the User compositor directly (no broker) — standalone use.

@@ -304,13 +304,15 @@ fn default_payload(backend: Backend) -> Vec<String> {
     }
 }
 
-/// No-op for `Backend::Kwin` (its payload is already running by construction
-/// — see `SpawnedCompositor`'s doc comment). For `Backend::GstWaylandDisplay`,
-/// blocks (via `runtime.block_on`) waiting for the compositor's Wayland
-/// socket to appear and then spawns `command` as its nested payload —
-/// directly, or via the broker if `via_broker` (only meaningful for
-/// `Mode::Broker`'s User stage; the Login stage always spawns directly, same
-/// as production — see `session_backend::spawn_gst_payload`'s doc comment).
+/// No-op for `SpawnedCompositor::Kwin`/`HeadlessLogin` (their payload is
+/// already running by construction — see `SpawnedCompositor`'s doc
+/// comment; the Login stage is always `HeadlessLogin` now regardless of
+/// `--backend`, so this is a no-op for every Login-stage call). For
+/// `GstWaylandDisplay`, blocks (via `runtime.block_on`) waiting for the
+/// compositor's Wayland socket to appear and then spawns `command` as its
+/// nested payload — directly, or via the broker if `via_broker` (only
+/// meaningful for `Mode::Broker`'s User stage — see `session_backend::
+/// spawn_gst_payload`'s doc comment).
 fn spawn_gst_payload_for(
     runtime: &tokio::runtime::Runtime,
     compositor: &mut SpawnedCompositor,
@@ -396,7 +398,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Mode::Handoff | Mode::Broker => {
             eprintln!("viewer: spawning Login compositor...");
-            (SessionType::Login, session_backend::spawn_login_compositor(args.backend, &args.login_app, args.width as u32, args.height as u32)?)
+            (SessionType::Login, session_backend::spawn_login_compositor(&args.login_app, args.width as u32, args.height as u32)?)
         }
     };
 

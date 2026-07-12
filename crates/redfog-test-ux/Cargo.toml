@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 eframe = "0.27"
+redfog-login-protocol = { path = "../redfog-login-protocol" }
 
 [dev-dependencies]
 # Same version eframe 0.27 already pulls in transitively — reused directly

@@ -317,18 +317,34 @@ impl SessionManager {
         self.self_ref.get().and_then(Weak::upgrade).expect("self_ref set in new()")
     }
 
-    /// Spawns the Login compositor directly — never goes through the
-    /// broker, since it doesn't need to run as any particular target user
-    /// (see design.md's "Authentication: a real graphical login screen").
+    /// Spawns the Login compositor — always headless (see
+    /// `session_backend::spawn_login_compositor`'s doc comment), never
+    /// goes through the broker, since it doesn't need to run as any
+    /// particular target user (see design.md's "Authentication: a real
+    /// graphical login screen").
     fn spawn_login_compositor(&self, width: u32, height: u32) -> Result<SpawnedCompositor, String> {
-        session_backend::spawn_login_compositor(self.config.backend, &self.config.login_app, width, height)
+        session_backend::spawn_login_compositor(&self.config.login_app, width, height)
     }
 
     /// Acquires the User compositor — via the broker if configured
     /// (`Authenticate` then `SpawnSession`/`SpawnPayload` depending on
     /// `backend`, the production path), or directly otherwise (standalone
     /// use without a broker).
-    async fn spawn_user_compositor(&self, width: u32, height: u32) -> Result<SpawnedCompositor, String> {
+    /// Returns the compositor alongside the username it was actually
+    /// spawned as — the caller must thread this same value into the
+    /// `SessionType::User(...)` it builds around the result (see
+    /// `handoff_to_user`), not re-derive or hardcode its own placeholder.
+    /// Confirmed live: `handoff_to_user` used to pass a hardcoded
+    /// `"user".to_string()` into `SessionType::User(...)` regardless of
+    /// this method's own (correct) username resolution below — harmless
+    /// for `Backend::Kwin` (its `SpawnSession` call already takes the real
+    /// username as a direct parameter here, not through `SessionType`), but
+    /// silently spawned the gst-wayland-display backend's nested payload as
+    /// the literal account `"user"` instead of whoever actually logged in,
+    /// since `spawn_gst_payload_in_background` reads the username back out
+    /// of `RunningSession.kind` — a real, unrelated account, if one happens
+    /// to exist on the target system, or a `SpawnPayload` failure otherwise.
+    async fn spawn_user_compositor(&self, width: u32, height: u32) -> Result<(SpawnedCompositor, String), String> {
         // `handle_login_report` sets this once `redfog-login`'s credentials
         // have already passed the broker's real, password-checked
         // `Authenticate` — re-sending an empty password through that same
@@ -349,7 +365,7 @@ impl SessionManager {
         let user_app = selected.as_ref().map(|s| s.user_app.clone()).unwrap_or_else(|| self.config.user_app.clone());
 
         let Some(broker_socket_path) = &self.config.broker_socket_path else {
-            return session_backend::spawn_user_compositor_direct(backend, &username, &user_app, width, height);
+            return session_backend::spawn_user_compositor_direct(backend, &username, &user_app, width, height).map(|c| (c, username));
         };
 
         let session_id = self.next_broker_session_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string();
@@ -365,6 +381,7 @@ impl SessionManager {
             height,
         )
         .await
+        .map(|c| (c, username))
     }
 
     fn spawn_session(&self, kind: SessionType, width: u32, height: u32, compositor: SpawnedCompositor) -> Result<RunningSession, String> {
@@ -613,8 +630,8 @@ impl SessionManager {
         let _ = old_login.audio_pipeline.set_state(gstreamer::State::Null);
         old_login.compositor.terminate();
 
-        let compositor = self.spawn_user_compositor(width, height).await?;
-        let user_session = self.spawn_session(SessionType::User("user".to_string()), width, height, compositor)?;
+        let (compositor, username) = self.spawn_user_compositor(width, height).await?;
+        let user_session = self.spawn_session(SessionType::User(username), width, height, compositor)?;
         self.start_streaming(user_session);
         Ok(())
     }

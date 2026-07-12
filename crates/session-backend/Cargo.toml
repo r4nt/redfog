@@ -7,5 +7,11 @@ edition = "2021"
 redfog-core = { path = "../redfog-core" }
 gst-backend = { path = "../gst-backend" }
 redfog-broker-protocol = { path = "../redfog-broker-protocol" }
+redfog-login-protocol = { path = "../redfog-login-protocol" }
 gstreamer = "0.21"
+gstreamer-app = "0.21"
 tokio = { version = "1", features = ["net", "io-util"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tiny-skia = "0.11"

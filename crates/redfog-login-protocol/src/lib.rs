@@ -20,6 +20,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod render;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LoginRequest {
     /// `session` is either the `name` of one of the operator-configured

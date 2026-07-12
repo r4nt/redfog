@@ -463,11 +463,10 @@ async fn send_input_until_seen(stdout_lines: &Arc<Mutex<Vec<String>>>, stream: &
 
 /// Like `send_input_until_seen`, but requires `needle`'s occurrence count to
 /// exceed `min_count` rather than merely appearing — needed wherever the
-/// same text can legitimately appear more than once (e.g. across a
-/// `Backend::GstWaylandDisplay` Login->User handoff, both stages log
-/// "TESTUX[wayland-1]: ...", unlike Kwin's per-stage socket names) so a
-/// stale match from a previous stage/connection doesn't trivially satisfy
-/// the wait without actually proving the input reached the *current* one.
+/// same text can legitimately appear more than once (e.g. a reconnect to
+/// the same User-stage session logs the identical needle a second time) so
+/// a stale match from a previous connection doesn't trivially satisfy the
+/// wait without actually proving the input reached the *current* one.
 async fn send_input_until_new_seen(
     stdout_lines: &Arc<Mutex<Vec<String>>>,
     stream: &MoonlightStream,
@@ -584,7 +583,7 @@ async fn real_client_connects_reconnects_and_sends_input() {
         .await
         .expect("first stream must connect");
 
-    server.wait_for_stdout("TESTUX[redfog-login-0]: started", Duration::from_secs(10)).await;
+    server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(10)).await;
 
     // ---- Simulated client mouse movement + key press, verified by proof
     // it actually reached the Login-stage session, not just that the
@@ -597,7 +596,7 @@ async fn real_client_connects_reconnects_and_sends_input() {
         &server.stdout_lines,
         &stream,
         ClientInputEvent::MouseMoveAbsolute { x: 640, y: 360, reference_width: 1280, reference_height: 720 },
-        "TESTUX[redfog-login-0]: pointer_moved",
+        "TESTUX[login]: pointer_moved",
         Duration::from_secs(10),
     )
     .await;
@@ -611,7 +610,7 @@ async fn real_client_connects_reconnects_and_sends_input() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     send_key(&stream, VK_Q.wrapping_add(1) /* VK_R, an arbitrary non-exit key */, true).await;
-    server.wait_for_stdout("TESTUX[redfog-login-0]: key_pressed", Duration::from_secs(5)).await;
+    server.wait_for_stdout("TESTUX[login]: key_pressed", Duration::from_secs(5)).await;
 
     // ---- Confirm streaming works before touching the handoff, and start
     // tracking frame gaps from here through the handoff below. ----
@@ -782,21 +781,16 @@ impl GstTestServer {
         GstTestServer { _process: process, http_port, stdout_lines }
     }
 
-    fn count_stdout(&self, needle: &str) -> usize {
-        self.stdout_lines.lock().unwrap().iter().filter(|line| line.contains(needle)).count()
-    }
-
-    /// Waits for `needle`'s occurrence count to exceed `baseline` — needed
-    /// here since the same text can legitimately appear more than once
-    /// (`Backend::GstWaylandDisplay`'s Login and User stages both log
-    /// "TESTUX[wayland-1]: ..." — same fixed socket name for both, unlike
-    /// Kwin's per-stage "redfog-login-0"/"redfog-user-0" — so a plain "does
-    /// it appear" check would trivially pass on a stale match from the
-    /// *other* stage).
-    async fn wait_for_new_stdout(&self, needle: &str, baseline: usize, timeout: Duration) {
+    /// The Login stage's fixed "TESTUX[login]: ..." label (see this test's
+    /// own doc comment on `wait_for_stdout` below) never collides with the
+    /// User stage's own backend-specific label, so — unlike the Kwin
+    /// test's `real_client_connects_reconnects_and_sends_input`, which
+    /// genuinely does reconnect to the same session and needs count
+    /// baselines — a plain "does it appear" check is always enough here.
+    async fn wait_for_stdout(&self, needle: &str, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
-        while self.count_stdout(needle) <= baseline {
-            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for a new {needle:?} in redfog-server's output");
+        while !self.stdout_lines.lock().unwrap().iter().any(|line| line.contains(needle)) {
+            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {needle:?} in redfog-server's output");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -846,22 +840,20 @@ async fn gst_wayland_display_backend_smoke_test() {
         .await
         .expect("stream must connect");
 
-    // Both Login and User stages use waylanddisplaysrc's one fixed socket
-    // name ("wayland-1" — see spawn_gst_compositor), unlike Kwin's per-stage
-    // "redfog-login-0"/"redfog-user-0" — so redfog-test-ux logs the same
-    // "TESTUX[wayland-1]: ..." prefix regardless of stage, and every check
-    // below needs a count baseline to distinguish "already seen from the
-    // Login stage" from "a new one from the User stage after handoff".
-    let started_count = server.count_stdout("TESTUX[wayland-1]: started");
-    server.wait_for_new_stdout("TESTUX[wayland-1]: started", started_count, Duration::from_secs(15)).await;
+    // The Login stage is always headless now (see session_backend::
+    // spawn_login_compositor), regardless of backend — redfog-test-ux logs
+    // "TESTUX[login]: ..." for it unconditionally, distinct from the User
+    // stage's backend-specific label ("wayland-1" here, for
+    // Backend::GstWaylandDisplay), so unlike before, none of these checks
+    // need count-baseline tracking to disambiguate "which stage logged
+    // this" — each label only ever comes from one stage in this test.
+    server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(15)).await;
 
-    let pointer_moved_count = server.count_stdout("TESTUX[wayland-1]: pointer_moved");
-    send_input_until_new_seen(
+    send_input_until_seen(
         &server.stdout_lines,
         &stream,
         ClientInputEvent::MouseMoveAbsolute { x: 640, y: 360, reference_width: 1280, reference_height: 720 },
-        "TESTUX[wayland-1]: pointer_moved",
-        pointer_moved_count,
+        "TESTUX[login]: pointer_moved",
         Duration::from_secs(10),
     )
     .await;
@@ -870,24 +862,21 @@ async fn gst_wayland_display_backend_smoke_test() {
     assert!(login_frames > 0, "expected video frames from the Login-stage test UX (gst-wayland-display backend)");
 
     // ---- Trigger Login->User handoff (redfog-test-ux exits on 'Q'). ----
-    let started_count = server.count_stdout("TESTUX[wayland-1]: started");
     send_key(&stream, VK_Q, true).await;
     send_key(&stream, VK_Q, false).await;
     let (handoff_frames, max_gap) = poll_frames_tracking_gaps(&stream, async {
-        server.wait_for_new_stdout("TESTUX[wayland-1]: started", started_count, Duration::from_secs(15)).await;
+        server.wait_for_stdout("TESTUX[wayland-1]: started", Duration::from_secs(15)).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
     })
     .await;
     assert!(handoff_frames > 0, "expected video frames to keep flowing across the Login->User handoff (gst-wayland-display backend)");
     assert!(max_gap < Duration::from_secs(3), "video stalled for {max_gap:?} across the handoff (gst-wayland-display backend)");
 
-    let pointer_moved_count = server.count_stdout("TESTUX[wayland-1]: pointer_moved");
-    send_input_until_new_seen(
+    send_input_until_seen(
         &server.stdout_lines,
         &stream,
         ClientInputEvent::MouseMoveAbsolute { x: 640, y: 360, reference_width: 1280, reference_height: 720 },
         "TESTUX[wayland-1]: pointer_moved",
-        pointer_moved_count,
         Duration::from_secs(10),
     )
     .await;
