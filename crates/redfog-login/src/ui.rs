@@ -26,6 +26,29 @@ pub enum Focus {
     None,
 }
 
+/// A short, curated list, not every layout `xkeyboard-config` knows about —
+/// the dropdown popup has no scroll support, so the list has to stay short
+/// enough to fit on screen without one (see [`DROPDOWN_ROW_H`]). Codes are
+/// real XKB layout codes (`rules/evdev.lst`), passed straight through to
+/// `keymap::Keymap::new`.
+pub fn default_keyboard_layouts() -> Vec<(String, String)> {
+    [
+        ("us", "English (US)"),
+        ("gb", "English (UK)"),
+        ("de", "German"),
+        ("fr", "French"),
+        ("es", "Spanish"),
+        ("it", "Italian"),
+        ("pt", "Portuguese"),
+        ("ru", "Russian"),
+        ("se", "Swedish"),
+        ("jp", "Japanese"),
+    ]
+    .into_iter()
+    .map(|(code, name)| (code.to_string(), name.to_string()))
+    .collect()
+}
+
 #[derive(Clone)]
 pub struct LoginUiState {
     pub width: u32,
@@ -38,6 +61,10 @@ pub struct LoginUiState {
     pub sessions: Vec<String>,
     pub selected_session: usize,
     pub session_dropdown_open: bool,
+    /// `(xkb_code, display_name)` pairs — see [`default_keyboard_layouts`].
+    pub keyboard_layouts: Vec<(String, String)>,
+    pub selected_layout: usize,
+    pub keyboard_dropdown_open: bool,
     pub error_msg: Option<String>,
     pub cursor_pos: (f64, f64),
     /// Toggled roughly every 500ms by the caller to blink the text caret.
@@ -55,6 +82,9 @@ impl LoginUiState {
             sessions,
             selected_session: 0,
             session_dropdown_open: false,
+            keyboard_layouts: default_keyboard_layouts(),
+            selected_layout: 0,
+            keyboard_dropdown_open: false,
             error_msg: None,
             cursor_pos: (width as f64 / 2.0, height as f64 / 2.0),
             caret_blink_on: true,
@@ -75,6 +105,11 @@ pub struct Layout {
     /// while the dropdown is open; empty otherwise, so a click can never
     /// hit a row that isn't actually visible.
     pub session_options: Vec<Rect>,
+    /// Same shape as `session_box`/`session_options`, for the keyboard
+    /// layout picker — see `draw_dropdown_box`/`draw_dropdown_popup`,
+    /// which are generic over which dropdown they're drawing.
+    pub keyboard_box: Rect,
+    pub keyboard_options: Vec<Rect>,
     pub login_button: Rect,
 }
 
@@ -238,9 +273,13 @@ pub fn render(state: &LoginUiState) -> (Pixmap, Layout) {
     let mut pixmap = Pixmap::new(w.max(1), h.max(1)).expect("non-zero canvas size");
     fill_cached_background(&mut pixmap, w.max(1), h.max(1));
 
-    // Centered card.
+    // Centered card. Tall enough for every row below plus top/bottom
+    // padding — computed generously rather than trimmed tight, since a
+    // popup or the error line can each add to the visual footprint without
+    // changing the card's own fixed height (they float on top / push
+    // nothing).
     let card_w = (w as f32 * 0.34).clamp(360.0, 560.0);
-    let card_h = 430.0f32.min(h as f32 * 0.8);
+    let card_h = 620.0f32.min(h as f32 * 0.85);
     let card_x = (w as f32 - card_w) / 2.0;
     let card_y = (h as f32 - card_h) / 2.0;
     let card_rect = Rect::from_xywh(card_x, card_y, card_w, card_h).unwrap();
@@ -261,6 +300,17 @@ pub fn render(state: &LoginUiState) -> (Pixmap, Layout) {
     cy += 46.0;
 
     let field_h = 44.0;
+
+    // Keyboard layout first, deliberately before Username/Password — it's
+    // the one setting that changes how typing into those two fields
+    // itself behaves, so it needs to be chosen before, not after.
+    draw_text(&mut pixmap, "Keyboard", content_x as i32, cy as i32, TEXT_SECONDARY, false);
+    cy += 22.0;
+    let keyboard_box = Rect::from_xywh(content_x, cy, content_w, field_h).unwrap();
+    let keyboard_selected_name = &state.keyboard_layouts[state.selected_layout].1;
+    draw_dropdown_box(&mut pixmap, keyboard_box, keyboard_selected_name, state.keyboard_dropdown_open);
+    cy += field_h + 22.0;
+
     draw_text(&mut pixmap, "Username", content_x as i32, cy as i32, TEXT_SECONDARY, false);
     cy += 22.0;
     let username_field = Rect::from_xywh(content_x, cy, content_w, field_h).unwrap();
@@ -291,7 +341,16 @@ pub fn render(state: &LoginUiState) -> (Pixmap, Layout) {
     // Drawn last (after the button/error text) so it visually floats on
     // top of whatever it happens to overlap below it, matching how a real
     // dropdown popup behaves — its hit-test regions take priority over
-    // everything else for the same reason (see Layout::hit_test).
+    // everything else for the same reason (see Layout::hit_test). At most
+    // one of these is ever non-empty at a time in practice (the caller
+    // enforces opening one dropdown closes the other), but render() itself
+    // doesn't need to assume that — it just draws whichever are open.
+    let keyboard_options = if state.keyboard_dropdown_open {
+        let names: Vec<String> = state.keyboard_layouts.iter().map(|(_, name)| name.clone()).collect();
+        draw_dropdown_popup(&mut pixmap, keyboard_box, &names, state.selected_layout, state.cursor_pos)
+    } else {
+        Vec::new()
+    };
     let session_options = if state.session_dropdown_open {
         draw_dropdown_popup(&mut pixmap, session_box, &state.sessions, state.selected_session, state.cursor_pos)
     } else {
@@ -300,7 +359,7 @@ pub fn render(state: &LoginUiState) -> (Pixmap, Layout) {
 
     draw_cursor(&mut pixmap, state.cursor_pos);
 
-    (pixmap, Layout { username_field, password_field, session_box, session_options, login_button })
+    (pixmap, Layout { username_field, password_field, session_box, session_options, keyboard_box, keyboard_options, login_button })
 }
 
 fn draw_field(pixmap: &mut Pixmap, rect: Rect, value: &str, masked: bool, focused: bool, caret_blink_on: bool) {
@@ -453,14 +512,24 @@ impl Layout {
     /// click into a focus change / segment selection / button press.
     pub fn hit_test(&self, x: f64, y: f64) -> Hit {
         let (x, y) = (x as f32, y as f32);
-        // The popup (if open) is drawn on top of everything else, so it
-        // must win hit-testing too — a click that lands where the popup
+        // Popups (if open) are drawn on top of everything else, so they
+        // must win hit-testing too — a click that lands where a popup
         // visually covers the button/fields below it must hit the popup,
-        // not whatever's underneath.
+        // not whatever's underneath. At most one of these is ever open at
+        // once in practice (the caller enforces mutual exclusivity), so
+        // checking both here in either order is equally correct.
+        for (i, row) in self.keyboard_options.iter().enumerate() {
+            if rect_contains(row, x, y) {
+                return Hit::KeyboardOption(i);
+            }
+        }
         for (i, row) in self.session_options.iter().enumerate() {
             if rect_contains(row, x, y) {
                 return Hit::SessionOption(i);
             }
+        }
+        if rect_contains(&self.keyboard_box, x, y) {
+            return Hit::KeyboardToggle;
         }
         if rect_contains(&self.session_box, x, y) {
             return Hit::SessionToggle;
@@ -486,10 +555,14 @@ pub enum Hit {
     SessionToggle,
     /// Click on an open row — selects it and closes the popup.
     SessionOption(usize),
+    /// Same as `SessionToggle`/`SessionOption`, for the keyboard layout
+    /// picker.
+    KeyboardToggle,
+    KeyboardOption(usize),
     LoginButton,
-    /// Also what a click outside the popup means while it's open — the
-    /// caller should treat this as "close the dropdown without changing
-    /// the selection" in that case, matching how real dropdown menus
-    /// close on any click-away.
+    /// Also what a click outside an open popup means — the caller should
+    /// treat this as "close whichever dropdown is open, without changing
+    /// its selection," matching how real dropdown menus close on any
+    /// click-away.
     None,
 }

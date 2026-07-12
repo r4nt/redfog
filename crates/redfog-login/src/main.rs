@@ -21,11 +21,12 @@
 //! gone stale relative to the state it's judging (e.g. the dropdown having
 //! just opened but its row rects not registered yet).
 //!
-//! Text input assumes a US QWERTY layout (see `evdev_key_to_char`) — there's
-//! no XKB/compositor left to do real keymap translation for us anymore.
-//! Reasonable for a login form's username/password fields; would need
-//! real keymap support to go further than that.
+//! Text input goes through a real `libxkbcommon` keymap (see `keymap`
+//! module) — there's no compositor left to do this for us implicitly, so
+//! it's done explicitly, the same way KWin/Sway do it internally. Layout
+//! is selectable from the login screen's own dropdown, defaulting to US.
 
+mod keymap;
 mod ui;
 
 use std::io::{BufRead, BufReader, Write};
@@ -46,68 +47,9 @@ use ui::{Focus, Hit, Layout, LoginUiState};
 const USER_CONFIGURED: &str = "user-configured";
 
 const BTN_LEFT: u32 = 272;
-const KEY_LEFTSHIFT: u32 = 42;
-const KEY_RIGHTSHIFT: u32 = 54;
 const KEY_BACKSPACE: u32 = 14;
 const KEY_TAB: u32 = 15;
 const KEY_ENTER: u32 = 28;
-
-/// A minimal evdev-keycode -> ASCII mapping for US QWERTY — see the module
-/// doc comment for why this exists instead of real keymap translation.
-fn evdev_key_to_char(keycode: u32, shift: bool) -> Option<char> {
-    let (lower, upper) = match keycode {
-        2 => ('1', '!'),
-        3 => ('2', '@'),
-        4 => ('3', '#'),
-        5 => ('4', '$'),
-        6 => ('5', '%'),
-        7 => ('6', '^'),
-        8 => ('7', '&'),
-        9 => ('8', '*'),
-        10 => ('9', '('),
-        11 => ('0', ')'),
-        12 => ('-', '_'),
-        13 => ('=', '+'),
-        16 => ('q', 'Q'),
-        17 => ('w', 'W'),
-        18 => ('e', 'E'),
-        19 => ('r', 'R'),
-        20 => ('t', 'T'),
-        21 => ('y', 'Y'),
-        22 => ('u', 'U'),
-        23 => ('i', 'I'),
-        24 => ('o', 'O'),
-        25 => ('p', 'P'),
-        26 => ('[', '{'),
-        27 => (']', '}'),
-        30 => ('a', 'A'),
-        31 => ('s', 'S'),
-        32 => ('d', 'D'),
-        33 => ('f', 'F'),
-        34 => ('g', 'G'),
-        35 => ('h', 'H'),
-        36 => ('j', 'J'),
-        37 => ('k', 'K'),
-        38 => ('l', 'L'),
-        39 => (';', ':'),
-        40 => ('\'', '"'),
-        41 => ('`', '~'),
-        43 => ('\\', '|'),
-        44 => ('z', 'Z'),
-        45 => ('x', 'X'),
-        46 => ('c', 'C'),
-        47 => ('v', 'V'),
-        48 => ('b', 'B'),
-        49 => ('n', 'N'),
-        50 => ('m', 'M'),
-        51 => (',', '<'),
-        52 => ('.', '>'),
-        53 => ('/', '?'),
-        57 => (' ', ' '),
-        _ => return None,
-    };
-    Some(if shift { upper } else { lower })
-}
 
 /// Sends the entered credentials (and the chosen session name — either one
 /// of the loaded presets' `name`s, or [`USER_CONFIGURED`] — see
@@ -160,31 +102,41 @@ fn try_submit(state: &mut LoginUiState) {
 
 fn handle_click(state: &mut LoginUiState, layout: &Layout) {
     let hit = layout.hit_test(state.cursor_pos.0, state.cursor_pos.1);
-    if state.session_dropdown_open {
-        // The popup is on top of everything else while open — any click,
-        // hit or miss, is about the popup first. A click on one of its
-        // rows selects it; anything else (including its own toggle, or a
-        // click that lands on whatever's visually underneath it) just
-        // closes it, matching how real dropdown menus swallow their first
-        // outside click rather than also acting on what's beneath it.
+    if state.session_dropdown_open || state.keyboard_dropdown_open {
+        // Whichever popup is open is on top of everything else — any
+        // click, hit or miss, is about that popup first. A click on one of
+        // its own rows selects it; anything else (including its own
+        // toggle, or a click that lands on whatever's visually underneath
+        // it) just closes it, matching how real dropdown menus swallow
+        // their first outside click rather than also acting on what's
+        // beneath it. Both dropdowns' open flags are cleared unconditionally
+        // here (not just whichever was actually open) — simplest way to
+        // maintain "at most one open at a time" without extra bookkeeping,
+        // since clearing an already-false flag is a no-op.
         match hit {
             Hit::SessionOption(i) => state.selected_session = i,
+            Hit::KeyboardOption(i) => state.selected_layout = i,
             _ => {}
         }
         state.session_dropdown_open = false;
+        state.keyboard_dropdown_open = false;
         return;
     }
     match hit {
         Hit::Username => state.focus = Focus::Username,
         Hit::Password => state.focus = Focus::Password,
         Hit::SessionToggle => state.session_dropdown_open = true,
-        Hit::SessionOption(_) => {} // unreachable while closed — no rows to hit
+        Hit::KeyboardToggle => state.keyboard_dropdown_open = true,
+        Hit::SessionOption(_) | Hit::KeyboardOption(_) => {} // unreachable while closed — no rows to hit
         Hit::LoginButton => try_submit(state),
         Hit::None => {}
     }
 }
 
-fn handle_key(state: &mut LoginUiState, keycode: u32, shift: bool) {
+/// `text` is whatever `keymap::Keymap::key_event` resolved this press to —
+/// empty for keys that don't produce text on their own (modifiers, dead
+/// keys awaiting a second keystroke, ...).
+fn handle_key(state: &mut LoginUiState, keycode: u32, text: &str) {
     match keycode {
         KEY_BACKSPACE => match state.focus {
             Focus::Username => {
@@ -202,11 +154,16 @@ fn handle_key(state: &mut LoginUiState, keycode: u32, shift: bool) {
             };
         }
         KEY_ENTER => try_submit(state),
-        other => {
-            if let Some(c) = evdev_key_to_char(other, shift) {
+        _ => {
+            // Anything else: insert whatever the keymap resolved this
+            // press to, if it's printable text — guards against control
+            // characters defensively (e.g. Escape produces one on some
+            // layouts), even though Backspace/Tab/Enter's own control
+            // characters are already handled by the explicit arms above.
+            if !text.is_empty() && !text.chars().any(|c| c.is_control()) {
                 match state.focus {
-                    Focus::Username => state.username.push(c),
-                    Focus::Password => state.password.push(c),
+                    Focus::Username => state.username.push_str(text),
+                    Focus::Password => state.password.push_str(text),
                     Focus::None => {}
                 }
             }
@@ -219,11 +176,14 @@ fn handle_key(state: &mut LoginUiState, keycode: u32, shift: bool) {
 struct Shared {
     state: LoginUiState,
     layout: Layout,
-    shift_held: bool,
 }
 
-fn handle_input(shared: &mut Shared, event: LoginInputEvent) {
-    let Shared { state, layout, shift_held } = shared;
+/// `keymap` is owned entirely by the caller's thread (see `main`'s reader
+/// thread) — it's rebuilt there, outside this function, whenever
+/// `state.selected_layout` changes; this function only ever feeds it key
+/// events, never swaps it out.
+fn handle_input(shared: &mut Shared, keymap: &mut keymap::Keymap, event: LoginInputEvent) {
+    let Shared { state, layout } = shared;
     match event {
         LoginInputEvent::MouseMoveAbsolute { x, y } => {
             state.cursor_pos = (x.clamp(0.0, state.width as f64 - 1.0), y.clamp(0.0, state.height as f64 - 1.0));
@@ -239,10 +199,12 @@ fn handle_input(shared: &mut Shared, event: LoginInputEvent) {
         }
         LoginInputEvent::MouseAxis { .. } => {} // no scrollable content on this screen
         LoginInputEvent::KeyboardKey { keycode, pressed } => {
-            if keycode == KEY_LEFTSHIFT || keycode == KEY_RIGHTSHIFT {
-                *shift_held = pressed;
-            } else if pressed {
-                handle_key(state, keycode, *shift_held);
+            // Always fed through, even for releases and non-text keys
+            // (Shift, etc.) — XKB's internal modifier tracking silently
+            // desyncs otherwise (see `Keymap::key_event`'s doc comment).
+            let text = keymap.key_event(keycode, pressed);
+            if pressed {
+                handle_key(state, keycode, &text);
             }
         }
     }
@@ -269,20 +231,33 @@ fn main() {
         UnixStream::connect(&frame_socket_path).unwrap_or_else(|e| panic!("failed to connect to login frame socket {frame_socket_path}: {e}"));
 
     let state = LoginUiState::new(width, height, session_names);
+    let initial_layout_code = state.keyboard_layouts[state.selected_layout].0.clone();
     let (_pixmap, layout) = ui::render(&state);
-    let shared = Arc::new(Mutex::new(Shared { state, layout, shift_held: false }));
+    let shared = Arc::new(Mutex::new(Shared { state, layout }));
 
     // Reader thread: does nothing but block-read input messages and apply
     // them — never blocked by, or blocking, frame writes (see the module
-    // doc comment).
+    // doc comment). Owns the `Keymap` outright (never shared across
+    // threads, so no locking needed for it) and rebuilds it whenever the
+    // login screen's own keyboard dropdown picks a different layout.
     let reader_stream = stream.try_clone().expect("failed to clone login frame stream for the reader thread");
     {
         let shared = shared.clone();
         std::thread::spawn(move || {
             let mut reader_stream = reader_stream;
+            let mut keymap = keymap::Keymap::new(&initial_layout_code);
+            let mut current_layout_code = initial_layout_code;
             loop {
                 match render::read_message(&mut reader_stream) {
-                    Ok(Some(Message::Input(event))) => handle_input(&mut shared.lock().unwrap(), event),
+                    Ok(Some(Message::Input(event))) => {
+                        let mut shared = shared.lock().unwrap();
+                        handle_input(&mut shared, &mut keymap, event);
+                        let new_layout_code = &shared.state.keyboard_layouts[shared.state.selected_layout].0;
+                        if *new_layout_code != current_layout_code {
+                            current_layout_code = new_layout_code.clone();
+                            keymap = keymap::Keymap::new(&current_layout_code);
+                        }
+                    }
                     Ok(Some(Message::Frame { .. })) => {} // wrong direction on this stream, ignore
                     Ok(None) => std::process::exit(0),    // peer closed cleanly
                     Err(e) => {

@@ -25,4 +25,13 @@ fn main() {
     let open_path = base_path.replace(".png", "-open.png");
     pixmap.save_png(&open_path).expect("failed to save preview PNG");
     println!("wrote {open_path}");
+    state.session_dropdown_open = false;
+
+    state.keyboard_dropdown_open = true;
+    state.selected_layout = 2; // German
+    state.cursor_pos = (958.0, 620.0); // hovering a row
+    let (pixmap, _layout) = ui::render(&state);
+    let kbd_path = base_path.replace(".png", "-keyboard-open.png");
+    pixmap.save_png(&kbd_path).expect("failed to save preview PNG");
+    println!("wrote {kbd_path}");
 }
