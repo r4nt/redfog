@@ -74,6 +74,32 @@ fi
 # what they're doing and wants to skip the build check). ----
 : "${SUDO_USER:?must be run via sudo, not as a raw root login}"
 
+# Move into our own systemd scope before starting anything, isolated from
+# whatever cgroup this shell happens to have inherited (typically your
+# desktop session's own — e.g. chrome-remote-desktop@<user>.service, if
+# you're running this from a terminal inside a CRD-connected desktop, the
+# common case this script was written for). Confirmed live: redfog-server
+# leaked memory until the kernel OOM-killed it, and because it was still
+# sitting inside that same cgroup, the kill took the whole CRD session down
+# with it, not just redfog-server — see project memory for the incident.
+# `systemd-run --scope` always talks to PID1's manager to create a brand
+# new, top-level-slice-scoped unit regardless of the caller's own cgroup,
+# so this genuinely decouples the two rather than just hoping `setsid`'s
+# new session/process-group also implied a new cgroup (it doesn't).
+# `MemoryMax` is a real backstop, not just cosmetic isolation: a future leak
+# now gets OOM-killed within this scope specifically, long before it could
+# threaten the rest of a 31G machine that also runs your desktop session.
+if [ -z "${REDFOG_LIVE_SCOPED:-}" ]; then
+    echo "moving into a dedicated systemd scope (redfog-live.slice), isolated from this shell's own cgroup..."
+    exec systemd-run --scope --unit="redfog-live-$$" --slice=redfog-live.slice --collect \
+        --property="MemoryMax=10G" \
+        --setenv="REDFOG_LIVE_SCOPED=1" \
+        --setenv="SUDO_USER=$SUDO_USER" \
+        --setenv="PATH=$PATH" \
+        --setenv="REDFOG_BROKER_PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN-1}" \
+        -- "$SELF" "$@"
+fi
+
 if [ ! -e "$PLUGIN_DIR/libgstwaylanddisplaysrc.so" ]; then
     echo "warning: gst-wayland-display plugin not found at $PLUGIN_DIR — the Sway session option will fail if picked." >&2
     echo "         (this shouldn't happen via the normal 'bash scripts/sudo-live-session.sh' invocation; run that instead of sudo directly.)" >&2
@@ -82,6 +108,19 @@ fi
 BROKER_LOG="/tmp/redfog-live-broker.log"
 SERVER_LOG="/tmp/redfog-live-server.log"
 REDFOG_BROKER_PAM_SPAWN="${REDFOG_BROKER_PAM_SPAWN-1}"
+
+# TEMPORARY debugging aids for the "resume works but video updates are
+# severely throttled" investigation — see the doc comments at their
+# corresponding call sites (redfog-broker/src/session.rs's spawn_via_pam,
+# redfog-server/src/main.rs) for what these actually do. Override to ""
+# (empty) to disable either one; remove this whole block once that
+# investigation concludes.
+# kwin_screencast/kwin_platform_virtual found via `strings` on the
+# installed screencast.so/libkwin.so — this repo has no KWin source.
+REDFOG_DEBUG_KWIN_LOGGING_RULES="${REDFOG_DEBUG_KWIN_LOGGING_RULES-kwin_screencast.debug=true;kwin_platform_virtual.debug=true}"
+# GStreamer debug level 6 ("LOG") on just the pipewiresrc category — verbose
+# enough to see buffer/negotiation timing without TRACE-level memory dumps.
+REDFOG_DEBUG_GST_DEBUG="${REDFOG_DEBUG_GST_DEBUG-pipewiresrc:6}"
 
 cleanup() {
     echo "stopping..."
@@ -104,6 +143,7 @@ rm -f /tmp/redfog-live-broker.sock
 
 echo "starting redfog-broker (PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN:-<unset, systemd-unit path>}, real PAM auth)..."
 REDFOG_BROKER_PAM_SPAWN="$REDFOG_BROKER_PAM_SPAWN" \
+REDFOG_DEBUG_KWIN_LOGGING_RULES="$REDFOG_DEBUG_KWIN_LOGGING_RULES" \
 RUST_LOG=redfog_broker=debug \
 setsid "$REPO_DIR/target/release/redfog-broker" > "$BROKER_LOG" 2>&1 &
 BROKER_PID=$!
@@ -122,6 +162,7 @@ REDFOG_BROKER_SOCKET=/tmp/redfog-runtime/broker.sock \
 REDFOG_LOGIN_APP="$REPO_DIR/target/release/redfog-login" \
 REDFOG_USER_APP="plasmashell --no-respawn" \
 REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR="$PLUGIN_DIR" \
+REDFOG_DEBUG_GST_DEBUG="$REDFOG_DEBUG_GST_DEBUG" \
 RUST_LOG=redfog_moonlight=debug,redfog_server=debug,gst_backend=debug \
 setsid "$REPO_DIR/target/release/redfog-server" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!

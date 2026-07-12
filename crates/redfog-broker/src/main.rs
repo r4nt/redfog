@@ -144,6 +144,12 @@ async fn handle_connection(
                 tracing::info!("reading session.toml for user {username}");
                 BrokerResponse::ReadUserSessionConfig(sessions.read_user_session_config(&username).await)
             }
+            // No tracing::info! here, unlike every other request above —
+            // this one is polled periodically for as long as a session is
+            // streaming (see SessionManager::watch_user_session_exit), so
+            // logging each call would flood the log with one line every
+            // couple of seconds per active session for no benefit.
+            BrokerRequest::IsSessionAlive { session_id } => BrokerResponse::IsSessionAlive(sessions.is_session_alive(&session_id).await),
         };
 
         write_response(&mut reader, &response).await?;

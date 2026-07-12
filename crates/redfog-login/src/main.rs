@@ -51,6 +51,28 @@ const KEY_BACKSPACE: u32 = 14;
 const KEY_TAB: u32 = 15;
 const KEY_ENTER: u32 = 28;
 
+/// Sends one request to `redfog-server` over `REDFOG_LOGIN_SOCKET` and
+/// returns its response — shared connection/framing logic for
+/// `authenticate`/`check_username`/`try_logout`. `Err` here means a
+/// transport-level failure (couldn't connect, couldn't read/parse a
+/// response) — a *rejected* request (bad password, no such session, ...) is
+/// a successful round trip whose `LoginResponse` payload happens to be an
+/// `Err`, decided by each caller's own match on the specific variant it
+/// expects back.
+fn send_login_request(socket_path: &str, request: &LoginRequest) -> Result<LoginResponse, String> {
+    let stream = UnixStream::connect(socket_path).map_err(|e| format!("failed to reach session server: {e}"))?;
+    let mut writer = stream.try_clone().map_err(|e| format!("failed to reach session server: {e}"))?;
+    let mut line = serde_json::to_string(request).expect("protocol types always serialize");
+    line.push('\n');
+    writer.write_all(line.as_bytes()).map_err(|e| format!("failed to reach session server: {e}"))?;
+
+    let mut response_line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut response_line)
+        .map_err(|e| format!("failed to read response from session server: {e}"))?;
+    serde_json::from_str(response_line.trim_end()).map_err(|e| format!("invalid response from session server: {e}"))
+}
+
 /// Sends the entered credentials (and the chosen session name — either one
 /// of the loaded presets' `name`s, or [`USER_CONFIGURED`] — see
 /// `SessionManager::handle_login_report`) to `redfog-server` over
@@ -60,6 +82,12 @@ const KEY_ENTER: u32 = 28;
 /// broker configured), falls back to accepting any non-empty username, same
 /// as this app's original no-op placeholder behavior — the session choice
 /// is simply never reported in that case.
+///
+/// Deliberately doesn't take a "resume vs. start fresh" flag: which one
+/// happens is decided server-side, from whether `username` already has a
+/// background session at the moment this call lands — never from this
+/// process's own (possibly stale) `LoginUiState::username_running`, which
+/// exists purely to label the button, not to drive real behavior.
 fn authenticate(username: &str, password: &str, session: &str) -> Result<(), String> {
     let Ok(socket_path) = std::env::var("REDFOG_LOGIN_SOCKET") else {
         if username.trim().is_empty() {
@@ -67,21 +95,37 @@ fn authenticate(username: &str, password: &str, session: &str) -> Result<(), Str
         }
         return Ok(());
     };
-    let stream = UnixStream::connect(&socket_path).map_err(|e| format!("failed to reach session server: {e}"))?;
-    let mut writer = stream.try_clone().map_err(|e| format!("failed to reach session server: {e}"))?;
     let request = LoginRequest::Authenticate { username: username.to_string(), password: password.to_string(), session: session.to_string() };
-    let mut line = serde_json::to_string(&request).expect("protocol types always serialize");
-    line.push('\n');
-    writer.write_all(line.as_bytes()).map_err(|e| format!("failed to reach session server: {e}"))?;
-
-    let mut response_line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response_line)
-        .map_err(|e| format!("failed to read response from session server: {e}"))?;
-    let response: LoginResponse =
-        serde_json::from_str(response_line.trim_end()).map_err(|e| format!("invalid response from session server: {e}"))?;
-    match response {
+    match send_login_request(&socket_path, &request)? {
         LoginResponse::Authenticate(result) => result,
+        other => Err(format!("unexpected response to Authenticate: {other:?}")),
+    }
+}
+
+/// Whether `username` already has a running session — see
+/// `LoginRequest::CheckUsername`'s doc comment for why this needs no
+/// password. `None` (rather than defaulting to "not running") whenever the
+/// question genuinely can't be answered — no session server configured, an
+/// empty username, or a transport failure — so the caller shows "Log In"
+/// (the safe default) rather than confidently showing the wrong label.
+/// Errors are logged, not surfaced to the user: failing to answer this
+/// purely cosmetic question shouldn't block them from just trying to log
+/// in anyway.
+fn check_username(username: &str) -> Option<bool> {
+    let socket_path = std::env::var("REDFOG_LOGIN_SOCKET").ok()?;
+    if username.trim().is_empty() {
+        return None;
+    }
+    match send_login_request(&socket_path, &LoginRequest::CheckUsername { username: username.to_string() }) {
+        Ok(LoginResponse::CheckUsername { running }) => Some(running),
+        Ok(other) => {
+            eprintln!("redfog-login: unexpected response to CheckUsername: {other:?}");
+            None
+        }
+        Err(e) => {
+            eprintln!("redfog-login: failed to check username: {e}");
+            None
+        }
     }
 }
 
@@ -98,6 +142,43 @@ fn try_submit(state: &mut LoginUiState) {
             state.error_msg = Some(e);
         }
     }
+}
+
+/// Unlike `try_submit`, never exits the process on success — logging
+/// another session out doesn't mean *this* login screen's own job here is
+/// done; it stays up, ready for an actual login attempt.
+fn try_logout(state: &mut LoginUiState) {
+    let Ok(socket_path) = std::env::var("REDFOG_LOGIN_SOCKET") else {
+        state.error_msg = Some("Log Out requires a session server (no REDFOG_LOGIN_SOCKET configured)".to_string());
+        return;
+    };
+    let request = LoginRequest::LogOut { username: state.username.clone(), password: state.password.clone() };
+    let result = match send_login_request(&socket_path, &request) {
+        Ok(LoginResponse::LogOut(result)) => result,
+        Ok(other) => Err(format!("unexpected response to LogOut: {other:?}")),
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok(()) => {
+            state.password.clear();
+            state.error_msg = None;
+            // The button/control refresh themselves immediately — no
+            // separate "Logged Out" confirmation message needed; the
+            // Resume/Log Out UI simply disappearing back to a plain "Log
+            // In" button already communicates it worked.
+            state.username_running = Some(false);
+        }
+        Err(e) => state.error_msg = Some(e),
+    }
+}
+
+/// Re-checks `LoginUiState::username_running` for whatever's currently
+/// typed — called whenever focus leaves the username field (see
+/// `handle_click`/`handle_key`'s `KEY_TAB` arm), so the primary button's
+/// label is correct by the time a user's about to click it, matching how
+/// they'd naturally type username -> Tab/click -> password -> submit.
+fn maybe_check_username(state: &mut LoginUiState) {
+    state.username_running = if state.username.trim().is_empty() { None } else { check_username(&state.username) };
 }
 
 fn handle_click(state: &mut LoginUiState, layout: &Layout) {
@@ -122,6 +203,7 @@ fn handle_click(state: &mut LoginUiState, layout: &Layout) {
         state.keyboard_dropdown_open = false;
         return;
     }
+    let was_username_focused = state.focus == Focus::Username;
     match hit {
         Hit::Username => state.focus = Focus::Username,
         Hit::Password => state.focus = Focus::Password,
@@ -129,7 +211,11 @@ fn handle_click(state: &mut LoginUiState, layout: &Layout) {
         Hit::KeyboardToggle => state.keyboard_dropdown_open = true,
         Hit::SessionOption(_) | Hit::KeyboardOption(_) => {} // unreachable while closed — no rows to hit
         Hit::LoginButton => try_submit(state),
+        Hit::LogoutButton => try_logout(state),
         Hit::None => {}
+    }
+    if was_username_focused && state.focus != Focus::Username {
+        maybe_check_username(state);
     }
 }
 
@@ -141,6 +227,7 @@ fn handle_key(state: &mut LoginUiState, keycode: u32, text: &str) {
         KEY_BACKSPACE => match state.focus {
             Focus::Username => {
                 state.username.pop();
+                state.username_running = None; // stale relative to the new (shorter) text
             }
             Focus::Password => {
                 state.password.pop();
@@ -148,10 +235,14 @@ fn handle_key(state: &mut LoginUiState, keycode: u32, text: &str) {
             Focus::None => {}
         },
         KEY_TAB => {
+            let was_username_focused = state.focus == Focus::Username;
             state.focus = match state.focus {
                 Focus::Username => Focus::Password,
                 Focus::Password | Focus::None => Focus::Username,
             };
+            if was_username_focused {
+                maybe_check_username(state);
+            }
         }
         KEY_ENTER => try_submit(state),
         _ => {
@@ -162,7 +253,10 @@ fn handle_key(state: &mut LoginUiState, keycode: u32, text: &str) {
             // characters are already handled by the explicit arms above.
             if !text.is_empty() && !text.chars().any(|c| c.is_control()) {
                 match state.focus {
-                    Focus::Username => state.username.push_str(text),
+                    Focus::Username => {
+                        state.username.push_str(text);
+                        state.username_running = None; // stale relative to the new text
+                    }
                     Focus::Password => state.password.push_str(text),
                     Focus::None => {}
                 }

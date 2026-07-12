@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
@@ -18,7 +19,7 @@ macro_rules! eprintln {
 
 use wayland_client::{
     backend::ObjectId,
-    protocol::wl_registry,
+    protocol::{wl_output, wl_registry},
     Connection, Dispatch, Proxy, QueueHandle,
 };
 use wayland_protocols_plasma::screencast::v1::client::{
@@ -92,7 +93,34 @@ use kde_protocols::{
 struct State {
     // Screencast
     screencast:      Option<ZkdeScreencastUnstableV1>,
-    _stream:         Option<ZkdeScreencastStreamUnstableV1>,
+    /// Whichever stream object (bootstrap, from `create_stream`, or a later
+    /// one from `request_new_stream`) is the one currently expected to be
+    /// receiving frames. Kept purely for bookkeeping — deliberately never
+    /// closed.
+    ///
+    /// Two separate close strategies were tried live and both failed
+    /// worse than leaking:
+    /// 1. Closing the superseded stream immediately raced with the new
+    ///    stream's own PipeWire node coming up (`pipewiresrc` failed with
+    ///    "target not found").
+    /// 2. Deferring the close by 2s (letting the new stream establish
+    ///    first) avoided that race, but reading KWin's own source
+    ///    (`ScreencastManager::streamVirtualOutput`, `screencastmanager.cpp`)
+    ///    and distinguishing the bootstrap stream (`stream_virtual_output`,
+    ///    wired to `removeVirtualOutput` on close) from later ones
+    ///    (`stream_output`, no such wiring) still wasn't enough: closing a
+    ///    `stream_output`-derived stream caused a several-second stall and
+    ///    then killed the whole Wayland connection outright a cycle later
+    ///    (confirmed live: the capture session's background thread simply
+    ///    disappeared, meaning the connection died from a read error, not
+    ///    a panic).
+    ///
+    /// Every past-generation stream competing for frame delivery does
+    /// cause real, escalating throttling as more resumes pile up, but
+    /// that's strictly better than a dead connection — so this is the
+    /// least-bad option until there's a way to release a stream without
+    /// triggering either failure mode.
+    current_stream:  Option<ZkdeScreencastStreamUnstableV1>,
     node_id:         Option<u32>,
     stream_done:     bool,
     our_output_name: String,
@@ -107,13 +135,27 @@ struct State {
     device_done:       bool,
     config_done:       bool,
     has_configured_outputs: bool,
+    // Core `wl_output` counterpart of `our_device` (a *different* protocol
+    // object representing the same output) — needed for `stream_output`,
+    // which takes a `wl_output`, not a `kde_output_device_v2`. Tracked
+    // separately since `wl_output` globals are otherwise never bound at
+    // all (see the registry `Dispatch` impl).
+    _all_wl_outputs: Vec<wl_output::WlOutput>,
+    our_wl_output:   Option<wl_output::WlOutput>,
+    /// Set while a `request_new_stream` call is waiting on a *specific*
+    /// stream object's `Created`/`Failed` event, so the shared
+    /// `ZkdeScreencastStreamUnstableV1` `Dispatch` impl can route that
+    /// event here instead of into `node_id`/`stream_done` (which are
+    /// reserved for the original bootstrap stream from `create_stream`).
+    pending_stream_request: Option<ObjectId>,
+    pending_stream_result:  Option<Result<u32, String>>,
 }
 
 impl State {
     fn new(name: &str) -> Self {
         Self {
             screencast: None,
-            _stream: None,
+            current_stream: None,
             node_id: None,
             stream_done: false,
             our_output_name: name.into(),
@@ -126,6 +168,10 @@ impl State {
             device_done: false,
             config_done: false,
             has_configured_outputs: false,
+            _all_wl_outputs: Vec::new(),
+            our_wl_output: None,
+            pending_stream_request: None,
+            pending_stream_result: None,
         }
     }
 }
@@ -151,7 +197,27 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 eprintln!("capture: binding kde_output_device_registry_v2 v{}", version.min(21));
                 state._device_registry = Some(registry.bind(name, version.min(21), qh, ()));
             }
+            // Bound (unlike before) so `request_new_stream` has a `wl_output`
+            // to pass to `stream_output` — needs v4 for the `name` event,
+            // which is how we identify which of these is ours (same
+            // matching convention as `kde_output_device_v2::Event::Name`).
+            "wl_output" => {
+                state._all_wl_outputs.push(registry.bind(name, version.min(4), qh, ()));
+            }
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for State {
+    fn event(state: &mut Self, proxy: &wl_output::WlOutput, event: wl_output::Event,
+             _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let wl_output::Event::Name { name } = event {
+            eprintln!("capture: wl_output Name={name}");
+            if name == state.our_output_name || name.contains(&*state.our_output_name) {
+                eprintln!("capture: matched our wl_output");
+                state.our_wl_output = Some(proxy.clone());
+            }
         }
     }
 }
@@ -162,18 +228,34 @@ impl Dispatch<ZkdeScreencastUnstableV1, ()> for State {
 }
 
 impl Dispatch<ZkdeScreencastStreamUnstableV1, ()> for State {
-    fn event(state: &mut Self, _: &ZkdeScreencastStreamUnstableV1,
+    fn event(state: &mut Self, proxy: &ZkdeScreencastStreamUnstableV1,
              event: zkde_screencast_stream_unstable_v1::Event,
              _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // A `request_new_stream` call (see below) creates additional stream
+        // objects on this *same* connection, alongside the original
+        // bootstrap one from `create_stream` — route each event to whichever
+        // one is actually waiting on it, by proxy identity, rather than
+        // always overwriting the bootstrap fields.
+        let is_pending_request = state.pending_stream_request.as_ref() == Some(&proxy.id());
         match event {
             zkde_screencast_stream_unstable_v1::Event::Created { node } => {
                 eprintln!("capture: stream created, node={node}");
-                state.node_id = Some(node);
-                state.stream_done = true;
+                if is_pending_request {
+                    state.pending_stream_result = Some(Ok(node));
+                    state.pending_stream_request = None;
+                } else {
+                    state.node_id = Some(node);
+                    state.stream_done = true;
+                }
             }
             zkde_screencast_stream_unstable_v1::Event::Failed { error } => {
                 eprintln!("capture: stream failed: {error}");
-                state.stream_done = true;
+                if is_pending_request {
+                    state.pending_stream_result = Some(Err(error));
+                    state.pending_stream_request = None;
+                } else {
+                    state.stream_done = true;
+                }
             }
             _ => {}
         }
@@ -403,7 +485,7 @@ fn create_stream(
     h: i32,
     scale: f64,
 ) -> Option<u32> {
-    state._stream = None;
+    state.current_stream = None;
     conn.flush().ok();
     queue.roundtrip(state).ok()?;
 
@@ -417,7 +499,7 @@ fn create_stream(
             qh, (),
         )
     };
-    state._stream = Some(stream);
+    state.current_stream = Some(stream);
     state.node_id = None;
     state.stream_done = false;
     state.our_device = None;
@@ -438,14 +520,75 @@ fn create_stream(
 
     set_output_mode(state, queue, qh, conn, w, h);
 
+    // Needed for `request_new_stream`'s later `stream_output` calls (takes
+    // a `wl_output`, not a `kde_output_device_v2`) — our virtual output's
+    // corresponding `wl_output` global appears only *after* this bootstrap
+    // stream creation, so it can't be discovered any earlier than this.
+    // Bounded: if this never resolves (e.g. an old KWin without a `name`
+    // event on `wl_output`), `request_new_stream` will simply always fail
+    // clearly, rather than this call hanging here forever.
+    for _ in 0..40 {
+        if state.our_wl_output.is_some() {
+            break;
+        }
+        pump(state, queue, conn);
+    }
+    if state.our_wl_output.is_none() {
+        eprintln!("capture: warning: our wl_output was never identified — request_new_stream will be unavailable");
+    }
+
     state.node_id
+}
+
+/// Requests a *fresh* PipeWire stream/node from our already-existing
+/// virtual output, via `stream_output` — unlike `stream_virtual_output`
+/// (which the protocol's own doc comment describes as requesting a feed
+/// from "a **new** virtual output"), this attaches to the `wl_output` we
+/// already have and doesn't create, destroy, or reconfigure anything about
+/// the output itself. This is the actual fix for the video-resume bug that
+/// doesn't also destabilize other Wayland clients: recreating the whole
+/// virtual output on every resume (the previous approach) was confirmed
+/// live to be a real output-hotplug event fired at every client, not just
+/// our own consumer — `plasmashell`'s own desktop/panel surfaces
+/// intermittently just didn't come back. Getting a fresh stream this way
+/// touches nothing else.
+fn request_new_stream(
+    state: &mut State,
+    queue: &mut wayland_client::EventQueue<State>,
+    conn: &Connection,
+    qh: &QueueHandle<State>,
+) -> Result<u32, String> {
+    let screencast = state.screencast.clone().ok_or("no screencast global bound")?;
+    let wl_output = state.our_wl_output.clone().ok_or("our wl_output was never identified")?;
+
+    let stream = screencast.stream_output(&wl_output, zkde_screencast_unstable_v1::Pointer::Embedded as u32, qh, ());
+    state.pending_stream_request = Some(stream.id());
+    state.pending_stream_result = None;
+    conn.flush().ok();
+
+    while state.pending_stream_result.is_none() {
+        pump(state, queue, conn);
+    }
+    let result = state.pending_stream_result.take().unwrap();
+
+    if result.is_ok() {
+        // This stream is now the one actually in use. The superseded one
+        // (`current_stream`'s old value) is deliberately dropped without
+        // calling `.close()` on it — see `current_stream`'s doc comment.
+        state.current_stream = Some(stream);
+    }
+
+    result
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
 
 pub struct CaptureSession {
-    node_id:   u32,
-    resize_tx: mpsc::Sender<(i32, i32, mpsc::Sender<()>)>,
+    node_id:       u32,
+    resize_tx:     mpsc::Sender<(i32, i32, mpsc::Sender<()>)>,
+    new_stream_tx: mpsc::Sender<mpsc::Sender<Result<u32, String>>>,
+    should_stop:   Arc<AtomicBool>,
+    thread:        Option<std::thread::JoinHandle<()>>,
 }
 
 impl CaptureSession {
@@ -471,11 +614,23 @@ impl CaptureSession {
             .ok_or("virtual output stream failed")?;
 
         let (resize_tx, resize_rx) = mpsc::channel::<(i32, i32, mpsc::Sender<()>)>();
+        let (new_stream_tx, new_stream_rx) = mpsc::channel::<mpsc::Sender<Result<u32, String>>>();
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let should_stop_thread = should_stop.clone();
 
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             use std::os::fd::{AsFd, AsRawFd};
             let fd = conn.as_fd().as_raw_fd();
             loop {
+                if should_stop_thread.load(Ordering::Relaxed) {
+                    // `conn` drops here, closing the Wayland connection —
+                    // the compositor sees this as a normal client
+                    // disconnect and cleans up every object (screencast
+                    // stream, output device claim, etc.) this session ever
+                    // registered, without needing an explicit `.destroy()`
+                    // per object.
+                    break;
+                }
                 if let Some(guard) = conn.prepare_read() {
                     let mut fds = [libc::pollfd {
                         fd,
@@ -499,14 +654,44 @@ impl CaptureSession {
                     set_output_mode(&mut state, &mut queue, &qh, &conn, w, h);
                     let _ = reply_tx.send(());
                 }
+
+                while let Ok(reply_tx) = new_stream_rx.try_recv() {
+                    eprintln!("capture: requesting a fresh stream");
+                    let result = request_new_stream(&mut state, &mut queue, &conn, &qh);
+                    let _ = reply_tx.send(result);
+                }
             }
         });
 
-        Ok(CaptureSession { node_id, resize_tx })
+        Ok(CaptureSession { node_id, resize_tx, new_stream_tx, should_stop, thread: Some(thread) })
     }
 
     pub fn node_id(&self) -> u32 {
         self.node_id
+    }
+
+    /// Cleanly tears down this capture session and blocks until its
+    /// Wayland connection has actually closed. Consumes `self` — there's
+    /// nothing left to call afterward. Not used by the video-resume path
+    /// anymore (see `new_stream`'s doc comment for why); kept for actual
+    /// end-of-session teardown.
+    pub fn disconnect(self) {
+        self.should_stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread {
+            let _ = thread.join();
+        }
+    }
+
+    /// Requests a fresh PipeWire stream/node from this *same*, still-open
+    /// capture session, without touching the underlying virtual output at
+    /// all — the actual fix for the video-resume bug (see
+    /// `request_new_stream`'s doc comment for the full mechanism and why
+    /// tearing down and recreating the whole capture session, tried first,
+    /// destabilized other Wayland clients like `plasmashell`).
+    pub fn new_stream(&self) -> Result<u32, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.new_stream_tx.send(reply_tx).map_err(|_| "capture session's background thread is gone".to_string())?;
+        reply_rx.recv().map_err(|_| "capture session's background thread dropped the reply channel".to_string())?
     }
 
     /// Request the virtual output to change resolution.

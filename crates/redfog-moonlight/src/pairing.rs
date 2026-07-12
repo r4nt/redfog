@@ -201,6 +201,7 @@ impl PairingServer {
             "/cancel" => self.cancel(&params).await,
             "/pin" => self.pin_page(&params),
             "/submit-pin" => self.submit_pin_query(&params, req.into_body()).await,
+            "/pending-pairs" => self.pending_pairs(),
             _ => not_found(),
         }
     }
@@ -491,6 +492,18 @@ impl PairingServer {
                 .unwrap(),
             Err(e) => bad_request(e),
         }
+    }
+
+    /// Not part of the Moonlight protocol — a small tooling hook so
+    /// `redfog-pair` (and anything else that wants to relay a PIN) can find
+    /// out which `uniqueid` is actually waiting, one per line, instead of
+    /// needing to already know it (e.g. from grepping server logs).
+    fn pending_pairs(&self) -> Response<Full<Bytes>> {
+        let ids = self.clients.pending_unique_ids().join("\n");
+        Response::builder()
+            .header("Content-Type", "text/plain")
+            .body(Full::new(Bytes::from(ids)))
+            .unwrap()
     }
 }
 

@@ -52,6 +52,16 @@ pub enum BrokerRequest {
     /// this — it's gated on proof of identity, not used to decide what to
     /// show an unauthenticated party.
     ReadUserSessionConfig { username: String },
+    /// Whether the session spawned under `session_id` (via `SpawnSession` or
+    /// `SpawnPayload`) is still running — the only way a caller can tell a
+    /// broker-spawned session died (e.g. the user logged out): the actual
+    /// child process (or systemd unit) lives in the broker's own process
+    /// tree, not the caller's, so nothing the caller holds locally can
+    /// observe this. A `session_id` the broker has no record of at all
+    /// (already reaped, or never existed) reports `false` rather than an
+    /// error — from the caller's perspective those mean the same thing:
+    /// nothing left to reconnect to.
+    IsSessionAlive { session_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +75,7 @@ pub enum BrokerResponse {
     /// should surface a clear "no ~/.config/redfog/session.toml found"
     /// error at that point instead).
     ReadUserSessionConfig(Result<Option<UserSessionConfig>, String>),
+    IsSessionAlive(bool),
 }
 
 /// The User stage's backend/payload, as configured by the target user

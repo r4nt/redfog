@@ -43,6 +43,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     gstreamer::init()?;
 
+    // TEMPORARY debugging aid for the "resume works but video updates are
+    // severely throttled" investigation — traces `pipewiresrc`'s own
+    // buffer-request/negotiation timeline from the client side, to
+    // complement `REDFOG_DEBUG_KWIN_LOGGING_RULES` (redfog-broker's
+    // equivalent for the compositor side). Not read automatically from
+    // `GST_DEBUG` alone since this needs to apply regardless of what the
+    // invoking script's own environment happens to set. Remove once that
+    // investigation concludes.
+    if let Ok(spec) = std::env::var("REDFOG_DEBUG_GST_DEBUG") {
+        gstreamer::debug_set_threshold_from_string(&spec, true);
+    }
+
     let _headless_runtime = redfog_core::HeadlessRuntime::start(redfog_core::default_runtime_dir())
         .map_err(|e| e as Box<dyn std::error::Error>)?;
 

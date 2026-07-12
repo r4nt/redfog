@@ -11,6 +11,7 @@ members = [
     "crates/redfog-broker-protocol",
     "crates/redfog-login-protocol",
     "crates/redfog-session-init",
+    "crates/redfog-pair",
     "crates/gst-backend",
     "crates/session-backend",
     "crates/viewer",

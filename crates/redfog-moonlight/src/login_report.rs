@@ -44,6 +44,10 @@ impl LoginReportServer {
                 LoginRequest::Authenticate { username, password, session } => {
                     LoginResponse::Authenticate(self.session_manager.handle_login_report(username, password, session).await)
                 }
+                LoginRequest::CheckUsername { username } => {
+                    LoginResponse::CheckUsername { running: self.session_manager.handle_check_username(&username) }
+                }
+                LoginRequest::LogOut { username, password } => LoginResponse::LogOut(self.session_manager.handle_log_out(username, password).await),
             };
             let mut response_line = serde_json::to_string(&response).expect("protocol types always serialize");
             response_line.push('\n');

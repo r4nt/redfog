@@ -96,11 +96,20 @@ pub enum VideoSource {
 }
 
 impl VideoSource {
-    fn into_element(self) -> gst::Element {
+    /// `client_name` must be unique per session/generation — GStreamer's
+    /// `pipewiresrc` shares one underlying PipeWire core/thread-loop across
+    /// every element in the process that resolves to the same client
+    /// identity. Without a distinct name here, every session for the life of
+    /// one `redfog-server` process reuses the same connection, so a single
+    /// wedged (abandoned-on-timeout) pipeline permanently poisons it for
+    /// every later session too — confirmed live via matching mutex addresses
+    /// across generations.
+    fn into_element(self, client_name: &str) -> gst::Element {
         match self {
             VideoSource::PipeWireNode(node_id) => gst::ElementFactory::make("pipewiresrc")
                 .name("src")
                 .property("path", node_id.to_string())
+                .property("client-name", client_name)
                 .property("do-timestamp", true)
                 .build()
                 .expect("pipewiresrc should always be available"),
@@ -263,6 +272,33 @@ impl CompositorSession {
         })
     }
 
+    /// Requests a fresh PipeWire stream/node for this session's video
+    /// source, without touching the underlying KWin screencast capture at
+    /// all — the video-resume fix. Two earlier approaches were tried and
+    /// confirmed live to still be broken:
+    /// - Recreating just the GStreamer-side `pipewiresrc` consumer while
+    ///   KWin's own screencast *producer* stream stayed the same one the
+    ///   whole time — still wedged identically (see
+    ///   `redfog-core/tests/pause_resume.rs`).
+    /// - Fully disconnecting and reconnecting the capture session (a fresh
+    ///   Wayland connection, `zkde_screencast_unstable_v1::
+    ///   stream_virtual_output`) — this *did* unstick the video, but
+    ///   `stream_virtual_output`'s own protocol doc comment says it
+    ///   requests a feed from "a **new** virtual output": every
+    ///   reconnect was a real output-hotplug event fired at every Wayland
+    ///   client, not just our own consumer, and intermittently disrupted
+    ///   others (`plasmashell`'s own desktop/panel surfaces sometimes just
+    ///   didn't come back — confirmed to be genuinely missing surfaces,
+    ///   not merely a stale video frame, since input broke too).
+    ///
+    /// `CaptureSession::new_stream` (`stream_output` against our
+    /// already-existing `wl_output`) is the actual fix: it touches nothing
+    /// about the output itself, so nothing else needs to react to it.
+    pub fn reconnect_capture(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.pipewire_node_id = self.capture_session.new_stream()?;
+        Ok(())
+    }
+
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
         match &mut self.kwin_process {
             Some(child) => child.try_wait(),
@@ -276,6 +312,24 @@ impl CompositorSession {
             child.wait().ok();
         }
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+
+    /// Non-blocking subset of `terminate()` — just the signal, no `wait()` —
+    /// for use as a `Drop` safety net (see `RunningSession`'s `Drop` impl in
+    /// `redfog-moonlight`), where blocking on a possibly-wedged child (the
+    /// same class of hang `terminate()`'s own `wait()` can suffer from,
+    /// confirmed live for the Login stage's reader-thread `join()`) would be
+    /// actively harmful: `Drop` can run at unpredictable points (e.g. a
+    /// `HashMap::insert` silently dropping a replaced value), and a call
+    /// this deep down inside `&mut self` doesn't get to be `async` or
+    /// `spawn_blocking`'d. An unreaped zombie left behind by skipping
+    /// `wait()` is a tiny, harmless cost next to leaking this process's own
+    /// gigabytes of GStreamer/PipeWire-mapped buffers forever — confirmed
+    /// live to actually happen (see the OOM incident in project memory).
+    pub fn kill_best_effort(&mut self) {
+        if let Some(child) = self.kwin_process.as_mut() {
+            let _ = child.kill();
+        }
     }
 }
 
@@ -347,7 +401,8 @@ impl StreamingEngine {
         on_frame: impl Fn(bool) + Send + Sync + 'static,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let input_forwarder = InputForwarder::connect(&initial_session.socket_path)?;
-        let pipeline = make_pipeline(initial_session.video_source(), frame_store, on_frame);
+        let client_name = format!("redfog-streaming-engine-{}", std::process::id());
+        let pipeline = make_pipeline(initial_session.video_source(), &client_name, frame_store, on_frame);
         pipeline.set_state(gst::State::Playing)?;
         Ok(Self { pipeline, input_forwarder })
     }
@@ -367,13 +422,14 @@ impl StreamingEngine {
 
 pub fn make_pipeline<F>(
     source: VideoSource,
+    client_name: &str,
     frame_store: Arc<Mutex<Option<Frame>>>,
     on_frame: F,
 ) -> gst::Pipeline
 where
     F: Fn(bool) + Send + Sync + 'static,
 {
-    let src = source.into_element();
+    let src = source.into_element(client_name);
     let downstream = gst::parse_bin_from_description(
         "videoconvert ! video/x-raw,format=BGRx ! appsink name=sink sync=false",
         true,
@@ -422,11 +478,16 @@ const ENCODER_ELEMENT_NAME: &str = "enc";
 /// hardware encoding is worth the complexity (see project notes on the
 /// NVIDIA GBM issue — encoding is a separate GPU path from KWin's virtual
 /// backend rendering, so it isn't necessarily blocked by the same bug).
-pub fn make_encoder_pipeline<F>(source: VideoSource, bitrate_kbps: u32, on_access_unit: F) -> gst::Pipeline
+pub fn make_encoder_pipeline<F>(
+    source: VideoSource,
+    client_name: &str,
+    bitrate_kbps: u32,
+    on_access_unit: F,
+) -> gst::Pipeline
 where
     F: Fn(Vec<u8>, bool) + Send + Sync + 'static,
 {
-    let src = source.into_element();
+    let src = source.into_element(client_name);
     let downstream_desc = format!(
         "videoconvert \
          ! video/x-raw,format=I420 \
@@ -459,6 +520,47 @@ where
             .build(),
     );
     pipeline
+}
+
+/// Swaps out a pipeline's video source element in place, leaving the
+/// downstream processing chain (`videoconvert`/`x264enc`/`appsink`, etc.)
+/// untouched — for `pipewiresrc`, confirmed live and in isolation (see
+/// `redfog-core/tests/pause_resume.rs`) to reliably never restart its
+/// internal streaming task on a second Paused->Playing transition, even
+/// though `set_state`/`get_state` may both eventually report the pipeline
+/// reached `Playing`. Building a *fresh* source element instead is the
+/// workaround: it's never been through a Paused->Playing cycle before, so
+/// it can't have hit this yet.
+///
+/// The old element's own teardown is *not* waited on — it may itself never
+/// return (same root issue: its internal state is already wedged), so its
+/// `Null` transition runs on a detached, abandoned thread, same pattern as
+/// `run_with_timeout` in redfog-moonlight. Requires the pipeline to have
+/// been built by [`make_pipeline`]/[`make_encoder_pipeline`] (relies on the
+/// source element being named `"src"`, exactly as those construct it).
+pub fn replace_video_source(
+    pipeline: &gst::Pipeline,
+    source: VideoSource,
+    client_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let old_src = pipeline.by_name("src").ok_or("no element named \"src\" in this pipeline")?;
+    let old_src_pad = old_src.static_pad("src").ok_or("\"src\" element has no src pad")?;
+    let downstream_pad = old_src_pad.peer().ok_or("\"src\" element's src pad isn't linked to anything")?;
+    let downstream = downstream_pad.parent_element().ok_or("downstream pad has no parent element")?;
+
+    old_src_pad.unlink(&downstream_pad).ok();
+    pipeline.remove(&old_src)?;
+    let old_src_for_teardown = old_src;
+    std::thread::spawn(move || {
+        let _ = old_src_for_teardown.set_state(gst::State::Null);
+    });
+
+    let new_src = source.into_element(client_name);
+    pipeline.add(&new_src)?;
+    new_src.link(&downstream)?;
+    new_src.sync_state_with_parent()?;
+
+    Ok(())
 }
 
 /// Force the next frame out of a [`make_encoder_pipeline`] pipeline to be a
@@ -520,12 +622,12 @@ impl Drop for AudioLoopback {
 /// Capture -> Opus encode pipeline for network streaming: `pipewiresrc`
 /// targeting an [`AudioLoopback`]'s capture side -> stereo 48kHz -> Opus.
 /// Delivers one encoded Opus packet per callback invocation.
-pub fn make_audio_pipeline<F>(loopback: &AudioLoopback, on_packet: F) -> gst::Pipeline
+pub fn make_audio_pipeline<F>(loopback: &AudioLoopback, client_name: &str, on_packet: F) -> gst::Pipeline
 where
     F: Fn(Vec<u8>) + Send + Sync + 'static,
 {
     let desc = format!(
-        "pipewiresrc target-object={capture_name} do-timestamp=true \
+        "pipewiresrc target-object={capture_name} client-name={client_name} do-timestamp=true \
          ! audioconvert ! audioresample \
          ! audio/x-raw,format=S16LE,channels=2,rate=48000 \
          ! opusenc frame-size=20 \

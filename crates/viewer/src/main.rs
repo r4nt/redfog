@@ -343,7 +343,8 @@ fn build_and_play_pipeline(
     frame_store: Arc<Mutex<Option<Frame>>>,
     event_loop_proxy: winit::event_loop::EventLoopProxy<UserEvent>,
 ) -> Result<gst::Pipeline, Box<dyn std::error::Error>> {
-    let pipeline = redfog_core::make_pipeline(compositor.video_source(), frame_store, move |changed| {
+    let client_name = format!("redfog-viewer-{}", std::process::id());
+    let pipeline = redfog_core::make_pipeline(compositor.video_source(), &client_name, frame_store, move |changed| {
         if changed {
             let _ = event_loop_proxy.send_event(UserEvent::FrameSizeChanged);
         } else {

@@ -121,16 +121,30 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
 
+    // TEMPORARY test-only knob for investigating "throttling after resume
+    // if there's no damage for a while" (see
+    // `video_stays_healthy_after_an_idle_gap_post_resume` in
+    // connection_integration.rs): disables this instance's own continuous
+    // auto-repaint entirely, so a test can create a genuine no-damage idle
+    // window (this app otherwise *always* repaints continuously by design
+    // — see the module doc comment — which makes that scenario impossible
+    // to reproduce with it as-is) and then drive damage on demand by
+    // sending real input (egui still repaints on input events even with
+    // auto-repaint disabled). Unset (the default for every other test)
+    // preserves the original always-on behavior exactly.
+    let no_autorepaint = std::env::var_os("REDFOG_TEST_UX_NO_AUTOREPAINT").is_some();
+
     eframe::run_native(
         "Redfog Test UX",
         options,
-        Box::new(|_cc| Box::new(TestUxApp { label, last_pos: None })),
+        Box::new(move |_cc| Box::new(TestUxApp { label, last_pos: None, no_autorepaint })),
     )
 }
 
 struct TestUxApp {
     label: String,
     last_pos: Option<egui::Pos2>,
+    no_autorepaint: bool,
 }
 
 impl eframe::App for TestUxApp {
@@ -140,7 +154,11 @@ impl eframe::App for TestUxApp {
         // KWin's screencast only pushes a PipeWire frame when a client
         // commits a new buffer, so without this the capture pipeline sends
         // one frame and then stalls (see redfog-login's identical comment).
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        // Suppressed entirely when `no_autorepaint` is set — see its own
+        // doc comment above.
+        if !self.no_autorepaint {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
 
         let label = &self.label;
         ctx.input(|i| {

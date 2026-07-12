@@ -1,0 +1,11 @@
+[package]
+name = "redfog-pair"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "redfog-pair"
+path = "src/main.rs"
+
+[dependencies]
+ureq = "2"

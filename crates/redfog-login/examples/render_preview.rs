@@ -34,4 +34,14 @@ fn main() {
     let kbd_path = base_path.replace(".png", "-keyboard-open.png");
     pixmap.save_png(&kbd_path).expect("failed to save preview PNG");
     println!("wrote {kbd_path}");
+    state.keyboard_dropdown_open = false;
+
+    // Resume + Log Out state: the typed username already has a running
+    // session.
+    state.username_running = Some(true);
+    state.cursor_pos = (1120.0, 640.0);
+    let (pixmap, _layout) = ui::render(&state);
+    let resume_path = base_path.replace(".png", "-resume.png");
+    pixmap.save_png(&resume_path).expect("failed to save preview PNG");
+    println!("wrote {resume_path}");
 }

@@ -3869,6 +3869,7 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "kwin-capture",
+ "nix",
  "wayland-backend",
  "wayland-client",
  "wayland-scanner",
@@ -3937,6 +3938,13 @@ dependencies = [
  "ureq",
  "uuid 1.23.4",
  "x509-parser",
+]
+
+[[package]]
+name = "redfog-pair"
+version = "0.1.0"
+dependencies = [
+ "ureq",
 ]
 
 [[package]]

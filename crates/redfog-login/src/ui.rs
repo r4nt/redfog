@@ -69,6 +69,13 @@ pub struct LoginUiState {
     pub cursor_pos: (f64, f64),
     /// Toggled roughly every 500ms by the caller to blink the text caret.
     pub caret_blink_on: bool,
+    /// Whether the currently-typed `username` already has a running
+    /// (possibly backgrounded) session — `None` until checked (see
+    /// `main.rs`'s `check_username`, fired when the field loses focus) or
+    /// once `username` has been edited since the last check made this
+    /// stale. Drives the primary button's label ("Log In" vs "Resume") and
+    /// whether the "Log Out" control is shown at all.
+    pub username_running: Option<bool>,
 }
 
 impl LoginUiState {
@@ -88,6 +95,7 @@ impl LoginUiState {
             error_msg: None,
             cursor_pos: (width as f64 / 2.0, height as f64 / 2.0),
             caret_blink_on: true,
+            username_running: None,
         }
     }
 }
@@ -110,7 +118,17 @@ pub struct Layout {
     /// which are generic over which dropdown they're drawing.
     pub keyboard_box: Rect,
     pub keyboard_options: Vec<Rect>,
+    /// Primary button — labeled "Log In" or "Resume" depending on
+    /// `LoginUiState::username_running`, but always the same action from
+    /// the click handler's perspective (`try_submit`): which one actually
+    /// happens is decided server-side at `Authenticate` time, never
+    /// trusted from this cached, possibly-stale client-side hint.
     pub login_button: Rect,
+    /// `None` when not shown at all — only rendered once
+    /// `LoginUiState::username_running` is confirmed `Some(true)`, so
+    /// there's nothing to click (and therefore nothing to hit-test) when a
+    /// username hasn't been checked yet or has no running session.
+    pub logout_button: Option<Rect>,
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> Color {
@@ -279,7 +297,7 @@ pub fn render(state: &LoginUiState) -> (Pixmap, Layout) {
     // changing the card's own fixed height (they float on top / push
     // nothing).
     let card_w = (w as f32 * 0.34).clamp(360.0, 560.0);
-    let card_h = 620.0f32.min(h as f32 * 0.85);
+    let card_h = 680.0f32.min(h as f32 * 0.85);
     let card_x = (w as f32 - card_w) / 2.0;
     let card_y = (h as f32 - card_h) / 2.0;
     let card_rect = Rect::from_xywh(card_x, card_y, card_w, card_h).unwrap();
@@ -336,7 +354,21 @@ pub fn render(state: &LoginUiState) -> (Pixmap, Layout) {
 
     let button_h = 46.0;
     let login_button = Rect::from_xywh(content_x, cy, content_w, button_h).unwrap();
-    draw_button(&mut pixmap, login_button, "LOG IN");
+    let primary_label = if state.username_running == Some(true) { "RESUME" } else { "LOG IN" };
+    draw_button(&mut pixmap, login_button, primary_label);
+    cy += button_h + 14.0;
+
+    // Only shown once a running session is actually confirmed for the
+    // typed username — nothing to log out of otherwise, and showing a
+    // clickable-looking control that does nothing (or errors) would be
+    // worse than not showing it at all.
+    let logout_button = if state.username_running == Some(true) {
+        let rect = Rect::from_xywh(content_x, cy, content_w, 38.0).unwrap();
+        draw_outline_button(&mut pixmap, rect, "LOG OUT");
+        Some(rect)
+    } else {
+        None
+    };
 
     // Drawn last (after the button/error text) so it visually floats on
     // top of whatever it happens to overlap below it, matching how a real
@@ -359,7 +391,7 @@ pub fn render(state: &LoginUiState) -> (Pixmap, Layout) {
 
     draw_cursor(&mut pixmap, state.cursor_pos);
 
-    (pixmap, Layout { username_field, password_field, session_box, session_options, keyboard_box, keyboard_options, login_button })
+    (pixmap, Layout { username_field, password_field, session_box, session_options, keyboard_box, keyboard_options, login_button, logout_button })
 }
 
 fn draw_field(pixmap: &mut Pixmap, rect: Rect, value: &str, masked: bool, focused: bool, caret_blink_on: bool) {
@@ -476,6 +508,28 @@ fn draw_button(pixmap: &mut Pixmap, rect: Rect, label: &str) {
     draw_text(pixmap, label, text_x, text_y, (255, 255, 255), false);
 }
 
+/// A secondary, lower-emphasis button — outlined rather than filled, so it
+/// doesn't visually compete with the primary Log In/Resume button above it.
+/// Used only for "Log Out", which should be reachable but not the thing a
+/// user's eye lands on first.
+fn draw_outline_button(pixmap: &mut Pixmap, rect: Rect, label: &str) {
+    let path = rounded_rect_path(rect, 10.0);
+    let mut fill = Paint::default();
+    fill.set_color(rgb(FIELD_FILL.0, FIELD_FILL.1, FIELD_FILL.2));
+    fill.anti_alias = true;
+    pixmap.fill_path(&path, &fill, tiny_skia::FillRule::Winding, Transform::identity(), None);
+    let mut stroke_paint = Paint::default();
+    stroke_paint.set_color(rgb(ERROR.0, ERROR.1, ERROR.2));
+    stroke_paint.anti_alias = true;
+    let stroke = tiny_skia::Stroke { width: 1.5, ..Default::default() };
+    pixmap.stroke_path(&path, &stroke_paint, &stroke, Transform::identity(), None);
+
+    let label_w = text_width(label, false);
+    let text_x = rect.left() as i32 + (rect.width() as i32 - label_w) / 2;
+    let text_y = rect.top() as i32 + (rect.height() as i32 - 15) / 2;
+    draw_text(pixmap, label, text_x, text_y, ERROR, false);
+}
+
 /// A simple filled arrow, since there's no compositor left to draw a real
 /// cursor for us — the previous KWin/gst-wayland-display backends drew
 /// this for free as part of whatever desktop environment was rendering;
@@ -543,6 +597,14 @@ impl Layout {
         if rect_contains(&self.login_button, x, y) {
             return Hit::LoginButton;
         }
+        // `None` (not shown, see the field's own doc comment) means there's
+        // nothing here to hit at all — falls through to `Hit::None` below,
+        // same as clicking any other empty space on the card.
+        if let Some(logout_button) = &self.logout_button {
+            if rect_contains(logout_button, x, y) {
+                return Hit::LogoutButton;
+            }
+        }
         Hit::None
     }
 }
@@ -560,6 +622,7 @@ pub enum Hit {
     KeyboardToggle,
     KeyboardOption(usize),
     LoginButton,
+    LogoutButton,
     /// Also what a click outside an open popup means — the caller should
     /// treat this as "close whichever dropdown is open, without changing
     /// its selection," matching how real dropdown menus close on any

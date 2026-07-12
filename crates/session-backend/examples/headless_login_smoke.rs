@@ -71,7 +71,8 @@ fn main() {
     let mut input = compositor.input_sink().expect("input_sink");
 
     let frame_store: Arc<Mutex<Option<redfog_core::Frame>>> = Arc::new(Mutex::new(None));
-    let pipeline = redfog_core::make_pipeline(compositor.video_source(), frame_store.clone(), |_changed| {});
+    let client_name = format!("redfog-headless-login-smoke-{}", std::process::id());
+    let pipeline = redfog_core::make_pipeline(compositor.video_source(), &client_name, frame_store.clone(), |_changed| {});
     {
         use gstreamer::prelude::*;
         pipeline.set_state(gstreamer::State::Playing).expect("pipeline playing");

@@ -94,6 +94,15 @@ impl ClientManager {
         notify
     }
 
+    /// `uniqueid`s currently mid-handshake (cert + salt sent, blocked in
+    /// `getservercert` waiting on a PIN) — lets a human-facing tool (the
+    /// login UI, or `redfog-pair`) show/pick a client to pair without
+    /// needing to already know its `uniqueid` (e.g. from grepping server
+    /// logs).
+    pub fn pending_unique_ids(&self) -> Vec<String> {
+        self.pending.lock().unwrap().keys().cloned().collect()
+    }
+
     /// PIN relayed by a human (e.g. via the login UI on first connect).
     /// Derives the shared AES key and wakes the blocked `getservercert` call.
     pub fn submit_pin(&self, unique_id: &str, pin: &str) -> Result<(), String> {

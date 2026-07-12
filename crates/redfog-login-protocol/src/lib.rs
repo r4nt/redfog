@@ -32,11 +32,31 @@ pub enum LoginRequest {
     /// (read via the broker's `ReadUserSessionConfig`, gated behind this
     /// same `Authenticate` having already succeeded).
     Authenticate { username: String, password: String, session: String },
+    /// Whether `username` already has a running (possibly backgrounded)
+    /// session — lets the login screen show "Resume" instead of "Log In",
+    /// and enable/disable its "Log Out" control, before any password is
+    /// even submitted. Deliberately requires no password: revealing which
+    /// usernames currently have an active session to anyone who reaches the
+    /// login screen, pre-authentication, is a real (if minor) information
+    /// disclosure — an accepted tradeoff for a personal/self-hosted server
+    /// in exchange for the button already showing the right label by the
+    /// time a real login attempt is submitted, rather than a two-step
+    /// "submit, then pick an action" flow.
+    CheckUsername { username: String },
+    /// Terminates `username`'s running session outright (unlike a plain
+    /// disconnect/reconnect, which only backgrounds it — see
+    /// `SessionManager::background_or_discard_active_session`). Still
+    /// requires the real password, same as `Authenticate` — otherwise
+    /// anyone at the login screen could end another user's session without
+    /// proving they are that user.
+    LogOut { username: String, password: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LoginResponse {
     Authenticate(Result<(), String>),
+    CheckUsername { running: bool },
+    LogOut(Result<(), String>),
 }
 
 /// One operator-configured, named entry in `sessions.toml` — what the login

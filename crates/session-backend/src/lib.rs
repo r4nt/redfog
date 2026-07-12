@@ -174,6 +174,29 @@ impl SpawnedCompositor {
         }
     }
 
+    /// Non-blocking subset of `terminate()` — see
+    /// `CompositorSession::kill_best_effort`'s doc comment for why this
+    /// exists at all (a `Drop`-safe safety net, never the primary teardown
+    /// path). Skips `wait()`/`join()` for every variant — an unreaped
+    /// zombie or a reader thread that takes its time noticing EOF are both
+    /// fine; leaking this whole compositor's GStreamer/PipeWire resources
+    /// forever, because nothing ever called `terminate()` on it at all
+    /// (confirmed live — see project memory), is not.
+    pub fn kill_best_effort(&mut self) {
+        match self {
+            Self::Kwin(session) => session.kill_best_effort(),
+            Self::GstWaylandDisplay { payload_process, .. } => {
+                if let Some(child) = payload_process.as_mut() {
+                    let _ = child.kill();
+                }
+            }
+            Self::HeadlessLogin { child, input_stream, .. } => {
+                let _ = input_stream.shutdown(std::net::Shutdown::Both);
+                let _ = child.kill();
+            }
+        }
+    }
+
     /// Resizes the compositor's own output surface — meaningful only for
     /// backends whose surface size isn't fixed at construction time.
     /// Returns whether anything actually changed, so callers know whether
@@ -198,6 +221,20 @@ impl SpawnedCompositor {
                 true
             }
             Self::GstWaylandDisplay { .. } | Self::HeadlessLogin { .. } => false,
+        }
+    }
+
+    /// Requests a fresh PipeWire stream/node for this session's video
+    /// source — see `CompositorSession::reconnect_capture`'s doc comment
+    /// for why this, and not tearing down/recreating the capture, is the
+    /// actual fix. A documented no-op for `GstWaylandDisplay`/
+    /// `HeadlessLogin` (neither goes through a KWin screencast/PipeWire
+    /// stream at all — see `video_source`'s `VideoSource::Element` arms for
+    /// those).
+    pub fn reconnect_kwin_capture(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Self::Kwin(session) => session.reconnect_capture(),
+            Self::GstWaylandDisplay { .. } | Self::HeadlessLogin { .. } => Ok(()),
         }
     }
 }
