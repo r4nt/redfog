@@ -1381,16 +1381,11 @@ impl SessionManager {
         // starting a fresh one: the desktop they left behind (and anything
         // still running in it) is exactly where they left it.
         //
-        // For `Backend::Kwin`, resuming a backgrounded session used to just
-        // un-pause its existing video pipeline — reliably leaving the
-        // client stuck forever re-requesting an IDR frame (root-caused and
-        // fixed, see `rebuild_for_resume`'s doc comment: reusing the same
-        // pipeline, or even just the same KWin screencast producer, is what
-        // was actually broken, not resuming as such). Now rebuilds the
-        // screencast capture and both pipelines fully fresh first.
-        // `Backend::GstWaylandDisplay`/`HeadlessLogin` are unaffected (no
-        // KWin screencast/PipeWire stream involved at all) and skip this
-        // rebuild entirely — see `SpawnedCompositor::reconnect_kwin_capture`.
+        // For all backends, resuming a backgrounded session is a clean no-op
+        // (see `rebuild_for_resume`'s doc comment). The GStreamer pipelines
+        // are kept in the Playing state while backgrounded, so the PipeWire
+        // stream remains hot and active, avoiding both the damage-source stall
+        // on resume and the need to recreate/reconnect the capture session.
         let username = self.authenticated_username.lock().unwrap().clone().unwrap_or_else(|| "user".to_string());
         // Bound to a plain local first, not matched on directly — the
         // `.lock().unwrap()` guard would otherwise stay alive for the whole

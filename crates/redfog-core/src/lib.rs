@@ -496,46 +496,6 @@ where
     pipeline
 }
 
-/// Swaps out a pipeline's video source element in place, leaving the
-/// downstream processing chain (`videoconvert`/`x264enc`/`appsink`, etc.)
-/// untouched — for `pipewiresrc`, confirmed live and in isolation (see
-/// `redfog-core/tests/pause_resume.rs`) to reliably never restart its
-/// internal streaming task on a second Paused->Playing transition, even
-/// though `set_state`/`get_state` may both eventually report the pipeline
-/// reached `Playing`. Building a *fresh* source element instead is the
-/// workaround: it's never been through a Paused->Playing cycle before, so
-/// it can't have hit this yet.
-///
-/// The old element's own teardown is *not* waited on — it may itself never
-/// return (same root issue: its internal state is already wedged), so its
-/// `Null` transition runs on a detached, abandoned thread, same pattern as
-/// `run_with_timeout` in redfog-moonlight. Requires the pipeline to have
-/// been built by [`make_pipeline`]/[`make_encoder_pipeline`] (relies on the
-/// source element being named `"src"`, exactly as those construct it).
-pub fn replace_video_source(
-    pipeline: &gst::Pipeline,
-    source: VideoSource,
-    client_name: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let old_src = pipeline.by_name("src").ok_or("no element named \"src\" in this pipeline")?;
-    let old_src_pad = old_src.static_pad("src").ok_or("\"src\" element has no src pad")?;
-    let downstream_pad = old_src_pad.peer().ok_or("\"src\" element's src pad isn't linked to anything")?;
-    let downstream = downstream_pad.parent_element().ok_or("downstream pad has no parent element")?;
-
-    old_src_pad.unlink(&downstream_pad).ok();
-    pipeline.remove(&old_src)?;
-    let old_src_for_teardown = old_src;
-    std::thread::spawn(move || {
-        let _ = old_src_for_teardown.set_state(gst::State::Null);
-    });
-
-    let new_src = source.into_element(client_name);
-    pipeline.add(&new_src)?;
-    new_src.link(&downstream)?;
-    new_src.sync_state_with_parent()?;
-
-    Ok(())
-}
 
 /// Force the next frame out of a [`make_encoder_pipeline`] pipeline to be a
 /// keyframe — used to honor Moonlight's `RequestIdrFrame`/
