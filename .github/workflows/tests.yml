@@ -1,0 +1,63 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set XDG_RUNTIME_DIR
+        # Every test/script in this repo assumes this is set explicitly
+        # rather than inheriting it silently (see project memory: some
+        # invocation paths don't have it at all) — `env:` above can't run
+        # a shell command, so compute it here instead of hardcoding a UID.
+        run: echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang libclang-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav gstreamer1.0-pipewire \
+            libpipewire-0.3-dev pipewire wireplumber \
+            libpam0g-dev libdbus-1-dev dbus-user-session \
+            libssl-dev
+          # Best-effort: the isolated KWin resume tests
+          # (redfog-core/tests/pause_resume.rs) skip themselves with a
+          # clear message rather than failing if kwin_wayland isn't
+          # installed or doesn't work in this environment, so this is
+          # allowed to fail without breaking the job.
+          sudo apt-get install -y --no-install-recommends kwin-wayland || true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch patched vendor dependencies
+        run: bash scripts/fetch-patched-deps.sh
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: redfog-core pause_resume tests
+        run: cargo test -p redfog-core --test pause_resume -- --test-threads=1
+
+      - name: redfog-moonlight connection_integration tests
+        # gst_wayland_display_backend_smoke_test is excluded: it requires
+        # REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR pointed at a separately
+        # built gst-wayland-display plugin (see scripts/run-gst-viewer.sh)
+        # that this job doesn't build — not part of the default local
+        # `scripts/run-tests.sh` run either, for the same reason.
+        run: cargo test -p redfog-moonlight --test connection_integration -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test
