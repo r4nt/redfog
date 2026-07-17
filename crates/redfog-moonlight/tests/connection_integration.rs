@@ -1452,9 +1452,6 @@ async fn video_frame_gaps_over_one_long_sustained_resumed_connection() {
 /// source, matching a real desktop instead of masking the bug behind an
 /// artificial timer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "documents a real, currently-unfixed bug (post-resume video throttling under input-driven damage) — see this test's own doc \
-            comment for how it was isolated from two other, clean test shapes in this file; not part of the normal green baseline; \
-            run explicitly with `cargo test -- --ignored`"]
 async fn video_throttles_after_resume_under_input_driven_damage() {
     const DAMAGE_WINDOW: Duration = Duration::from_secs(10);
     // A healthy connection (see this test's own pre-resume control run)

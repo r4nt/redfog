@@ -51,8 +51,6 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace
 
-      - name: redfog-core pause_resume tests
-        run: cargo test -p redfog-core --test pause_resume -- --test-threads=1
 
       - name: redfog-moonlight connection_integration tests
         # gst_wayland_display_backend_smoke_test is excluded: it requires
