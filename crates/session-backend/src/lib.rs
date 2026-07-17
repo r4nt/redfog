@@ -224,19 +224,6 @@ impl SpawnedCompositor {
         }
     }
 
-    /// Requests a fresh PipeWire stream/node for this session's video
-    /// source — see `CompositorSession::reconnect_capture`'s doc comment
-    /// for why this, and not tearing down/recreating the capture, is the
-    /// actual fix. A documented no-op for `GstWaylandDisplay`/
-    /// `HeadlessLogin` (neither goes through a KWin screencast/PipeWire
-    /// stream at all — see `video_source`'s `VideoSource::Element` arms for
-    /// those).
-    pub fn reconnect_kwin_capture(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        match self {
-            Self::Kwin(session) => session.reconnect_capture(),
-            Self::GstWaylandDisplay { .. } | Self::HeadlessLogin { .. } => Ok(()),
-        }
-    }
 }
 
 /// [`InputSink`] for [`SpawnedCompositor::HeadlessLogin`] — ships each call

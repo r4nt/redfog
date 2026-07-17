@@ -272,32 +272,6 @@ impl CompositorSession {
         })
     }
 
-    /// Requests a fresh PipeWire stream/node for this session's video
-    /// source, without touching the underlying KWin screencast capture at
-    /// all — the video-resume fix. Two earlier approaches were tried and
-    /// confirmed live to still be broken:
-    /// - Recreating just the GStreamer-side `pipewiresrc` consumer while
-    ///   KWin's own screencast *producer* stream stayed the same one the
-    ///   whole time — still wedged identically (see
-    ///   `redfog-core/tests/pause_resume.rs`).
-    /// - Fully disconnecting and reconnecting the capture session (a fresh
-    ///   Wayland connection, `zkde_screencast_unstable_v1::
-    ///   stream_virtual_output`) — this *did* unstick the video, but
-    ///   `stream_virtual_output`'s own protocol doc comment says it
-    ///   requests a feed from "a **new** virtual output": every
-    ///   reconnect was a real output-hotplug event fired at every Wayland
-    ///   client, not just our own consumer, and intermittently disrupted
-    ///   others (`plasmashell`'s own desktop/panel surfaces sometimes just
-    ///   didn't come back — confirmed to be genuinely missing surfaces,
-    ///   not merely a stale video frame, since input broke too).
-    ///
-    /// `CaptureSession::new_stream` (`stream_output` against our
-    /// already-existing `wl_output`) is the actual fix: it touches nothing
-    /// about the output itself, so nothing else needs to react to it.
-    pub fn reconnect_capture(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.pipewire_node_id = self.capture_session.new_stream()?;
-        Ok(())
-    }
 
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
         match &mut self.kwin_process {
