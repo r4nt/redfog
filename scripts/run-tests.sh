@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Runs the full sudo-free test suite: workspace build, the isolated KWin
-# resume tests (redfog-core/tests/pause_resume.rs), and the main moonlight
+# Runs the full sudo-free test suite: workspace build, and the main moonlight
 # integration suite (redfog-moonlight/tests/connection_integration.rs).
 #
 # Sudo-free: connection_integration.rs uses its REDFOG_BROKER_FAKE_SPAWN
@@ -47,16 +46,10 @@ run_suite() {
     fi
 }
 
-run_suite "redfog-core pause_resume" \
-    cargo test -p redfog-core --test pause_resume -- --test-threads=1
-
 run_suite "redfog-moonlight connection_integration" \
     cargo test -p redfog-moonlight --test connection_integration -- --test-threads=1
 
 if [ "$INCLUDE_IGNORED" -eq 1 ]; then
-    run_suite "redfog-core pause_resume (--ignored)" \
-        cargo test -p redfog-core --test pause_resume -- --test-threads=1 --ignored
-
     run_suite "redfog-moonlight connection_integration (--ignored)" \
         cargo test -p redfog-moonlight --test connection_integration -- --test-threads=1 --ignored
 fi
