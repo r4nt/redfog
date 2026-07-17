@@ -817,89 +817,23 @@ impl SessionManager {
     /// Rebuilds a backgrounded session's screencast capture and video/audio
     /// pipelines fully fresh before resuming it — a no-op for backends
     /// other than `Backend::Kwin` (see `SpawnedCompositor::
-    /// reconnect_kwin_capture`'s doc comment; there's no confirmed problem
-    /// to work around for those yet).
+    /// Rebuilds a backgrounded session's video/audio pipelines.
     ///
-    /// Root cause (confirmed live and in isolation — see
-    /// `redfog-core/tests/pause_resume.rs`): un-pausing a `Backend::Kwin`
-    /// session's *existing* video pipeline reliably leaves the client stuck
-    /// forever re-requesting an IDR frame — and it's not specific to reusing
-    /// the same `pipewiresrc` client element, or even to reusing the same
-    /// KWin screencast *producer* stream; both were tried in isolation and
-    /// still wedged identically. Only rebuilding the *whole* pipeline
-    /// (source and downstream both) against a freshly reconnected capture
-    /// session actually resumes successfully. The previously-reverted
-    /// attempt at rebuilding fresh pipelines here crashed `kwin_wayland`
-    /// itself — not because rebuilding is inherently unsafe, but because
-    /// that attempt synchronously tore the *old* pipeline down (to `Null`)
-    /// as part of the same call; this version never waits on the old
-    /// pipeline's teardown at all (same reasoning as `discard_running_
-    /// session`: its own Paused->Playing already failed once, so its `Null`
-    /// transition may never return either).
-    async fn rebuild_for_resume(&self, mut background: RunningSession) -> Result<RunningSession, String> {
-        if !matches!(background.compositor, Some(SpawnedCompositor::Kwin(_))) {
-            return Ok(background);
-        }
-        let generation = background.generation;
-        let this = self.arc_self();
-        tokio::task::spawn_blocking(move || {
-            use gstreamer::prelude::*;
-            tracing::info!("rebuild_for_resume(generation={generation}): starting reconnect_kwin_capture");
-            let reconnect_start = std::time::Instant::now();
-            background
-                .compositor
-                .as_mut()
-                .expect("compositor present until torn down")
-                .reconnect_kwin_capture()
-                .map_err(|e| format!("failed to reconnect KWin capture for resume: {e}"))?;
-            tracing::info!("rebuild_for_resume(generation={generation}): reconnect_kwin_capture finished after {:?}", reconnect_start.elapsed());
-            let build_start = std::time::Instant::now();
-            let (video_pipeline, audio_pipeline) = this.build_pipelines(
-                background.compositor.as_ref().expect("compositor present until torn down"),
-                &background._audio_loopback,
-                generation,
-            );
-            tracing::info!("rebuild_for_resume(generation={generation}): build_pipelines finished after {:?}", build_start.elapsed());
-            // Lets this generation's *original* bus-watcher threads (from
-            // whenever it was first spawned — resuming never spawns new
-            // ones, see `start_streaming`) drop their clone of the pipeline
-            // being replaced here, so it can actually be freed once the
-            // teardown below `Null`s it too — see `bus_watchers_stop`'s
-            // doc comment for why `set_state(Null)` alone doesn't achieve
-            // that.
-            background.bus_watchers_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            let old_video = std::mem::replace(&mut background.video_pipeline, video_pipeline);
-            let old_audio = std::mem::replace(&mut background.audio_pipeline, audio_pipeline);
-            // Bounded and logged, matching `discard_running_session` —
-            // this call site previously had neither, so a hang here (the
-            // same class of "reused pipewiresrc never completes a state
-            // transition" issue this whole resume fix is about, just on
-            // the *old*, now-superseded pipeline instead of the new one)
-            // was invisible: no timeout meant the old pipeline's GStreamer
-            // threads (encoder thread pool, appsink pad task, etc.) could
-            // sit there forever, competing for CPU with every subsequent
-            // session's own pipeline. Confirmed live: after ~13 resumes,
-            // the process had accumulated 73 threads (33 of them stray
-            // `src:src` pad tasks) and every session had become visibly
-            // slower — input lag, sluggish redraw — consistent with
-            // exactly this leak, not a fresh regression per resume.
-            std::thread::spawn(move || {
-                let teardown_start = std::time::Instant::now();
-                if run_with_timeout(move || { let _ = old_video.set_state(gstreamer::State::Null); }, Duration::from_secs(5)) {
-                    tracing::info!("rebuild_for_resume(generation={generation}): old video pipeline set to Null after {:?}", teardown_start.elapsed());
-                } else {
-                    tracing::error!("rebuild_for_resume(generation={generation}): old video pipeline Null-transition timed out after 5s — abandoning it rather than blocking this thread forever");
-                }
-                if run_with_timeout(move || { let _ = old_audio.set_state(gstreamer::State::Null); }, Duration::from_secs(5)) {
-                    tracing::info!("rebuild_for_resume(generation={generation}): old audio pipeline set to Null after {:?}", teardown_start.elapsed());
-                } else {
-                    tracing::error!("rebuild_for_resume(generation={generation}): old audio pipeline Null-transition timed out after 5s — abandoning it rather than blocking this thread forever");
-                }
-            });
-            Ok(background)
-        })
-        .await
-        .map_err(|e| format!("rebuild_for_resume task panicked: {e}"))?
+    /// Formerly, this rebuilt the capture session and GStreamer pipelines fresh
+    /// to work around the "damage-source stall" (where KWin didn't send frames
+    /// due to lack of damage, causing keyframe request hangs).
+    ///
+    /// However, this recreation required calling `new_stream` which leaked
+    /// stream proxies, causing KWin's compositor to stall at 1 FPS on
+    /// unconsumed buffers.
+    ///
+    /// Now, we keep the GStreamer pipelines running in the Playing state
+    /// during backgrounding (see `background_or_discard`). Because the
+    /// pipelines are never paused, they remain active, preventing both the
+    /// damage-source stall (the encoder remains hot and ready) and the
+    /// stream proxy leaks. Consequently, `rebuild_for_resume` is a no-op.
+    async fn rebuild_for_resume(&self, background: RunningSession) -> Result<RunningSession, String> {
+        Ok(background)
     }
 
     fn spawn_session(
@@ -1722,16 +1656,12 @@ fn background_or_discard(session: RunningSession, background_sessions: &Mutex<Ha
     match &session.kind {
         SessionType::User(username) => {
             let username = username.clone();
-            // Dropping a GStreamer pipeline while it's still Playing isn't
-            // just a "Trying to dispose element ... but it is in PLAYING"
-            // warning — confirmed live via coredumpctl: it segfaulted the
-            // whole server (a PipeWire/GStreamer worker thread racing the
-            // Rust-side Drop) — but `Paused` is an ordinary state
-            // transition, not a teardown, so no such race applies to
-            // backgrounding.
-            use gstreamer::prelude::*;
-            let _ = session.video_pipeline.set_state(gstreamer::State::Paused);
-            let _ = session.audio_pipeline.set_state(gstreamer::State::Paused);
+            // Keeping the GStreamer pipelines running in the `Playing` state
+            // during backgrounding avoids the need to recreate the screencast
+            // stream on resume, which originally caused 1 FPS throttling by
+            // leaking stream proxies. When the screen is idle, GStreamer
+            // consumes virtually zero CPU/GPU resources since no frames are
+            // produced.
             background_sessions.lock().unwrap().insert(username, session);
         }
         SessionType::Login => {
