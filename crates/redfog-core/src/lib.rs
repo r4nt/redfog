@@ -591,10 +591,6 @@ impl Drop for AudioLoopback {
     }
 }
 
-/// Capture -> Opus encode pipeline for network streaming: `pipewiresrc`
-/// targeting an [`AudioLoopback`]'s capture side -> stereo 48kHz -> Opus.
-/// Delivers one encoded Opus packet per callback invocation.
-///
 /// `frame-size=5`, NOT the more common VoIP default of 20ms: Moonlight's
 /// wire protocol hardcodes a 5ms audio packet duration on the *client* side
 /// (confirmed by reading moonlight-common-rust — not vendored into git, see
@@ -608,18 +604,26 @@ impl Drop for AudioLoopback {
 /// slower than real audio arrived, causing a deterministic (not
 /// random-packet-loss-driven) queue-up-then-flush every few seconds —
 /// silence, then a fast, garbled burst, on a perfectly regular cycle.
-pub fn make_audio_pipeline<F>(loopback: &AudioLoopback, client_name: &str, on_packet: F) -> gst::Pipeline
-where
-    F: Fn(Vec<u8>) + Send + Sync + 'static,
-{
-    let desc = format!(
+/// Split out from `make_audio_pipeline` purely so this literal is
+/// unit-testable without needing a live PipeWire capture behind it.
+fn audio_pipeline_description(capture_name: &str, client_name: &str) -> String {
+    format!(
         "pipewiresrc target-object={capture_name} client-name={client_name} do-timestamp=true \
          ! audioconvert ! audioresample \
          ! audio/x-raw,format=S16LE,channels=2,rate=48000 \
          ! opusenc frame-size=5 \
-         ! appsink name=sink sync=false",
-        capture_name = loopback.capture_name,
-    );
+         ! appsink name=sink sync=false"
+    )
+}
+
+/// Capture -> Opus encode pipeline for network streaming: `pipewiresrc`
+/// targeting an [`AudioLoopback`]'s capture side -> stereo 48kHz -> Opus.
+/// Delivers one encoded Opus packet per callback invocation.
+pub fn make_audio_pipeline<F>(loopback: &AudioLoopback, client_name: &str, on_packet: F) -> gst::Pipeline
+where
+    F: Fn(Vec<u8>) + Send + Sync + 'static,
+{
+    let desc = audio_pipeline_description(&loopback.capture_name, client_name);
     let pipeline = gst::parse_launch(&desc)
         .expect("audio pipeline parse failed")
         .dynamic_cast::<gst::Pipeline>()
@@ -639,4 +643,22 @@ where
             .build(),
     );
     pipeline
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards against silently reverting to the more common VoIP default of
+    /// `frame-size=20` — the exact regression that caused a real, live
+    /// symptom (a WebRTC-relaying client's playback clock running 4x too
+    /// slow, since it paces against a `samples_per_frame` value derived
+    /// from Moonlight's own hardcoded 5ms assumption). Deliberately a plain
+    /// string check, not a constructed `gst::Pipeline` — this doesn't need
+    /// GStreamer initialized or a live PipeWire capture behind it at all.
+    #[test]
+    fn audio_pipeline_requests_5ms_opus_frames() {
+        let desc = audio_pipeline_description("some-capture-node", "some-client");
+        assert!(desc.contains("opusenc frame-size=5"), "pipeline description: {desc}");
+    }
 }

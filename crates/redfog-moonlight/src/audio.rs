@@ -139,4 +139,49 @@ mod tests {
         let p1 = packetizer.packetize(&opus_frame, 1960);
         assert_eq!(u16::from_be_bytes([p1[2], p1[3]]), 1);
     }
+
+    /// Guards the two bugs found live: audio sent as plaintext (the client
+    /// unconditionally AES-128-CBC-decrypts, regardless of the
+    /// `encryptionSupported` SDP flags), and the IV not actually advancing
+    /// per-packet the way the client's depayloader expects (derived from
+    /// `rikeyid` + this packet's own RTP sequence number, computed
+    /// independently here — not by calling `crypto::cbc_encrypt`'s own IV
+    /// math back at it).
+    #[test]
+    fn packetize_encrypted_round_trips_and_varies_iv_per_sequence_number() {
+        use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+
+        fn decrypt(ciphertext: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
+            type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+            let mut buffer = ciphertext.to_vec();
+            Aes128CbcDec::new(key.into(), iv.into())
+                .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+                .expect("valid pkcs7 padding")
+                .to_vec()
+        }
+
+        let key = [0x7au8; 16];
+        let key_id: u32 = 2260590725; // a real rikeyid value seen live
+        let mut packetizer = AudioPacketizer::new();
+        let frame0 = vec![0x11u8; 100];
+        let frame1 = vec![0x22u8; 40]; // different size, like real VBR Opus
+
+        let p0 = packetizer.packetize_encrypted(&frame0, 1000, &key, key_id);
+        let p1 = packetizer.packetize_encrypted(&frame1, 1005, &key, key_id);
+
+        // Never plaintext on the wire.
+        assert_ne!(&p0[RTP_HEADER_SIZE..], &frame0[..]);
+
+        let seq0 = u16::from_be_bytes([p0[2], p0[3]]);
+        let seq1 = u16::from_be_bytes([p1[2], p1[3]]);
+        assert_eq!((seq0, seq1), (0, 1));
+
+        let mut iv0 = [0u8; 16];
+        iv0[0..4].copy_from_slice(&key_id.wrapping_add(seq0 as u32).to_be_bytes());
+        let mut iv1 = [0u8; 16];
+        iv1[0..4].copy_from_slice(&key_id.wrapping_add(seq1 as u32).to_be_bytes());
+
+        assert_eq!(decrypt(&p0[RTP_HEADER_SIZE..], &key, &iv0), frame0);
+        assert_eq!(decrypt(&p1[RTP_HEADER_SIZE..], &key, &iv1), frame1);
+    }
 }

@@ -157,7 +157,7 @@ impl SessionManager {
         // `runtime_dir` — pointing PULSE_SERVER at the session dir instead
         // (an earlier bug here) meant it never had a pulse server listening
         // on it at all.
-        let pulse_socket_path = format!("{}/pulse/native", default_runtime_dir());
+        let pulse_socket_path = pulse_socket_path();
 
         let mut cmd = tokio::process::Command::new(&kwin_path);
         cmd.env("KWIN_PLATFORM", "virtual")
@@ -264,7 +264,7 @@ impl SessionManager {
         let pipewire_socket_path = format!("{}/pipewire-0", default_runtime_dir());
         // See `spawn_fake`'s equivalent comment: must be `default_runtime_dir()`,
         // not this session's own private `runtime_dir`.
-        let pulse_socket_path = format!("{}/pulse/native", default_runtime_dir());
+        let pulse_socket_path = pulse_socket_path();
         let unit_name = format!("redfog-fake-pam-session-{}-{session_id}", std::process::id());
 
         // `systemd-run --user --scope` needs the *real* `XDG_RUNTIME_DIR`
@@ -397,7 +397,7 @@ impl SessionManager {
         // Same reasoning as pipewire_socket_path: pipewire-pulse also runs
         // under redfog-server's own identity, in its runtime dir — not
         // this session's private `runtime_dir`.
-        let pulse_socket_path = format!("{}/pulse/native", default_runtime_dir());
+        let pulse_socket_path = pulse_socket_path();
         // redfog-server owns and creates this socket under its own
         // identity (see design.md's "Cross-user socket reachability") — the
         // target user's KWin needs an explicit grant to connect in, since
@@ -607,7 +607,7 @@ impl SessionManager {
         // Same reasoning as pipewire_socket_path: pipewire-pulse also runs
         // under redfog-server's own identity, in its runtime dir — not
         // this session's private `runtime_dir`.
-        let pulse_socket_path = format!("{}/pulse/native", default_runtime_dir());
+        let pulse_socket_path = pulse_socket_path();
         // The pre-bound fd handoff only helps *KWin itself* (which inherits
         // it directly via fork+exec, following FD_CLOEXEC being cleared
         // above) — it does nothing for any *other* client that connects to
@@ -1240,4 +1240,33 @@ fn which_kwin_wayland() -> Option<String> {
 
 fn default_runtime_dir() -> String {
     std::env::var("REDFOG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp/redfog-runtime".to_string())
+}
+
+/// PipeWire/wireplumber/pipewire-pulse all run under `redfog-server`'s own
+/// identity, in *its* runtime dir (`HeadlessRuntime::start`) — never a
+/// session's own private `runtime_dir` (that's KWin's isolated
+/// `XDG_RUNTIME_DIR`, a completely different directory). A single helper
+/// exists specifically so every call site gets this from one place instead
+/// of hand-building the same path — a hand-built copy of this once drifted
+/// from `pipewire_socket_path`'s equivalent construction and pointed at the
+/// wrong directory, which meant `PULSE_SERVER` never had a pulse server
+/// listening on it at all (confirmed live: KDE showed "connection to sound
+/// server lost").
+fn pulse_socket_path() -> String {
+    format!("{}/pulse/native", default_runtime_dir())
+}
+
+#[cfg(test)]
+mod pulse_socket_path_tests {
+    use super::*;
+
+    #[test]
+    fn always_rooted_at_default_runtime_dir_not_a_session_dir() {
+        // SAFETY: this test doesn't run concurrently with anything else
+        // that reads/writes REDFOG_RUNTIME_DIR — it's the only test in this
+        // crate that touches it.
+        unsafe { std::env::set_var("REDFOG_RUNTIME_DIR", "/tmp/redfog-runtime-test-marker") };
+        assert_eq!(pulse_socket_path(), "/tmp/redfog-runtime-test-marker/pulse/native");
+        unsafe { std::env::remove_var("REDFOG_RUNTIME_DIR") };
+    }
 }
