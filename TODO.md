@@ -112,6 +112,52 @@ obviously than audio's hard stall.
 
 ## Recently fixed (this session, for context — not TODO items)
 
+- **CPU usage during high-fps/high-bitrate NVENC streaming: 34% → ~10% of
+  a core.** Root-caused via non-invasive per-thread `/proc/<pid>/task/*/stat`
+  sampling (no `perf` on this machine; avoids `gdb`/`perf record`'s
+  pause-the-target problem) at 1920x1080@120fps, ~37Mbps, against a live
+  session with continuous full-frame damage (`glxgears`):
+  1. Nearly all CPU was on `pipewiresrc`'s own streaming thread — because
+     `make_encoder_pipeline` linked `pipewiresrc ! videorate` straight into
+     the `videoconvert`/encoder downstream bin with no thread boundary, so
+     everything downstream (format conversion, encoder submission) ran
+     synchronously on PipeWire's own I/O callback thread. Added a `queue`
+     (`leaky=downstream`, `max-size-buffers=2` — a pure threading boundary,
+     not a latency buffer) between capture and convert/encode so this work
+     can land on a different core. 34% → ~15%.
+  2. Per-thread sampling after the `queue` fix showed the cost had just
+     moved, unchanged in magnitude, onto the queue's own output thread —
+     meaning it was never PipeWire I/O to begin with, it was `videoconvert`
+     (forcing PipeWire's captured format to BGRx for `nvh264enc`). Checked
+     `nvh264enc`'s actual sink caps (`gst-inspect-1.0 nvh264enc`): it
+     accepts plain system-memory `video/x-raw` directly in a wide format
+     list (confirmed live via `gst-launch-1.0` that negotiation still
+     succeeds with no format forced), and does its own upload+colorspace
+     handling on the GPU. Removed the `videoconvert`/forced-BGRx step
+     entirely from `video_encoder_downstream_description`'s `Nvenc` arm —
+     PipeWire's native captured format now goes straight into `nvh264enc`.
+     ~15% → ~10%.
+  3. Isolated the remaining ~10% with a synthetic `videotestsrc ! nvh264enc`
+     pipeline (no PipeWire/KWin at all, same resolution/fps/bitrate): still
+     ~24-29% of a core just to hand raw system-memory frames to `nvh264enc`
+     at 1920x1080@120fps — i.e. this is NVENC's own host-to-device transfer
+     cost (pageable system memory needs a CPU-driven staging copy; there's
+     no way around *some* CPU cost here without genuinely GPU-resident
+     source frames), not something in redfog's own code, and the live
+     pipeline (~10%) is already doing *better* than this synthetic
+     worst-case, likely thanks to PipeWire's own buffer pool. Tried an
+     explicit `cudaupload` element ahead of `nvh264enc` in the synthetic
+     pipeline as a further probe (28.7% → 23.2%, a real but modest
+     improvement) — not worth the added pipeline complexity given it
+     doesn't beat what the live pipeline already achieves.
+  - **Remaining lever, not pursued here**: the fundamental reason frames
+    exist in CPU/system memory at all is `LIBGL_ALWAYS_SOFTWARE=1`, forced
+    unconditionally on every `kwin_wayland` spawn as a workaround for the
+    known NVIDIA GBM segfault (see project memory). A real fix for *that*
+    would let KWin render with the actual GPU and export DMA-BUF frames
+    PipeWire could hand to `nvh264enc` with zero CPU-side copying at all —
+    a much bigger, previously-parked investigation, not attempted here.
+
 - PULSE_SERVER pointed at the wrong runtime dir + missing ACL grant
   (`redfog-broker/src/session.rs`).
 - Audio sent as plaintext instead of the base-protocol-mandatory

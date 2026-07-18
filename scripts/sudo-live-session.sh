@@ -97,6 +97,8 @@ if [ -z "${REDFOG_LIVE_SCOPED:-}" ]; then
         --setenv="SUDO_USER=$SUDO_USER" \
         --setenv="PATH=$PATH" \
         --setenv="REDFOG_BROKER_PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN-1}" \
+        --setenv="GST_TRACERS=${GST_TRACERS:-}" \
+        --setenv="GST_DEBUG=${GST_DEBUG:-}" \
         -- "$SELF" "$@"
 fi
 
@@ -173,6 +175,8 @@ REDFOG_USER_APP="plasmashell --no-respawn" \
 REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR="$PLUGIN_DIR" \
 REDFOG_DEBUG_GST_DEBUG="$REDFOG_DEBUG_GST_DEBUG" \
 RUST_LOG="$REDFOG_LIVE_SERVER_RUST_LOG" \
+GST_TRACERS="${GST_TRACERS:-}" \
+GST_DEBUG="${GST_DEBUG:-}" \
 setsid "$REPO_DIR/target/release/redfog-server" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 

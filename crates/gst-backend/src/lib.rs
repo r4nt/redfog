@@ -30,57 +30,16 @@ use redfog_core::InputSink;
 /// acceleration is available — see project notes on the NVIDIA GBM issue.
 /// Pass a real DRM render node path (e.g. `/dev/dri/renderD128`) instead
 /// when one works.
-pub const RENDER_NODE_SOFTWARE: &str = "software";
-
-/// Builds the `waylanddisplaysrc` element, wrapped in a `capsfilter` forcing
-/// `width`/`height` (not yet part of a pipeline, not yet started — the
-/// caller adds the returned element to a `gst::Pipeline` via
-/// `redfog_core::VideoSource::Element`, same as any other source). Its
-/// Wayland socket doesn't exist until that pipeline reaches at least
-/// `Paused` — see [`wait_for_wayland_socket`].
 ///
-/// The capsfilter is required, not cosmetic: `waylanddisplaysrc` has no
-/// width/height *property* (only a wide negotiable caps range, confirmed
-/// via `gst-inspect-1.0`) and no default resolution of its own — left
-/// unconstrained, it negotiates down to the smallest satisfiable caps,
-/// which is a literal `1x1` frame (confirmed live: an unconstrained
-/// pipeline renders nothing, the exact "window opens but shows nothing"
-/// symptom this fixes). KWin's `VideoSource::PipeWireNode` path doesn't
-/// need this — the real resolution is already baked into the PipeWire
-/// stream itself by the time it reaches `pipewiresrc`.
-pub fn make_source_element(render_node: &str, width: i32, height: i32, fps: u32) -> Result<gst::Element, String> {
-    let waylandsrc = gst::ElementFactory::make("waylanddisplaysrc")
-        .name("waylanddisplaysrc")
-        .property("render-node", render_node)
-        .build()
-        .map_err(|e| {
-            format!(
-                "failed to create waylanddisplaysrc element: {e} — is gst-wayland-display built \
-                 and its plugin directory on GST_PLUGIN_PATH?"
-            )
-        })?;
-    let caps = gst::Caps::builder("video/x-raw")
-        .field("width", width)
-        .field("height", height)
-        .field("framerate", gst::Fraction::new(fps as i32, 1))
-        .build();
-    let capsfilter = gst::ElementFactory::make("capsfilter")
-        .name("src")
-        .property("caps", &caps)
-        .build()
-        .map_err(|e| format!("failed to create capsfilter element: {e}"))?;
-
-    let bin = gst::Bin::builder().name("waylanddisplaysrc-bin").build();
-    bin.add_many([&waylandsrc, &capsfilter]).map_err(|e| format!("failed to add elements to bin: {e}"))?;
-    waylandsrc.link(&capsfilter).map_err(|e| format!("failed to link waylanddisplaysrc to capsfilter: {e}"))?;
-
-    let src_pad = capsfilter.static_pad("src").ok_or("capsfilter has no src pad")?;
-    let ghost_pad = gst::GhostPad::with_target(&src_pad).map_err(|e| format!("failed to create ghost pad: {e}"))?;
-    ghost_pad.set_active(true).map_err(|e| format!("failed to activate ghost pad: {e}"))?;
-    bin.add_pad(&ghost_pad).map_err(|e| format!("failed to add ghost pad to bin: {e}"))?;
-
-    Ok(bin.upcast())
-}
+/// The actual `waylanddisplaysrc` element (plus the capsfilter forcing
+/// `width`/`height` — it has no such *property*, only a wide negotiable
+/// caps range with no default resolution of its own, so leaving it
+/// unconstrained negotiates down to a literal `1x1` frame, confirmed live)
+/// is built by `redfog_core::gst_wayland_display_encoder_pipeline_
+/// description`/`make_pipeline`, as part of one single pipeline string —
+/// this crate no longer constructs any GStreamer element itself, only
+/// process/socket management around whatever `redfog-core` builds.
+pub const RENDER_NODE_SOFTWARE: &str = "software";
 
 /// Polls `{runtime_dir}/{socket_name}` until it appears (created by
 /// `waylanddisplaysrc`'s Smithay compositor once the pipeline is playing)

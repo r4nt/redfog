@@ -41,6 +41,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let combined = if existing.is_empty() { plugin_dir } else { format!("{plugin_dir}:{existing}") };
         std::env::set_var("GST_PLUGIN_PATH", combined);
     }
+
+    // `glupload`/`glcolorconvert` (the NVENC video pipeline's GPU-side
+    // conversion path, see `video_encoder_downstream_description`) need a GL
+    // context, and this process has no real display (no X11/Wayland) to get
+    // one from the usual auto-detection. Left at their defaults, context
+    // creation tries to allocate an onscreen window surface and fails
+    // (`EGL_BAD_ALLOC`) even though a headless EGL/GBM display is otherwise
+    // available. `surfaceless` skips the window-surface step entirely —
+    // confirmed live via `gst-launch-1.0` in this exact environment (no
+    // DISPLAY/WAYLAND_DISPLAY set) that negotiation only succeeds with both
+    // of these set. Only set if not already present so a caller can still
+    // override for local/windowed debugging.
+    if std::env::var_os("GST_GL_WINDOW").is_none() {
+        std::env::set_var("GST_GL_WINDOW", "surfaceless");
+    }
+    if std::env::var_os("GST_GL_PLATFORM").is_none() {
+        std::env::set_var("GST_GL_PLATFORM", "egl");
+    }
+
     gstreamer::init()?;
 
     // TEMPORARY debugging aid for the "resume works but video updates are

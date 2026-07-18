@@ -973,7 +973,6 @@ impl SessionManager {
             SessionType::Login => "redfog-login-0".to_string(),
             SessionType::User(_) => "redfog-user-0".to_string(),
         };
-        let input_forwarder = compositor.input_sink()?;
         let audio_loopback = AudioLoopback::spawn(&audio_session_name)
             .map_err(|e| format!("failed to spawn audio loopback for {audio_session_name}: {e}"))?;
         // See `Shared::active_generation`'s doc comment — minted once per
@@ -990,6 +989,13 @@ impl SessionManager {
             self.config.bitrate_kbps,
         );
         let (video_pipeline, audio_pipeline) = self.build_pipelines(&compositor, &audio_loopback, generation, fps_cap);
+        // Must come *after* `build_pipelines`, not before (this used to be
+        // the other way around): `SpawnedCompositor::GstWaylandDisplay`'s
+        // `input_sink` now looks up its `waylanddisplaysrc` element inside
+        // the just-built `video_pipeline` (see `session_backend::
+        // SpawnedCompositor::input_sink`'s doc comment) rather than holding
+        // a pre-built element from before any pipeline existed.
+        let input_forwarder = compositor.input_sink(Some(&video_pipeline))?;
 
         Ok(RunningSession {
             kind,
@@ -1017,16 +1023,18 @@ impl SessionManager {
     /// time this is called, via KWin's own `--exit-with-session`).
     ///
     /// A background task rather than something `start_streaming` awaits
-    /// inline: `RunningSession`/`SpawnedCompositor::GstWaylandDisplay`
-    /// hold a `gstreamer::Element` directly, and something about that
-    /// combination — confirmed live, `SpawnedCompositor: Send` and
-    /// `SessionManager: Sync` both hold in isolation, yet an `async fn`
-    /// taking `&self` and an owned `RunningSession` still isn't — defeats
-    /// `tokio::spawn`'s `Send` bound once threaded through
-    /// `watch_login_exit`. Firing a fresh, independent task here sidesteps
-    /// it entirely; the task reaches back into `self.shared` under its own
-    /// lock once done, exactly like `watch_login_exit` already does,
-    /// rather than holding any owned/borrowed session state across an
+    /// inline: this dates from when `RunningSession`/`SpawnedCompositor::
+    /// GstWaylandDisplay` held a `gstreamer::Element` directly (no longer
+    /// true — see `VideoSource`'s doc comment in `redfog-core`), and
+    /// something about that combination — confirmed live,
+    /// `SpawnedCompositor: Send` and `SessionManager: Sync` both held in
+    /// isolation, yet an `async fn` taking `&self` and an owned
+    /// `RunningSession` still didn't — defeated `tokio::spawn`'s `Send`
+    /// bound once threaded through `watch_login_exit`. Firing a fresh,
+    /// independent task here sidestepped it entirely; kept as the
+    /// established pattern (the task reaches back into `self.shared` under
+    /// its own lock once done, exactly like `watch_login_exit` already
+    /// does, rather than holding any owned/borrowed session state across an
     /// await itself.
     fn spawn_gst_payload_in_background(&self, kind: SessionType, runtime_dir: String, socket_path: PathBuf, socket_name: String, broker_session_id: Option<String>) {
         let this = self.arc_self();

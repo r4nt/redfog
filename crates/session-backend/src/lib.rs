@@ -20,6 +20,7 @@
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gstreamer::prelude::*;
@@ -70,24 +71,24 @@ impl std::str::FromStr for Backend {
 /// caller-owned (direct spawn) — either way, `CompositorSession` itself
 /// already abstracts that difference (see its `kwin_process: Option<Child>`).
 ///
-/// `GstWaylandDisplay`: always caller-owned. The caller constructs and owns
-/// the `waylanddisplaysrc` GStreamer element directly, including its
-/// Wayland socket — the broker (if used at all) only grants the target user
-/// access to that already-existing socket and spawns the nested payload
-/// (e.g. Sway) as that user (`BrokerRequest::SpawnPayload`), which is why
-/// its `payload_process` field is filled in later, by [`spawn_gst_payload`],
-/// not at construction time (the payload's own Wayland socket doesn't exist
-/// until the pipeline built around `element` reaches at least `Paused`).
-///
-/// `HeadlessLogin`: no compositor, no Wayland socket, no KWin or
-/// gst-wayland-display at all — `redfog-login` renders its own frames
-/// in-process (`tiny-skia`/`embedded-graphics`) and ships them over a
-/// plain Unix stream (`redfog_login_protocol::render`) straight into a
-/// GStreamer `appsrc`, which is what `element` here actually is.
+/// `GstWaylandDisplay`/`HeadlessLogin`: deliberately hold no `gst::Element`
+/// at all — just the plain data `redfog_core::VideoSource` needs to embed
+/// each one directly into a single pipeline description string (see that
+/// enum's doc comment for the full reasoning; this used to hold a
+/// pre-built element, requiring `video_source()` to be callable before any
+/// pipeline existed, which is what motivated a whole separate-background-
+/// task workaround for a `Send`-bound issue — see this module's own doc
+/// comment — that turned out not to be necessary at all). `GstWaylandDisplay`'s
+/// `payload_process` field is filled in later, by [`spawn_gst_payload`], not
+/// at construction time — the nested payload's own Wayland socket doesn't
+/// exist until the pipeline built around this data reaches at least `Paused`.
 pub enum SpawnedCompositor {
     Kwin(CompositorSession),
     GstWaylandDisplay {
-        element: gstreamer::Element,
+        render_node: String,
+        width: i32,
+        height: i32,
+        fps: u32,
         runtime_dir: String,
         socket_path: PathBuf,
         socket_name: String,
@@ -99,9 +100,17 @@ pub enum SpawnedCompositor {
     },
     HeadlessLogin {
         child: Child,
-        /// The `appsrc` element frames are pushed into — see
-        /// [`spawn_login_compositor`]'s background reader thread.
-        element: gstreamer::Element,
+        /// Frames read off `input_stream` get relayed here — see
+        /// [`spawn_login_compositor`]'s background reader thread and
+        /// `redfog_core::VideoSource::Login`'s doc comment for the rest of
+        /// the chain (a `redfog_core::spawn_login_frame_pusher` on the
+        /// other end drains this into the actual `appsrc`, once one
+        /// exists). `Arc<Mutex<Option<...>>>` so `video_source()` can
+        /// `.take()` it exactly once (an `mpsc::Receiver` isn't `Clone`)
+        /// while still taking `&self` like every other variant here.
+        frame_rx: Arc<Mutex<Option<std::sync::mpsc::Receiver<Vec<u8>>>>>,
+        width: u32,
+        height: u32,
         /// A live handle to the same connection the reader thread reads
         /// frames from — `try_clone()`'d again by `input_sink()` for
         /// writing input events back the other way (see
@@ -114,28 +123,49 @@ pub enum SpawnedCompositor {
 }
 
 impl SpawnedCompositor {
+    /// Consumes this compositor's frame source — for `HeadlessLogin`,
+    /// literally consumes (`.take()`s the `mpsc::Receiver`, since it isn't
+    /// `Clone`), so this can only meaningfully be called once per
+    /// compositor. Matches how it's actually used: exactly once, to build
+    /// the one pipeline this compositor will ever have (see
+    /// `redfog-moonlight::session`'s `build_pipelines`, called exactly once
+    /// per `spawn_session` — resume never rebuilds it, see
+    /// `rebuild_for_resume`'s doc comment).
     pub fn video_source(&self) -> VideoSource {
         match self {
             Self::Kwin(session) => session.video_source(),
-            Self::GstWaylandDisplay { element, .. } => VideoSource::Element(element.clone()),
-            Self::HeadlessLogin { element, .. } => VideoSource::Element(element.clone()),
+            Self::GstWaylandDisplay { render_node, width, height, fps, .. } => {
+                VideoSource::GstWaylandDisplay { render_node: render_node.clone(), width: *width, height: *height, fps: *fps }
+            }
+            Self::HeadlessLogin { frame_rx, width, height, .. } => {
+                let frame_rx = frame_rx.lock().unwrap().take().expect("video_source() called more than once for a HeadlessLogin compositor");
+                VideoSource::Login { frame_rx, width: *width, height: *height }
+            }
         }
     }
 
-    /// KWin needs an explicit, fallible Wayland-protocol connection step;
-    /// gst-wayland-display doesn't (`send_event` works on the element
-    /// directly, no protocol handshake) — safe to call before the
-    /// compositor's socket even exists, unlike KWin's. `HeadlessLogin`'s
-    /// connection already exists by construction time (see
-    /// `spawn_login_compositor`), so this is infallible in practice for it
-    /// too — only `try_clone()`'s I/O error path can fail at all.
-    pub fn input_sink(&self) -> Result<Box<dyn InputSink>, String> {
+    /// `video_pipeline`: only actually needed for `GstWaylandDisplay`, to
+    /// look up the live `waylanddisplaysrc` element the pipeline built from
+    /// `video_source()`'s result contains (`send_event` needs a real
+    /// element, no protocol handshake the way KWin's Wayland connection
+    /// needs — but there's no element to send to until a pipeline exists
+    /// around one). Callers must build the video pipeline before calling
+    /// this for that variant — see `redfog-moonlight::session::spawn_session`
+    /// for the real ordering. `Kwin` connects independently (its own
+    /// Wayland socket, nothing to do with the video pipeline at all);
+    /// `HeadlessLogin`'s input goes over its own plain Unix socket, also
+    /// nothing to do with GStreamer — both ignore `video_pipeline`.
+    pub fn input_sink(&self, video_pipeline: Option<&gstreamer::Pipeline>) -> Result<Box<dyn InputSink>, String> {
         match self {
             Self::Kwin(session) => Ok(Box::new(
                 redfog_core::InputForwarder::connect(&session.socket_path)
                     .map_err(|e| format!("failed to connect input forwarder: {e}"))?,
             )),
-            Self::GstWaylandDisplay { element, .. } => Ok(Box::new(gst_backend::GstInputSink::new(element.clone()))),
+            Self::GstWaylandDisplay { .. } => {
+                let pipeline = video_pipeline.ok_or("GstWaylandDisplay::input_sink needs the already-built video pipeline")?;
+                let element = pipeline.by_name("waylanddisplaysrc").ok_or("waylanddisplaysrc not found in the video pipeline")?;
+                Ok(Box::new(gst_backend::GstInputSink::new(element)))
+            }
             Self::HeadlessLogin { input_stream, .. } => {
                 let stream = input_stream.try_clone().map_err(|e| format!("failed to clone login frame stream: {e}"))?;
                 Ok(Box::new(HeadlessLoginInputSink { stream }))
@@ -202,18 +232,16 @@ impl SpawnedCompositor {
     /// Returns whether anything actually changed, so callers know whether
     /// to rebuild their pipeline around a fresh [`Self::video_source`]
     /// afterward (KWin's `pipewiresrc` needs a fresh element per resize
-    /// anyway — see `VideoSource::into_element` — so this is safe to do
-    /// unconditionally when `true`; doing it when `false` would be either a
-    /// no-op or, for `GstWaylandDisplay`/`HeadlessLogin`, actively wrong —
-    /// see `spawn_gst_compositor`'s doc comment on why its
-    /// `VideoSource::Element` can't just be re-added to a new pipeline).
+    /// anyway — its `path` just gets re-pointed at a new node id, see
+    /// `pipewire_encoder_pipeline_description` — so this is safe to do
+    /// unconditionally when `true`; doing it when `false` would be a no-op).
     ///
     /// A documented no-op for `GstWaylandDisplay`/`HeadlessLogin`, not a
     /// limitation callers need to special-case per backend themselves:
     /// neither has a width/height that can change live (`waylanddisplaysrc`'s
-    /// capsfilter caps are fixed once built — see `gst_backend::
-    /// make_source_element`'s doc comment; `redfog-login`'s own canvas size
-    /// is likewise fixed for the process's lifetime).
+    /// capsfilter caps — see `redfog_core::gst_wayland_display_encoder_
+    /// pipeline_description` — are fixed once built; `redfog-login`'s own
+    /// canvas size is likewise fixed for the process's lifetime).
     pub fn resize(&self, width: i32, height: i32) -> bool {
         match self {
             Self::Kwin(session) => {
@@ -253,12 +281,17 @@ impl InputSink for HeadlessLoginInputSink {
     }
 }
 
-/// Builds (but does not play, and does not spawn any payload for) a
-/// `waylanddisplaysrc` element + its bookkeeping — shared by every caller
-/// that needs a `Backend::GstWaylandDisplay` compositor, since the Login and
+/// Prepares (but does not build any GStreamer element for, and does not
+/// spawn any payload for) a `Backend::GstWaylandDisplay` compositor's
+/// bookkeeping — shared by every caller that needs one, since the Login and
 /// User stages (and a standalone viewer's single-session mode) are
 /// otherwise identical; only the eventual payload-spawn mechanism differs
-/// (see [`spawn_gst_payload`]).
+/// (see [`spawn_gst_payload`]). The actual `waylanddisplaysrc` element gets
+/// built later, as part of one single pipeline string, by whichever of
+/// `redfog_core::make_pipeline`/`make_encoder_pipeline` ends up consuming
+/// this compositor's [`SpawnedCompositor::video_source`] — see
+/// `redfog_core::VideoSource`'s doc comment for why this doesn't need to
+/// happen here, unlike an earlier version of this function.
 pub fn spawn_gst_compositor(width: u32, height: u32, fps: u32, label: &str) -> Result<SpawnedCompositor, String> {
     let render_node = std::env::var("REDFOG_GST_RENDER_NODE").unwrap_or_else(|_| gst_backend::RENDER_NODE_SOFTWARE.to_string());
     // `label` (e.g. "redfog-login-0") only names *our own* runtime dir,
@@ -272,13 +305,16 @@ pub fn spawn_gst_compositor(width: u32, height: u32, fps: u32, label: &str) -> R
     std::fs::create_dir_all(&runtime_dir).map_err(|e| format!("failed to create {runtime_dir}: {e}"))?;
     // waylanddisplaysrc reads XDG_RUNTIME_DIR synchronously inside
     // pipeline.set_state(Playing) — must be set before that, not after
-    // (confirmed live: a RuntimeDirNotSet panic otherwise).
+    // (confirmed live: a RuntimeDirNotSet panic otherwise). Setting it here,
+    // well before that pipeline gets built, is still early enough.
     std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
-    let element = gst_backend::make_source_element(&render_node, width as i32, height as i32, fps)?;
     let socket_name = "wayland-1";
     let socket_path = PathBuf::from(&runtime_dir).join(socket_name);
     Ok(SpawnedCompositor::GstWaylandDisplay {
-        element,
+        render_node,
+        width: width as i32,
+        height: height as i32,
+        fps,
         runtime_dir,
         socket_path,
         socket_name: socket_name.to_string(),
@@ -302,11 +338,12 @@ pub fn spawn_gst_compositor(width: u32, height: u32, fps: u32, label: &str) -> R
 /// comments): rather than needing a real compositor just to host one small
 /// form, it renders its own frames (`tiny-skia`/`embedded-graphics`, no
 /// GPU) and ships them over a plain Unix stream
-/// (`redfog_login_protocol::render`) straight into a GStreamer `appsrc` —
-/// this function's whole job is standing that stream up: bind a socket,
-/// spawn `login_app` pointed at it via env vars, accept the one connection
-/// it makes, then hand frames arriving on it to a background thread that
-/// pushes them into the `appsrc`.
+/// (`redfog_login_protocol::render`) — this function's whole job is
+/// standing that stream up: bind a socket, spawn `login_app` pointed at it
+/// via env vars, accept the one connection it makes, then relay frames
+/// arriving on it onto a channel (see `SpawnedCompositor::HeadlessLogin`'s
+/// `frame_rx` doc comment for the rest of the chain — no GStreamer element
+/// gets built here at all).
 pub fn spawn_login_compositor(login_app: &[String], width: u32, height: u32) -> Result<SpawnedCompositor, String> {
     if login_app.is_empty() {
         return Err("login_app must not be empty".to_string());
@@ -353,39 +390,22 @@ pub fn spawn_login_compositor(login_app: &[String], width: u32, height: u32) -> 
     let _ = std::fs::remove_file(&socket_path); // no longer needed once connected
     stream.set_nonblocking(false).map_err(|e| format!("failed to set login frame stream blocking: {e}"))?;
 
-    let appsrc = gstreamer::ElementFactory::make("appsrc")
-        .name("login-appsrc")
-        .property("format", gstreamer::Format::Time)
-        .property("is-live", true)
-        .property("block", false)
-        .build()
-        .map_err(|e| format!("failed to create appsrc element: {e}"))?;
-    let caps = gstreamer::Caps::builder("video/x-raw")
-        .field("format", "RGBA")
-        .field("width", width as i32)
-        .field("height", height as i32)
-        .field("framerate", gstreamer::Fraction::new(30, 1))
-        .build();
-    appsrc.set_property("caps", &caps);
-
-    let app_src = appsrc
-        .clone()
-        .dynamic_cast::<gstreamer_app::AppSrc>()
-        .map_err(|_| "appsrc element factory didn't produce an AppSrc".to_string())?;
-
+    // No `appsrc`/GStreamer element built here at all — this thread just
+    // relays frames onto `frame_tx`; `redfog_core::spawn_login_frame_pusher`
+    // drains the receiving end into the real `appsrc`, once one exists (see
+    // `VideoSource::Login`'s doc comment for why that's a real improvement,
+    // not just moved code: this reader thread no longer needs a live
+    // `AppSrc` handle up front, so building the appsrc can happen inline,
+    // as part of one single pipeline description string).
+    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let reader_stream = stream.try_clone().map_err(|e| format!("failed to clone login frame stream: {e}"))?;
     let reader_thread = std::thread::spawn(move || {
         let mut reader = reader_stream;
         loop {
             match redfog_login_protocol::render::read_message(&mut reader) {
                 Ok(Some(redfog_login_protocol::render::Message::Frame { rgba, .. })) => {
-                    let mut buffer = gstreamer::Buffer::with_size(rgba.len()).expect("buffer allocation");
-                    {
-                        let buffer_mut = buffer.get_mut().expect("freshly allocated buffer is never shared");
-                        buffer_mut.copy_from_slice(0, &rgba).expect("buffer sized exactly for rgba");
-                    }
-                    if app_src.push_buffer(buffer).is_err() {
-                        break; // pipeline gone/EOS
+                    if frame_tx.send(rgba).is_err() {
+                        break; // pusher gone (pipeline torn down)
                     }
                 }
                 Ok(Some(redfog_login_protocol::render::Message::Input(_))) => {} // wrong direction on this stream, ignore
@@ -398,7 +418,14 @@ pub fn spawn_login_compositor(login_app: &[String], width: u32, height: u32) -> 
         }
     });
 
-    Ok(SpawnedCompositor::HeadlessLogin { child, element: appsrc, input_stream: stream, reader_thread: Some(reader_thread) })
+    Ok(SpawnedCompositor::HeadlessLogin {
+        child,
+        frame_rx: Arc::new(Mutex::new(Some(frame_rx))),
+        width,
+        height,
+        input_stream: stream,
+        reader_thread: Some(reader_thread),
+    })
 }
 
 /// Spawns the User compositor directly (no broker) — standalone use.

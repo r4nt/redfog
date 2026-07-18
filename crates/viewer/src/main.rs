@@ -419,7 +419,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // real graphical login screen"), matching production
     // (session_backend::spawn_gst_payload's callers).
     spawn_gst_payload_for(&runtime, &mut compositor, &args, initial_payload, false)?;
-    let mut input_sink = compositor.input_sink()?;
+    let mut input_sink = compositor.input_sink(Some(&pipeline))?;
     // `Option` so `CloseRequested`/handoff can `.take()` an owned value out
     // to call `terminate(self)` on, without needing a throwaway placeholder
     // compositor just to satisfy `mem::replace` — only ever `None` for the
@@ -572,7 +572,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     elwt.exit();
                     return;
                 }
-                input_sink = match new_compositor.input_sink() {
+                input_sink = match new_compositor.input_sink(Some(&new_pipeline)) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("viewer: failed to connect input sink to User compositor: {e}");

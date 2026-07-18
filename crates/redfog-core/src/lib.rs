@@ -85,55 +85,45 @@ pub struct CompositorSession {
 }
 
 /// A video frame source for [`make_pipeline`]/[`make_encoder_pipeline`] —
-/// either a PipeWire node to connect to via `pipewiresrc` (KWin's
-/// `CaptureSession`, which claims a virtual output and registers it in
-/// PipeWire itself), or an already-constructed GStreamer source element,
-/// for backends where the compositor *is* the GStreamer element (e.g.
-/// gst-wayland-display's `waylanddisplaysrc`, which has no PipeWire
-/// involvement at all — it hands raw frames straight to the pipeline).
+/// plain data only, deliberately never a pre-built `gst::Element`. Every
+/// variant here gets embedded directly into one literal pipeline
+/// description string per (source, encoder) combination — see
+/// `pipewire_encoder_pipeline_description`'s doc comment for why that
+/// matters (a caps bug hid for a long time specifically because a fragment
+/// of the pipeline was constructed away from where the rest of it was
+/// visible). `GstWaylandDisplay`/`Login` used to hold an already-constructed
+/// `gst::Element` instead — that required the source's owner (`session-
+/// backend`) to build it *before* any pipeline existed, which is also why
+/// `input_sink()`/frame-pushing used to need special-casing. Neither
+/// backend actually needs that: gst-wayland-display's Wayland socket only
+/// exists once the pipeline reaches `Playing` anyway (nothing waits on it
+/// before that), and Login's reader thread only needs a channel to relay
+/// frames through, not a live `AppSrc` handle up front.
 pub enum VideoSource {
     PipeWireNode(u32),
-    Element(gst::Element),
+    /// gst-wayland-display's `waylanddisplaysrc` — the compositor *is* this
+    /// element, no PipeWire involvement at all. `render_node` is either a
+    /// real DRM render node path or `gst_backend::RENDER_NODE_SOFTWARE`.
+    GstWaylandDisplay { render_node: String, width: i32, height: i32, fps: u32 },
+    /// Login's `appsrc`, fed via `frame_rx` — `redfog-login` renders its own
+    /// frames (`tiny-skia`, no GPU) and ships them over a Unix socket; a
+    /// background thread (`session_backend::spawn_login_compositor`) relays
+    /// each one onto this channel instead of pushing into an `AppSrc`
+    /// directly, since the `AppSrc` doesn't exist until the pipeline this
+    /// source ends up in is actually built.
+    Login { frame_rx: std::sync::mpsc::Receiver<Vec<u8>>, width: u32, height: u32 },
 }
 
-impl VideoSource {
-    /// `client_name` must be unique per session/generation — GStreamer's
-    /// `pipewiresrc` shares one underlying PipeWire core/thread-loop across
-    /// every element in the process that resolves to the same client
-    /// identity. Without a distinct name here, every session for the life of
-    /// one `redfog-server` process reuses the same connection, so a single
-    /// wedged (abandoned-on-timeout) pipeline permanently poisons it for
-    /// every later session too — confirmed live via matching mutex addresses
-    /// across generations.
-    fn into_element(self, client_name: &str, fps_cap: Option<u32>) -> gst::Element {
-        match self {
-            VideoSource::PipeWireNode(node_id) => {
-                let keepalive_time = 2000 / fps_cap.unwrap_or(60);
-                let pipewiresrc = gst::ElementFactory::make("pipewiresrc")
-                    .name("pipewiresrc")
-                    .property("path", node_id.to_string())
-                    .property("client-name", client_name)
-                    .property("do-timestamp", true)
-                    .property("keepalive-time", keepalive_time as i32)
-                    .build()
-                    .expect("pipewiresrc should always be available");
-                let videorate = gst::ElementFactory::make("videorate")
-                    .name("videorate")
-                    .property("skip-to-first", true)
-                    .build()
-                    .expect("videorate should always be available");
-                let bin = gst::Bin::builder().name("src").build();
-                bin.add_many([&pipewiresrc, &videorate]).unwrap();
-                pipewiresrc.link(&videorate).unwrap();
-                let src_pad = videorate.static_pad("src").unwrap();
-                let ghost_pad = gst::GhostPad::with_target(&src_pad).unwrap();
-                ghost_pad.set_active(true).unwrap();
-                bin.add_pad(&ghost_pad).unwrap();
-                bin.upcast()
-            }
-            VideoSource::Element(el) => el,
-        }
-    }
+/// What a video pipeline's captured frames end up as — the other half of
+/// [`video_pipeline_description`]'s `(source, sink)` match, alongside
+/// [`VideoSource`].
+pub enum VideoSink {
+    /// Raw BGRx frames for local display — [`make_pipeline`]'s only
+    /// consumer, the `viewer` debug tool. No encoding at all.
+    LocalDisplay,
+    /// H.264-encoded access units for network streaming —
+    /// [`make_encoder_pipeline`]'s only consumer, the real Moonlight server.
+    Encode { encoder: VideoEncoder, bitrate_kbps: u32 },
 }
 
 /// Where compositor input events go — implemented differently per backend.
@@ -402,9 +392,18 @@ impl StreamingEngine {
         Ok(Self { pipeline, input_forwarder })
     }
 
+    /// Looks up `pipewiresrc` directly by name (not a wrapping "src" bin,
+    /// the way this method's own `pipeline` used to be built) — matches
+    /// [`make_pipeline`]'s `VideoSource::PipeWireNode` case, which no
+    /// longer wraps `pipewiresrc` in an intermediate bin at all (one flat
+    /// `gst::parse_launch` string now, see that function's doc comment).
+    /// [`StreamingEngine`] itself is currently dead code (unused anywhere
+    /// in this workspace) but kept consistent with the rest of this file's
+    /// pipeline-construction approach rather than left referencing a
+    /// naming scheme that no longer exists.
     pub fn handoff(&mut self, next_session: &CompositorSession) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let new_input_forwarder = InputForwarder::connect(&next_session.socket_path)?;
-        if let Some(src) = self.pipeline.by_name("src") {
+        if let Some(src) = self.pipeline.by_name("pipewiresrc") {
             src.set_state(gst::State::Null).ok();
             src.set_property("path", next_session.pipewire_node_id.to_string());
             src.set_state(gst::State::Playing).ok();
@@ -415,6 +414,281 @@ impl StreamingEngine {
     }
 }
 
+/// Relays frames arriving on `frame_rx` (see `VideoSource::Login`'s doc
+/// comment — a background thread in `session-backend` writes to the other
+/// end, forwarding what it reads off Login's Unix socket) into the
+/// `login-appsrc` element a pipeline built from a [`VideoSource::Login`]
+/// description always contains. Runs on its own thread for the pipeline's
+/// lifetime; exits cleanly whenever either side goes away (`frame_rx`
+/// disconnects when the socket reader thread exits, `push_buffer` errors
+/// once the pipeline itself is torn down).
+fn spawn_login_frame_pusher(pipeline: &gst::Pipeline, frame_rx: std::sync::mpsc::Receiver<Vec<u8>>) {
+    let app_src = pipeline
+        .by_name("login-appsrc")
+        .expect("a VideoSource::Login pipeline always names its appsrc \"login-appsrc\"")
+        .dynamic_cast::<gst_app::AppSrc>()
+        .expect("login-appsrc is always an appsrc");
+    std::thread::spawn(move || {
+        for frame in frame_rx {
+            let mut buffer = gst::Buffer::with_size(frame.len()).expect("buffer allocation");
+            {
+                let buffer_mut = buffer.get_mut().expect("freshly allocated buffer is never shared");
+                buffer_mut.copy_from_slice(0, &frame).expect("buffer sized exactly for frame");
+            }
+            if app_src.push_buffer(buffer).is_err() {
+                break; // pipeline gone/EOS
+            }
+        }
+    });
+}
+
+/// THE single place — in this crate, and by extension this whole workspace,
+/// since no other crate constructs a GStreamer element or pipeline string at
+/// all anymore (see `VideoSource`'s doc comment) — that knows the actual
+/// gst-launch syntax for any video pipeline this project builds. Every
+/// `(source, sink)` combination is one complete, self-contained literal
+/// string, spelled out in full in its own match arm right here, not
+/// composed from separately-named "capture"/"downstream" helper functions
+/// called from elsewhere the way earlier versions of this file did.
+///
+/// That composition was tried, twice, and both times caused a real bug to
+/// hide: first, a shared downstream-description function taking a
+/// `framerate: Option<u32>` that secretly also meant "is this a PipeWire
+/// source or not" — a fixed-framerate caps request placed in the wrong half
+/// didn't visibly fail, it just silently never reached `videorate`. Fixed
+/// by folding capture+downstream into one string per source... which then
+/// turned out to *still* be two copies of the same `pipewiresrc`/
+/// `videorate` text (one here, one in [`make_pipeline`]) that had already
+/// quietly drifted — only one of them had the `(ANY)` caps-features fix
+/// below, since nothing forced a change to one copy to touch the other.
+/// Both problems have the same root cause: pipeline construction living in
+/// more than one place, however each place is organized internally.
+/// Accepting the literal duplication across match arms below (e.g. the
+/// `pipewiresrc`/`videorate` text appears in all three `PipeWireNode` arms)
+/// is the actual fix — it trades a smaller *character* count for a
+/// genuinely single, greppable, all-in-one-screen place to read and change
+/// this project's entire GStreamer surface.
+///
+/// `client_name`/`fps` only matter for `VideoSource::PipeWireNode` (see the
+/// `PipeWireNode` arms below for why) — every other source carries its own
+/// `fps` as part of its own data and ignores both parameters entirely.
+fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32, sink: &VideoSink) -> String {
+    match (source, sink) {
+        (VideoSource::PipeWireNode(node_id), VideoSink::LocalDisplay) => {
+            format!(
+                "pipewiresrc name=pipewiresrc path={node_id} client-name=\"{client_name}\" \
+                             do-timestamp=true keepalive-time={} \
+                 ! videorate name=videorate skip-to-first=true \
+                 ! video/x-raw(ANY),framerate={fps}/1 \
+                 ! videoconvert \
+                 ! video/x-raw,format=BGRx \
+                 ! appsink name=sink sync=false",
+                2000 / fps,
+            )
+        }
+        // `client_name` must be unique per session/generation — GStreamer's
+        // `pipewiresrc` shares one underlying PipeWire core/thread-loop
+        // across every element in the process that resolves to the same
+        // client identity. Without a distinct name here, every session for
+        // the life of one `redfog-server` process reuses the same
+        // connection, so a single wedged (abandoned-on-timeout) pipeline
+        // permanently poisons it for every later session too — confirmed
+        // live via matching mutex addresses across generations.
+        //
+        // `video/x-raw(ANY),framerate={fps}/1` — the `(ANY)` caps-features
+        // tag is load-bearing, not decoration. A caps structure written
+        // without an explicit features tag (`video/x-raw,framerate=...`, no
+        // `(...)`) means *only* `memory:SystemMemory` in GStreamer's caps-
+        // negotiation model — it does not mean "any memory type, this
+        // format." User-caught bug: that plain form sat here through every
+        // earlier version of this pipeline, silently forcing a SystemMemory
+        // download right after `videorate`, on *every* encoder path —
+        // including `Nvenc`'s GL/DMA-BUF arm below, which never had a real
+        // chance to get a DMA-BUF from `pipewiresrc` because a hard
+        // SystemMemory boundary already sat between them. That's almost
+        // certainly the real explanation for `glupload` measuring a ~30fps
+        // ceiling instead of the requested 120 earlier in this pipeline's
+        // history: it was silently doing its own slow CPU-driven texture
+        // upload from system memory the whole time, never a DMA-BUF import,
+        // regardless of where the fixed-framerate caps request itself was
+        // anchored (an explanation floated and disproved at the time — this
+        // is the actual root cause that explanation missed). `(ANY)` fixes
+        // the framerate the same way while leaving the memory feature open
+        // for downstream to negotiate — `Software`'s `videoconvert` still
+        // only accepts system memory so still gets exactly that, `Nvenc`'s
+        // `glupload` can now actually receive DMA-BUF if `pipewiresrc`
+        // offers it. `queue` is a thread boundary between capture and
+        // convert/encode: without it, `pipewiresrc` pushes buffers
+        // synchronously from its own PipeWire I/O thread straight through
+        // conversion into the encoder, serializing all of that CPU work
+        // onto one core no matter how many others are idle (confirmed live
+        // via per-thread /proc sampling: ~28% of a core at 1920x1080@120fps
+        // with a CPU `videoconvert` ahead of the encoder). `leaky=downstream`
+        // + a small `max-size-buffers` keeps it a pure threading boundary,
+        // not a latency-adding buffer.
+        (VideoSource::PipeWireNode(node_id), VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps }) => {
+            format!(
+                "pipewiresrc name=pipewiresrc path={node_id} client-name=\"{client_name}\" \
+                             do-timestamp=true keepalive-time={} \
+                 ! videorate name=videorate skip-to-first=true \
+                 ! video/x-raw(ANY),framerate={fps}/1 \
+                 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
+                 ! videoconvert \
+                 ! video/x-raw,format=I420 \
+                 ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
+                           byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
+                 ! video/x-h264,stream-format=byte-stream,alignment=au \
+                 ! appsink name=sink sync=false",
+                2000 / fps,
+            )
+        }
+        // No CPU `videoconvert` here — `nvh264enc`'s sink pad accepts a wide
+        // format list directly (confirmed via `gst-inspect-1.0 nvh264enc`).
+        // `glupload`/`glcolorconvert`/DMA-BUF instead: KWin's virtual output
+        // is confirmed live (`nvidia-smi --query-compute-apps` showing a
+        // real C+G GPU context on `kwin_wayland --virtual`, at only ~8% CPU
+        // compositing a continuously-damaged 1920x1080@120Hz scene — far too
+        // cheap for software rasterization) to be genuinely GPU-composited
+        // (an earlier assumption that it wasn't, based on
+        // `LIBGL_ALWAYS_SOFTWARE=1` being set on every `kwin_wayland` spawn,
+        // was wrong: that's a Mesa-only knob NVIDIA's driver doesn't read).
+        // If `pipewiresrc` offers `memory:DMABuf` for this node, `glupload`
+        // imports it directly into a GL texture (EGLImage import, no CPU
+        // pixel touch at all); `nvh264enc` consumes it via CUDA-GL interop.
+        // `glcolorconvert` is a cheap GPU-side no-op unless a format
+        // mismatch needs fixing. Needs `GST_GL_WINDOW=surfaceless`/
+        // `GST_GL_PLATFORM=egl` set on the process (see `redfog-server::
+        // main`) since this process has no real display for GL context
+        // auto-detection to find.
+        //
+        // `videorate` is load-bearing, not optional: tried putting the fixed
+        // `framerate={fps}/1` request directly on `pipewiresrc`'s own output
+        // instead (`pipewiresrc` has no dedicated fps *property* — confirmed
+        // via `gst-inspect-1.0 pipewiresrc` — so this meant relying entirely
+        // on GStreamer's pipewire plugin translating that caps request into
+        // the SPA stream-format parameters it negotiates with the actual
+        // PipeWire graph, hoping KWin's screencast producer could satisfy an
+        // exact fixed rate directly, since its virtual output's own refresh
+        // rate is already configured to this same `fps`). Confirmed live
+        // that it can't: negotiation failed outright ("no more input
+        // formats" / `not-negotiated` on `pipewiresrc` itself) — KWin's
+        // screencast stream is fundamentally *variable*-rate, matching its
+        // damage-driven rendering model (a configured refresh rate is a
+        // ceiling on how often it *can* repaint when there's damage, not a
+        // promise to always produce a frame every interval). `videorate`
+        // downstream is what actually bridges that variable input into the
+        // fixed rate `rc-mode=cbr` needs — there's no way to make the
+        // source itself produce a genuinely fixed rate here.
+        // ! queue leaky=downstream max-size-buffers=3 max-size-bytes=0 max-size-time=0 \
+         //        ! videorate name=videorate skip-to-first=true \
+         //        ! video/x-raw(memory:DMABuf),framerate={fps}/1 \
+        (VideoSource::PipeWireNode(node_id), VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps }) => {
+            format!(
+                 "pipewiresrc name=pipewiresrc path={node_id} client-name=\"{client_name}\" \
+                             do-timestamp=true keepalive-time={} \
+                 ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
+                             rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
+                 ! video/x-h264,stream-format=byte-stream,alignment=au \
+                 ! appsink name=sink sync=false",
+                2000 / fps,
+            )
+        }
+        // `waylanddisplaysrc` — the compositor *is* this element (see
+        // `VideoSource::GstWaylandDisplay`'s doc comment). The capsfilter
+        // (`width`/`height`/`framerate` all fixed) is required, not
+        // cosmetic: `waylanddisplaysrc` has no width/height *property*, only
+        // a wide negotiable caps range with no default resolution of its
+        // own — left unconstrained, it negotiates down to a literal `1x1`
+        // frame (confirmed live: an unconstrained pipeline renders nothing).
+        (VideoSource::GstWaylandDisplay { render_node, width, height, fps }, VideoSink::LocalDisplay) => format!(
+            "waylanddisplaysrc name=waylanddisplaysrc render-node=\"{render_node}\" \
+             ! video/x-raw,width={width},height={height},framerate={fps}/1 \
+             ! videoconvert \
+             ! video/x-raw,format=BGRx \
+             ! appsink name=sink sync=false"
+        ),
+        // `identity name={FPS_CAP_ELEMENT_NAME}` + `install_fps_cap_probe`
+        // (not `videorate`): `waylanddisplaysrc` is a damage/event-driven
+        // source, not PipeWire's own steady stream — `videorate` broke on
+        // exactly this kind of source (see `install_fps_cap_probe`'s doc
+        // comment). No GL/DMA-BUF path even here: `waylanddisplaysrc` is a
+        // comparatively simple/young plugin with no DMA-BUF export of its
+        // own (unlike KWin — see the `PipeWireNode`/`Nvenc` arm above).
+        (VideoSource::GstWaylandDisplay { render_node, width, height, fps }, VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps }) => format!(
+            "waylanddisplaysrc name=waylanddisplaysrc render-node=\"{render_node}\" \
+             ! video/x-raw,width={width},height={height},framerate={fps}/1 \
+             ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
+             ! identity name={FPS_CAP_ELEMENT_NAME} \
+             ! videoconvert \
+             ! video/x-raw,format=I420 \
+             ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
+                       byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=sink sync=false"
+        ),
+        (VideoSource::GstWaylandDisplay { render_node, width, height, fps }, VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps }) => format!(
+            "waylanddisplaysrc name=waylanddisplaysrc render-node=\"{render_node}\" \
+             ! video/x-raw,width={width},height={height},framerate={fps}/1 \
+             ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
+             ! identity name={FPS_CAP_ELEMENT_NAME} \
+             ! video/x-raw \
+             ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
+                         rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=sink sync=false"
+        ),
+        // Login's `appsrc` — see `VideoSource::Login`'s doc comment for how
+        // frames actually reach it (a background thread relays them onto a
+        // channel; `spawn_login_frame_pusher` drains that channel into this
+        // `appsrc`, named `login-appsrc`, once the pipeline built from this
+        // description exists). `caps=` fixes `redfog-login`'s own fixed
+        // `tiny-skia` canvas format/size up front (no negotiable range to
+        // fall back on, same reasoning as `GstWaylandDisplay`'s capsfilter).
+        (VideoSource::Login { width, height, .. }, VideoSink::LocalDisplay) => format!(
+            "appsrc name=login-appsrc format=time is-live=true block=false \
+             caps=video/x-raw,format=RGBA,width={width},height={height},framerate=30/1 \
+             ! videoconvert \
+             ! video/x-raw,format=BGRx \
+             ! appsink name=sink sync=false"
+        ),
+        // Never a GL/DMA-BUF path: `redfog-login`'s `tiny-skia` renderer has
+        // zero GPU/compositor dependency by design, always plain software-
+        // rendered system memory. Confirmed live: requesting `memory:DMABuf`
+        // unconditionally (back when Login and the PipeWire case shared one
+        // downstream-description function) broke the Login stage outright
+        // (`not-negotiated` on `GstAppSrc:login-appsrc`) before ever
+        // reaching the real question of whether KWin/PipeWire has DMA-BUF.
+        (VideoSource::Login { width, height, .. }, VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps }) => format!(
+            "appsrc name=login-appsrc format=time is-live=true block=false \
+             caps=video/x-raw,format=RGBA,width={width},height={height},framerate=30/1 \
+             ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
+             ! identity name={FPS_CAP_ELEMENT_NAME} \
+             ! videoconvert \
+             ! video/x-raw,format=I420 \
+             ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
+                       byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=sink sync=false"
+        ),
+        (VideoSource::Login { width, height, .. }, VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps }) => format!(
+            "appsrc name=login-appsrc format=time is-live=true block=false \
+             caps=video/x-raw,format=RGBA,width={width},height={height},framerate=30/1 \
+             ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
+             ! identity name={FPS_CAP_ELEMENT_NAME} \
+             ! video/x-raw \
+             ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
+                         rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=sink sync=false"
+        ),
+    }
+}
+
+/// Delivers raw BGRx frames for local display — the `viewer` debug tool's
+/// only consumer. Gets its pipeline string from [`video_pipeline_description`]
+/// (the single place that owns every pipeline string this crate builds —
+/// see that function's own doc comment) with [`VideoSink::LocalDisplay`],
+/// same as [`make_encoder_pipeline`] does with [`VideoSink::Encode`].
 pub fn make_pipeline<F>(
     source: VideoSource,
     client_name: &str,
@@ -424,17 +698,14 @@ pub fn make_pipeline<F>(
 where
     F: Fn(bool) + Send + Sync + 'static,
 {
-    let src = source.into_element(client_name, None);
-    let downstream = gst::parse_bin_from_description(
-        "videoconvert ! video/x-raw,format=BGRx ! appsink name=sink sync=false",
-        true,
-    )
-    .expect("downstream bin parse failed");
-
-    let pipeline = gst::Pipeline::new();
-    pipeline.add(&src).expect("failed to add source to pipeline");
-    pipeline.add(&downstream).expect("failed to add downstream bin to pipeline");
-    src.link(&downstream).expect("failed to link source to downstream bin");
+    let full_desc = video_pipeline_description(&source, client_name, 60, &VideoSink::LocalDisplay);
+    let pipeline = gst::parse_launch(&full_desc)
+        .unwrap_or_else(|e| panic!("failed to build local-display pipeline: {e}\n(pipeline description: {full_desc:?})"))
+        .dynamic_cast::<gst::Pipeline>()
+        .expect("gst::parse_launch on a plain top-level description (no bin.(...)) always yields a Pipeline");
+    if let VideoSource::Login { frame_rx, .. } = source {
+        spawn_login_frame_pusher(&pipeline, frame_rx);
+    }
 
     let appsink = pipeline
         .by_name("sink").unwrap()
@@ -540,49 +811,6 @@ pub fn detect_video_encoder() -> VideoEncoder {
     }
 }
 
-/// Split out from `make_encoder_pipeline` purely so this is unit-testable
-/// without needing a live `VideoSource`/capture backend behind it.
-///
-/// Always starts with a passthrough `identity` element (see
-/// `install_fps_cap_probe`'s doc comment for why fps capping is done via a
-/// runtime pad probe attached to it, not embedded in this description
-/// string) — present unconditionally, with `sync=false` (its default) so
-/// it's a true no-op with no clock/latency effect when no probe is
-/// attached, matching the pipeline exactly as it was before fps capping
-/// existed at all.
-fn video_encoder_downstream_description(encoder: VideoEncoder, framerate: Option<u32>, bitrate_kbps: u32) -> String {
-    let framerate_suffix = match framerate {
-        Some(fps) => format!(",framerate={fps}/1"),
-        None => "".to_string(),
-    };
-    match encoder {
-        VideoEncoder::Software => format!(
-            "identity name={FPS_CAP_ELEMENT_NAME} \
-             ! videoconvert \
-             ! video/x-raw,format=I420{framerate_suffix} \
-             ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
-                       byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
-             ! video/x-h264,stream-format=byte-stream,alignment=au \
-             ! appsink name=sink sync=false"
-        ),
-        // `repeat-sequence-header=true` is the NVENC equivalent of
-        // x264enc's default byte-stream SPS/PPS-per-IDR behavior — without
-        // it a client that (re)joins mid-stream, or loses the very first
-        // access unit, never gets a parameter set to decode against.
-        // `zerolatency=true` + `tune=ultra-low-latency` + `rc-mode=cbr`
-        // match the software path's own zerolatency/CBR intent.
-        // `gop-size` is x264enc's `key-int-max` under a different name.
-        VideoEncoder::Nvenc => format!(
-            "identity name={FPS_CAP_ELEMENT_NAME} \
-             ! videoconvert \
-             ! video/x-raw,format=NV12{framerate_suffix} \
-             ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
-                         rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
-             ! video/x-h264,stream-format=byte-stream,alignment=au \
-             ! appsink name=sink sync=false"
-        ),
-    }
-}
 
 /// Installs a buffer probe on `element`'s `src` pad that drops any buffer
 /// arriving less than `1/fps` seconds (measured in real wall-clock time,
@@ -635,6 +863,24 @@ fn install_fps_cap_probe(element: &gst::Element, fps: u32) {
 /// probe via `install_fps_cap_probe` — see its doc comment for why that
 /// mechanism (not `videorate`, which broke this pipeline outright — see
 /// git history) was chosen.
+///
+/// Gets its pipeline string from [`video_pipeline_description`] — the
+/// single place that owns every pipeline string this crate builds, see that
+/// function's own doc comment — with `VideoSink::Encode { encoder,
+/// bitrate_kbps }`. No source is ever a pre-built `gst::Element` glued on
+/// with `.link()` — see `VideoSource`'s doc comment for why that used to be
+/// true for two of the three variants, and why it turned out not to
+/// actually be necessary.
+///
+/// `fps_cap`: for the damage-driven sources (`GstWaylandDisplay`/`Login`),
+/// `None` leaves capture fully dynamic, byte-identical to the pipeline
+/// before fps capping existed at all (the `identity` gate element is still
+/// there, but nothing ever attaches a probe to it, so it's a true no-op);
+/// `Some(fps)` attaches a buffer-drop probe via `install_fps_cap_probe` —
+/// see its doc comment for why that mechanism (not `videorate`, which broke
+/// this pipeline outright for a damage-driven source — see git history) was
+/// chosen. PipeWire's own steady stream paces itself via `videorate`
+/// instead — no probe involved there at all.
 pub fn make_encoder_pipeline<F>(
     source: VideoSource,
     client_name: &str,
@@ -646,14 +892,8 @@ pub fn make_encoder_pipeline<F>(
 where
     F: Fn(Vec<u8>, bool) + Send + Sync + 'static,
 {
-    let is_pipewire = matches!(source, VideoSource::PipeWireNode(_));
-    let framerate = if is_pipewire {
-        Some(fps_cap.unwrap_or(60))
-    } else {
-        None
-    };
-    let src = source.into_element(client_name, fps_cap);
-    let downstream_desc = video_encoder_downstream_description(encoder, framerate, bitrate_kbps);
+    let fps = fps_cap.unwrap_or(60);
+    let full_desc = video_pipeline_description(&source, client_name, fps, &VideoSink::Encode { encoder, bitrate_kbps });
     // Named/self-contained panic message (not a bare `.expect()`) so a
     // missing/broken encoder plugin says exactly that, rather than a
     // generic "parse failed" with no indication of *which* encoder or
@@ -661,24 +901,26 @@ where
     // comment warns about (plugin registered but unhealthy driver/no GPU),
     // and it's much more common in practice than a typo in the pipeline
     // description string.
-    let downstream = gst::parse_bin_from_description(&downstream_desc, true).unwrap_or_else(|e| {
-        panic!(
-            "failed to build the {encoder:?} video encoder pipeline: {e}\n\
-             (pipeline description: {downstream_desc:?})\n\
-             If this is Nvenc, force REDFOG_VIDEO_ENCODER=software to rule out a broken/mismatched NVENC driver install."
-        )
-    });
-    if !is_pipewire {
+    let pipeline = gst::parse_launch(&full_desc)
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to build the {encoder:?} video pipeline: {e}\n\
+                 (pipeline description: {full_desc:?})\n\
+                 If this is Nvenc, force REDFOG_VIDEO_ENCODER=software to rule out a broken/mismatched NVENC driver install."
+            )
+        })
+        .dynamic_cast::<gst::Pipeline>()
+        .expect("gst::parse_launch on a plain top-level description (no bin.(...)) always yields a Pipeline");
+
+    if !matches!(source, VideoSource::PipeWireNode(_)) {
         if let Some(fps) = fps_cap.filter(|&fps| fps > 0) {
-            let gate = downstream.by_name(FPS_CAP_ELEMENT_NAME).expect("identity gate element always present");
+            let gate = pipeline.by_name(FPS_CAP_ELEMENT_NAME).expect("identity gate element always present for a damage-driven source");
             install_fps_cap_probe(&gate, fps);
         }
     }
-
-    let pipeline = gst::Pipeline::new();
-    pipeline.add(&src).expect("failed to add source to pipeline");
-    pipeline.add(&downstream).expect("failed to add downstream bin to pipeline");
-    src.link(&downstream).expect("failed to link source to downstream bin");
+    if let VideoSource::Login { frame_rx, .. } = source {
+        spawn_login_frame_pusher(&pipeline, frame_rx);
+    }
 
     let appsink = pipeline
         .by_name("sink").unwrap()
@@ -900,13 +1142,108 @@ mod tests {
         assert_eq!(detect_video_encoder(), expected);
     }
 
-    /// Cheap sanity check that the gate element is always present — no
-    /// GStreamer pipeline needed, just the description string.
+    /// Cheap sanity check that the fps-cap gate element is present for the
+    /// damage-driven sources' `Encode` arms — no GStreamer pipeline needed,
+    /// just the description string. `videorate`-based pacing (`PipeWireNode`)
+    /// never has this gate at all.
     #[test]
-    fn downstream_description_always_has_the_fps_cap_gate() {
-        let desc = video_encoder_downstream_description(VideoEncoder::Software, None, 10_000);
-        assert!(desc.contains(&format!("identity name={FPS_CAP_ELEMENT_NAME}")), "pipeline description: {desc}");
-        assert!(!desc.contains("videorate"), "pipeline description: {desc}");
+    fn damage_driven_sources_have_the_fps_cap_gate() {
+        let gst_wayland_display = video_pipeline_description(
+            &VideoSource::GstWaylandDisplay { render_node: "software".to_string(), width: 1280, height: 720, fps: 60 },
+            "test-client",
+            60,
+            &VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps: 10_000 },
+        );
+        assert!(gst_wayland_display.contains(&format!("identity name={FPS_CAP_ELEMENT_NAME}")), "pipeline description: {gst_wayland_display}");
+        assert!(!gst_wayland_display.contains("videorate"), "pipeline description: {gst_wayland_display}");
+
+        let (login_tx, login_rx) = std::sync::mpsc::channel();
+        drop(login_tx);
+        let login = video_pipeline_description(
+            &VideoSource::Login { frame_rx: login_rx, width: 1280, height: 720 },
+            "test-client",
+            60,
+            &VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps: 10_000 },
+        );
+        assert!(login.contains(&format!("identity name={FPS_CAP_ELEMENT_NAME}")), "pipeline description: {login}");
+        assert!(!login.contains("videorate"), "pipeline description: {login}");
+    }
+
+    /// Neither `VideoSource::GstWaylandDisplay` nor `VideoSource::Login` can
+    /// ever satisfy a `memory:DMABuf` caps request (see `video_pipeline_
+    /// description`'s doc comment). Confirmed live for Login specifically:
+    /// requesting it unconditionally (back when Login and the PipeWire case
+    /// shared one downstream-description function) broke the Login stage
+    /// outright (`not-negotiated` on `GstAppSrc:login-appsrc`) before the
+    /// pipeline ever got as far as the real PipeWire capture this was meant
+    /// to test — exactly the kind of mistake having every combination
+    /// spelled out explicitly, in one match, should make structurally
+    /// harder to make again.
+    #[test]
+    fn only_the_pipewire_pipeline_requests_dmabuf() {
+        let (login_tx, login_rx) = std::sync::mpsc::channel();
+        drop(login_tx);
+        let login = video_pipeline_description(
+            &VideoSource::Login { frame_rx: login_rx, width: 1280, height: 720 },
+            "test-client",
+            60,
+            &VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps: 10_000 },
+        );
+        assert!(!login.contains("DMABuf"), "Login pipeline description: {login}");
+        assert!(!login.contains("glupload"), "Login pipeline description: {login}");
+
+        let gst_wayland_display = video_pipeline_description(
+            &VideoSource::GstWaylandDisplay { render_node: "software".to_string(), width: 1280, height: 720, fps: 60 },
+            "test-client",
+            60,
+            &VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps: 10_000 },
+        );
+        assert!(!gst_wayland_display.contains("DMABuf"), "gst-wayland-display pipeline description: {gst_wayland_display}");
+        assert!(!gst_wayland_display.contains("glupload"), "gst-wayland-display pipeline description: {gst_wayland_display}");
+
+        let pipewire = video_pipeline_description(
+            &VideoSource::PipeWireNode(56),
+            "test-client",
+            120,
+            &VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps: 10_000 },
+        );
+        assert!(pipewire.contains("DMABuf"), "PipeWire pipeline description: {pipewire}");
+        assert!(pipewire.contains("glupload"), "PipeWire pipeline description: {pipewire}");
+    }
+
+    /// Real `gst::parse_launch` syntax/structure check for the `Software`
+    /// encoder — string-content assertions (like the test above) can't
+    /// catch a genuine grammar mistake (unbalanced parens, a bad property
+    /// name, etc.) in the generated description. Doesn't need a live
+    /// PipeWire node behind it: constructing/parsing a `pipewiresrc`
+    /// element doesn't itself connect to anything — that only happens on
+    /// the state change to `READY`/`PAUSED`, which this test never makes.
+    ///
+    /// `Nvenc` deliberately isn't checked here, and can't be with a fake
+    /// node id — confirmed while writing this test: `pipewiresrc`'s static
+    /// pad template caps are `ANY` (`gst-inspect-1.0 pipewiresrc`; it only
+    /// knows its *real* caps once actually connected to a live node), so
+    /// `gst_parse_launch`'s structural link check for the `Nvenc` arm's
+    /// explicit `video/x-raw(memory:DMABuf)` caps filter fails immediately
+    /// against a non-existent node ("queue1 can't handle caps
+    /// video/x-raw(memory:DMABuf)") — not because the pipeline description
+    /// is wrong, but because there's nothing live upstream to negotiate
+    /// concrete caps against. That's a real, load-bearing gap in what this
+    /// crate can verify offline: whether DMA-BUF is actually negotiable at
+    /// all is only knowable against a real, running KWin/PipeWire capture
+    /// (confirmed live, separately, that it does successfully negotiate
+    /// there).
+    #[test]
+    fn pipewire_pipeline_description_parses_for_software_encoder() {
+        gst::init().expect("gst::init");
+        let desc = video_pipeline_description(
+            &VideoSource::PipeWireNode(999_999),
+            "parse-check",
+            120,
+            &VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps: 10_000 },
+        );
+        let el = gst::parse_launch(&desc).unwrap_or_else(|e| panic!("pipeline failed to parse: {e}\n{desc}"));
+        assert!(el.dynamic_cast::<gst::Pipeline>().is_ok(), "pipeline description: {desc}");
     }
 
     /// Real, live pipeline test — the whole reason `videorate` shipped
