@@ -289,6 +289,7 @@ pub struct SessionManager {
     /// reason they are: a fresh RTSP session shouldn't inherit a previous,
     /// unrelated connection's degraded state.
     current_bitrate_kbps: AtomicU32,
+    target_bitrate_kbps: AtomicU32,
     /// Unique per-attempt id passed to the broker's `SpawnSession` — avoids
     /// systemd unit name collisions across successive launch/cancel cycles
     /// within the same `redfog-server` process lifetime.
@@ -396,6 +397,7 @@ impl SessionManager {
             audio_packetizer: Mutex::new(Arc::new(Mutex::new(AudioPacketizer::new()))),
             stream_start: Mutex::new(std::time::Instant::now()),
             current_bitrate_kbps: AtomicU32::new(bitrate_kbps),
+            target_bitrate_kbps: AtomicU32::new(bitrate_kbps),
             next_broker_session_id: AtomicU64::new(0),
             next_generation: AtomicU64::new(0),
             authenticated_username: Mutex::new(None),
@@ -648,7 +650,7 @@ impl SessionManager {
         *self.video_packetizer.lock().unwrap() = Arc::new(Mutex::new(VideoPacketizer::new()));
         *self.audio_packetizer.lock().unwrap() = Arc::new(Mutex::new(AudioPacketizer::new()));
         *self.stream_start.lock().unwrap() = std::time::Instant::now();
-        self.current_bitrate_kbps.store(self.config.bitrate_kbps, std::sync::atomic::Ordering::Relaxed);
+        self.current_bitrate_kbps.store(self.target_bitrate_kbps.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// An owned `Arc<Self>` for moving into spawned tasks — trait methods
@@ -779,7 +781,7 @@ impl SessionManager {
         // `/launch`, before RTSP `PLAY` creates them (see `on_play`). Look
         // the *current* sender up fresh on every frame via `self`, rather
         // than capturing today's (always-`None`) value once here.
-        let bitrate = self.config.bitrate_kbps;
+        let bitrate = self.target_bitrate_kbps.load(std::sync::atomic::Ordering::Relaxed);
         let video_encoder = self.config.video_encoder;
         let this = self.arc_self();
         // `video_packetizer`/`audio_packetizer`/`stream_start` are looked up
@@ -1899,9 +1901,23 @@ fn discard_running_session(mut session: RunningSession) {
 }
 
 impl RtspHandler for SessionManager {
-    fn on_announce(&self, _params: AnnouncedParams) {
-        // v1: resolution/fps were already fixed at spawn time from /launch's
-        // params; ANNOUNCE's values aren't applied yet (see plan doc).
+    fn on_announce(&self, params: AnnouncedParams) {
+        if let Some(bitrate_kbps) = params.bitrate_kbps {
+            tracing::info!("RTSP ANNOUNCE: client requested bitrate {} kbps", bitrate_kbps);
+            self.target_bitrate_kbps.store(bitrate_kbps, std::sync::atomic::Ordering::Relaxed);
+            self.current_bitrate_kbps.store(bitrate_kbps, std::sync::atomic::Ordering::Relaxed);
+
+            // Apply it to the active pipeline encoder immediately if it exists
+            let shared = self.shared.lock().unwrap();
+            let active_pipeline = match &shared.state {
+                State::Launched { session } => Some(&session.video_pipeline),
+                State::Streaming { session } => Some(&session.video_pipeline),
+                _ => None,
+            };
+            if let Some(pipeline) = active_pipeline {
+                redfog_core::set_encoder_bitrate(pipeline, bitrate_kbps);
+            }
+        }
     }
 
     fn on_play(&self) {
@@ -2185,7 +2201,7 @@ impl ControlEventHandler for SessionManager {
         let next_frame_number = self.video_packetizer.lock().unwrap().clone().lock().unwrap().next_frame_number();
         let frames_behind = (next_frame_number as u64).saturating_sub(last_good_frame);
 
-        let target_kbps = self.config.bitrate_kbps;
+        let target_kbps = self.target_bitrate_kbps.load(std::sync::atomic::Ordering::Relaxed);
         let current_kbps = self.current_bitrate_kbps.load(std::sync::atomic::Ordering::Relaxed);
         let new_kbps = adapt_bitrate_kbps(current_kbps, target_kbps, frames_behind);
         // Every report, not just ones that actually change anything —

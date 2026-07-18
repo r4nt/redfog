@@ -208,6 +208,7 @@ impl RtspServer {
 
     fn parse_announce(&self, body: &[u8]) -> AnnouncedParams {
         let text = String::from_utf8_lossy(body);
+        tracing::info!("RTSP ANNOUNCE SDP body:\n{}", text);
         let mut width = self.default_width;
         let mut height = self.default_height;
         let mut fps = self.default_fps;
@@ -225,7 +226,7 @@ impl RtspServer {
                 "clientViewportWd" => width = value.parse().unwrap_or(width),
                 "clientViewportHt" => height = value.parse().unwrap_or(height),
                 "maxFPS" => fps = value.parse().unwrap_or(fps),
-                "initialBitrate" => bitrate_kbps = value.parse().ok(),
+                "initialBitrateKbps" => bitrate_kbps = value.parse().ok(),
                 _ => {}
             }
         }
@@ -313,5 +314,12 @@ mod tests {
         assert_eq!(params.height, 720);
         assert_eq!(params.fps, 60); // fell back to default, wasn't in the body
         assert_eq!(params.bitrate_kbps, None);
+    }
+
+    #[test]
+    fn announce_parses_initial_bitrate_kbps() {
+        let body = "a=x-nv-video[0].initialBitrateKbps:1500\r\n";
+        let params = server().parse_announce(body.as_bytes());
+        assert_eq!(params.bitrate_kbps, Some(1500));
     }
 }

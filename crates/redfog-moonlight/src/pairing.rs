@@ -427,6 +427,7 @@ impl PairingServer {
     // all — confirmed live. `spawn_blocking` runs it on tokio's separate,
     // much larger blocking-thread pool instead.
     async fn launch(&self, params: &HashMap<String, String>, local_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
+        tracing::info!("HTTP /launch query parameters: {:?}", params);
         let (width, height, fps) = Self::parse_mode(params);
 
         let Some(rikey) = self.parse_rikey(params) else {
