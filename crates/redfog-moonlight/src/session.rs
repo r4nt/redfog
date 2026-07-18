@@ -20,9 +20,9 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use redfog_core::{AudioLoopback, InputSink, SessionType};
 pub use session_backend::Backend;
@@ -82,6 +82,14 @@ struct RunningSession {
     kind: SessionType,
     width: u32,
     height: u32,
+    /// The client's requested fps from `/launch`'s `mode=WxHxFPS` — carried
+    /// across a Login->User handoff the same way `width`/`height` are (see
+    /// `handoff_to_user`), so the same cap applies to both stages of one
+    /// RTSP session. Used to build `Option<u32>` fps caps for
+    /// `build_pipelines`/`make_encoder_pipeline` — see
+    /// `redfog_core::make_encoder_pipeline`'s doc comment for why `None`
+    /// (not just a very high number) is kept as a real, distinct option.
+    fps: u32,
     /// `Option` purely so `Drop` (see below) and `discard_running_session`/
     /// `handoff_to_user`'s Login teardown can each take it out via
     /// `Option::take` — a plain field can't be partially moved out of a
@@ -274,6 +282,13 @@ pub struct SessionManager {
     video_packetizer: Mutex<Arc<Mutex<VideoPacketizer>>>,
     audio_packetizer: Mutex<Arc<Mutex<AudioPacketizer>>>,
     stream_start: Mutex<std::time::Instant>,
+    /// Server-side adaptive bitrate's current target — starts at (and
+    /// recovers back up toward) `config.bitrate_kbps` as a ceiling, stepped
+    /// down when `on_loss_stats` sees the client falling behind. Reset
+    /// alongside the packetizers on a genuinely new `/launch` for the same
+    /// reason they are: a fresh RTSP session shouldn't inherit a previous,
+    /// unrelated connection's degraded state.
+    current_bitrate_kbps: AtomicU32,
     /// Unique per-attempt id passed to the broker's `SpawnSession` — avoids
     /// systemd unit name collisions across successive launch/cancel cycles
     /// within the same `redfog-server` process lifetime.
@@ -323,8 +338,45 @@ struct SelectedSession {
     glx_vendor: Option<String>,
 }
 
+/// Tracks encoded video output over a rolling window and reports fps/kbps
+/// at INFO on an interval, instead of one DEBUG line per frame — so
+/// `RUST_LOG=info` (the normal default) shows whether the fps cap
+/// negotiated at spawn (`spawn_session`'s startup log) is what's actually
+/// being delivered, without either per-frame log volume or needing to
+/// parse timestamps out of DEBUG output by hand.
+struct EncodedFrameStats {
+    window_start: Instant,
+    frames: u32,
+    bytes: u64,
+}
+
+impl EncodedFrameStats {
+    const REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self { window_start: Instant::now(), frames: 0, bytes: 0 }
+    }
+
+    /// Returns `Some((fps, kbps))` once `REPORT_INTERVAL` has elapsed since
+    /// the window started, resetting it; `None` otherwise.
+    fn record(&mut self, frame_bytes: usize) -> Option<(f64, f64)> {
+        self.frames += 1;
+        self.bytes += frame_bytes as u64;
+        let elapsed = self.window_start.elapsed();
+        if elapsed < Self::REPORT_INTERVAL {
+            return None;
+        }
+        let secs = elapsed.as_secs_f64();
+        let fps = self.frames as f64 / secs;
+        let kbps = (self.bytes as f64 * 8.0 / 1000.0) / secs;
+        *self = Self::new();
+        Some((fps, kbps))
+    }
+}
+
 impl SessionManager {
     pub fn new(config: SessionConfig) -> Arc<Self> {
+        let bitrate_kbps = config.bitrate_kbps;
         let this = Arc::new(Self {
             config,
             shared: Mutex::new(Shared {
@@ -343,6 +395,7 @@ impl SessionManager {
             video_packetizer: Mutex::new(Arc::new(Mutex::new(VideoPacketizer::new()))),
             audio_packetizer: Mutex::new(Arc::new(Mutex::new(AudioPacketizer::new()))),
             stream_start: Mutex::new(std::time::Instant::now()),
+            current_bitrate_kbps: AtomicU32::new(bitrate_kbps),
             next_broker_session_id: AtomicU64::new(0),
             next_generation: AtomicU64::new(0),
             authenticated_username: Mutex::new(None),
@@ -595,6 +648,7 @@ impl SessionManager {
         *self.video_packetizer.lock().unwrap() = Arc::new(Mutex::new(VideoPacketizer::new()));
         *self.audio_packetizer.lock().unwrap() = Arc::new(Mutex::new(AudioPacketizer::new()));
         *self.stream_start.lock().unwrap() = std::time::Instant::now();
+        self.current_bitrate_kbps.store(self.config.bitrate_kbps, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// An owned `Arc<Self>` for moving into spawned tasks — trait methods
@@ -713,7 +767,7 @@ impl SessionManager {
     /// tried to reconnect), not from rebuilding fresh ones as such.
     /// `rebuild_for_resume` avoids that by never waiting on the old
     /// pipeline's teardown at all.
-    fn build_pipelines(&self, compositor: &SpawnedCompositor, audio_loopback: &AudioLoopback, generation: u64) -> (gstreamer::Pipeline, gstreamer::Pipeline) {
+    fn build_pipelines(&self, compositor: &SpawnedCompositor, audio_loopback: &AudioLoopback, generation: u64, fps_cap: Option<u32>) -> (gstreamer::Pipeline, gstreamer::Pipeline) {
         // GStreamer's appsink callbacks run on GStreamer's own streaming
         // threads, not tokio worker threads — `tokio::spawn` would panic
         // there ("no reactor running"). Capture a `Handle` (valid from any
@@ -749,11 +803,16 @@ impl SessionManager {
         // confirmed live via matching mutex addresses across generations.
         let video_client_name = format!("redfog-video-gen-{generation}");
         let audio_client_name = format!("redfog-audio-gen-{generation}");
-        let video_pipeline = redfog_core::make_encoder_pipeline(compositor.video_source(), &video_client_name, video_encoder, bitrate, {
+        let video_stats = Arc::new(Mutex::new(EncodedFrameStats::new()));
+        let video_pipeline = redfog_core::make_encoder_pipeline(compositor.video_source(), &video_client_name, video_encoder, fps_cap, bitrate, {
             let handle = handle.clone();
             let this = this.clone();
+            let video_stats = video_stats.clone();
             move |data, is_key_frame| {
                 tracing::debug!("video encoder produced {} bytes, key_frame={is_key_frame}", data.len());
+                if let Some((fps, kbps)) = video_stats.lock().unwrap().record(data.len()) {
+                    tracing::info!("video: {fps:.1} fps, {kbps:.0} kbps (generation={generation})");
+                }
                 let sender = {
                     let shared = this.shared.lock().unwrap();
                     // See `Shared::active_generation`'s doc comment: a
@@ -895,6 +954,7 @@ impl SessionManager {
         kind: SessionType,
         width: u32,
         height: u32,
+        fps: u32,
         compositor: SpawnedCompositor,
         broker_session_id: Option<String>,
     ) -> Result<RunningSession, String> {
@@ -917,12 +977,22 @@ impl SessionManager {
         // spawn, never regenerated across a resume (resume reuses this
         // same pipeline, not a fresh `spawn_session` call).
         let generation = self.next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (video_pipeline, audio_pipeline) = self.build_pipelines(&compositor, &audio_loopback, generation);
+        // `fps == 0` (shouldn't happen from a real client — parse_mode's
+        // fallback is 60 — but defensively) means uncapped, same as never
+        // having requested a cap at all.
+        let fps_cap = (fps > 0).then_some(fps);
+        tracing::info!(
+            "spawn_session({kind:?}, generation={generation}): {width}x{height}, encoder={:?}, bitrate_ceiling={}kbps, fps_cap={fps_cap:?}",
+            self.config.video_encoder,
+            self.config.bitrate_kbps,
+        );
+        let (video_pipeline, audio_pipeline) = self.build_pipelines(&compositor, &audio_loopback, generation, fps_cap);
 
         Ok(RunningSession {
             kind,
             width,
             height,
+            fps,
             compositor: Some(compositor),
             input_forwarder,
             video_pipeline,
@@ -1408,7 +1478,7 @@ impl SessionManager {
                 }
             }
         };
-        let (width, height) = (old_login.width, old_login.height);
+        let (width, height, fps) = (old_login.width, old_login.height, old_login.fps);
 
         // Detached, not awaited — the old Login's pipelines/compositor are
         // independent objects the *new* session never touches, so there's
@@ -1466,7 +1536,7 @@ impl SessionManager {
                 let spawn_start = std::time::Instant::now();
                 let (compositor, username, broker_session_id) = self.spawn_user_compositor(width, height).await?;
                 tracing::info!("handoff_to_user: spawn_user_compositor for {username} finished after {:?}", spawn_start.elapsed());
-                (self.spawn_session(SessionType::User(username), width, height, compositor, broker_session_id)?, false)
+                (self.spawn_session(SessionType::User(username), width, height, fps, compositor, broker_session_id)?, false)
             }
         };
         tracing::info!("handoff_to_user: calling start_streaming (is_resume={is_resume}) after {:?} total so far", handoff_start.elapsed());
@@ -1477,7 +1547,7 @@ impl SessionManager {
 }
 
 impl LaunchHandler for SessionManager {
-    fn launch(&self, width: u32, height: u32, _fps: u32, rikey: RemoteInputKey) -> Result<(), String> {
+    fn launch(&self, width: u32, height: u32, fps: u32, rikey: RemoteInputKey) -> Result<(), String> {
         let was_idle;
         let taken;
         {
@@ -1549,7 +1619,7 @@ impl LaunchHandler for SessionManager {
         // nothing will ever notify.
         let spawn_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let compositor = self.spawn_login_compositor(width, height)?;
-            self.spawn_session(SessionType::Login, width, height, compositor, None)
+            self.spawn_session(SessionType::Login, width, height, fps, compositor, None)
         }));
         let session = match spawn_result {
             Ok(Ok(session)) => session,
@@ -2092,6 +2162,99 @@ impl ControlEventHandler for SessionManager {
         if let State::Streaming { session } = &shared.state {
             redfog_core::request_keyframe(&session.video_pipeline);
         }
+    }
+
+    /// Server-side adaptive bitrate — see `redfog_core::set_encoder_bitrate`'s
+    /// doc comment for why pure bitrate changes need no client cooperation
+    /// beyond this already-standard report. Heuristic, not scientifically
+    /// tuned (no access to real Sunshine's own constants) — multiplicative
+    /// step down when the client's reported `last_good_frame` is
+    /// meaningfully behind the frame we've actually just sent (a real,
+    /// direct sign it's not keeping up), multiplicative recovery once it's
+    /// caught back up, dead zone in between so single-frame jitter doesn't
+    /// cause visible oscillation. Never exceeds `config.bitrate_kbps` — that
+    /// stays the ceiling, not just a starting point.
+    fn on_loss_stats(&self, last_good_frame: u64) {
+        let video_pipeline = {
+            let shared = self.shared.lock().unwrap();
+            let State::Streaming { session } = &shared.state else { return };
+            session.video_pipeline.clone()
+        };
+
+        let next_frame_number = self.video_packetizer.lock().unwrap().clone().lock().unwrap().next_frame_number();
+        let frames_behind = (next_frame_number as u64).saturating_sub(last_good_frame);
+
+        let target_kbps = self.config.bitrate_kbps;
+        let current_kbps = self.current_bitrate_kbps.load(std::sync::atomic::Ordering::Relaxed);
+        let new_kbps = adapt_bitrate_kbps(current_kbps, target_kbps, frames_behind);
+        // Every report, not just ones that actually change anything —
+        // otherwise there's no way to see this loop is even running (e.g.
+        // to confirm it's just correctly deciding not to act) short of
+        // instrumenting the client itself.
+        tracing::debug!("loss stats: last_good_frame={last_good_frame} next_frame_number={next_frame_number} frames_behind={frames_behind} current_bitrate={current_kbps}kbps");
+
+        if new_kbps != current_kbps {
+            self.current_bitrate_kbps.store(new_kbps, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!("adaptive bitrate: {current_kbps} -> {new_kbps} kbps (frames_behind={frames_behind})");
+            redfog_core::set_encoder_bitrate(&video_pipeline, new_kbps);
+        }
+    }
+}
+
+/// Pure decision function for `on_loss_stats`'s server-side adaptive
+/// bitrate — split out from it purely so the actual heuristic is
+/// unit-testable without a running session/pipeline behind it. See that
+/// method's own doc comment for the reasoning (multiplicative step
+/// down/up, dead zone, ceiling never exceeds `target_kbps`).
+fn adapt_bitrate_kbps(current_kbps: u32, target_kbps: u32, frames_behind: u64) -> u32 {
+    let floor_kbps = (target_kbps / 4).max(1_000);
+    if frames_behind > 3 {
+        (current_kbps * 85 / 100).max(floor_kbps)
+    } else if frames_behind <= 1 {
+        (current_kbps * 105 / 100).min(target_kbps)
+    } else {
+        current_kbps
+    }
+}
+
+#[cfg(test)]
+mod adaptive_bitrate_tests {
+    use super::adapt_bitrate_kbps;
+
+    #[test]
+    fn steps_down_when_client_falls_behind() {
+        assert_eq!(adapt_bitrate_kbps(10_000, 10_000, 4), 8_500);
+    }
+
+    #[test]
+    fn recovers_up_when_caught_up() {
+        assert_eq!(adapt_bitrate_kbps(8_000, 10_000, 0), 8_400);
+        assert_eq!(adapt_bitrate_kbps(8_000, 10_000, 1), 8_400);
+    }
+
+    #[test]
+    fn dead_zone_leaves_bitrate_unchanged() {
+        assert_eq!(adapt_bitrate_kbps(8_000, 10_000, 2), 8_000);
+        assert_eq!(adapt_bitrate_kbps(8_000, 10_000, 3), 8_000);
+    }
+
+    #[test]
+    fn never_recovers_past_target_ceiling() {
+        assert_eq!(adapt_bitrate_kbps(9_900, 10_000, 0), 10_000);
+    }
+
+    #[test]
+    fn never_drops_below_floor() {
+        // floor is max(target/4, 1000) = 2_500 for a 10_000 target.
+        assert_eq!(adapt_bitrate_kbps(2_600, 10_000, 10), 2_500);
+        assert_eq!(adapt_bitrate_kbps(2_500, 10_000, 10), 2_500);
+    }
+
+    #[test]
+    fn floor_has_an_absolute_minimum_for_low_targets() {
+        // target/4 would be 500 for a 2_000 target, but the floor never
+        // goes below 1_000 regardless of how low the configured target is.
+        assert_eq!(adapt_bitrate_kbps(1_050, 2_000, 10), 1_000);
     }
 }
 

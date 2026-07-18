@@ -64,6 +64,17 @@ impl VideoPacketizer {
         Self { sequence_number: 0, frame_number: 1 }
     }
 
+    /// The frame number that will be assigned to the *next* `packetize()`
+    /// call — i.e. one past the last frame actually sent. Used by adaptive
+    /// bitrate to compare against a client's self-reported `last_good_frame`
+    /// (same numbering space: it's this exact counter, embedded in every
+    /// shard's header, that the client's depayloader tracks and echoes
+    /// back). Being one ahead of the true last-sent value doesn't matter —
+    /// this only feeds a threshold-based heuristic, not exact arithmetic.
+    pub fn next_frame_number(&self) -> u32 {
+        self.frame_number
+    }
+
     /// Packetize one encoded access unit. Returns the shards to send, in order.
     pub fn packetize(&mut self, encoded_data: &[u8], is_key_frame: bool, rtp_timestamp: u32) -> Vec<Vec<u8>> {
         let frame_number = self.frame_number;

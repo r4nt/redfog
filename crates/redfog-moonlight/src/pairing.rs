@@ -384,6 +384,34 @@ impl PairingServer {
         Some(RemoteInputKey { key, key_id })
     }
 
+    /// The client's requested resolution/fps, `(width, height, fps)`.
+    ///
+    /// Real clients send a single combined `mode` param
+    /// (`"{width}x{height}x{fps}"`, e.g. `mode=1920x1080x30` — confirmed
+    /// against moonlight-common-rust's own launch-request builder,
+    /// `http/launch.rs`: `key: "mode"`, not vendored into git, see
+    /// scripts/fetch-patched-deps.sh) — there are no separate `width=`/
+    /// `height=`/`fps=` query params in the real protocol at all. A
+    /// previous version of this function looked for exactly those three
+    /// separate keys, which real requests never contain, so it silently
+    /// fell back to the hardcoded 1920x1080x60 default on *every* launch,
+    /// completely ignoring whatever resolution the client actually
+    /// requested — confirmed live against a real captured `/launch` URL,
+    /// which only ever had `mode=1920x1080x30`, no `width`/`height`/`fps`
+    /// keys at all.
+    fn parse_mode(params: &HashMap<String, String>) -> (u32, u32, u32) {
+        const DEFAULT: (u32, u32, u32) = (1920, 1080, 60);
+        let Some(mode) = params.get("mode") else { return DEFAULT };
+        let mut parts = mode.split('x');
+        let (Some(width), Some(height), Some(fps)) = (parts.next(), parts.next(), parts.next()) else {
+            return DEFAULT;
+        };
+        let (Ok(width), Ok(height), Ok(fps)) = (width.parse(), height.parse(), fps.parse()) else {
+            return DEFAULT;
+        };
+        (width, height, fps)
+    }
+
     fn unpair(&self, _params: &HashMap<String, String>) -> Response<Full<Bytes>> {
         // TODO: actually remove from the paired-clients store once ClientManager exposes that.
         xml_response(paired_xml(""))
@@ -399,9 +427,7 @@ impl PairingServer {
     // all — confirmed live. `spawn_blocking` runs it on tokio's separate,
     // much larger blocking-thread pool instead.
     async fn launch(&self, params: &HashMap<String, String>, local_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
-        let width = params.get("width").and_then(|s| s.parse().ok()).unwrap_or(1920);
-        let height = params.get("height").and_then(|s| s.parse().ok()).unwrap_or(1080);
-        let fps = params.get("fps").and_then(|s| s.parse().ok()).unwrap_or(60);
+        let (width, height, fps) = Self::parse_mode(params);
 
         let Some(rikey) = self.parse_rikey(params) else {
             return bad_request("missing/invalid rikey/rikeyid".to_string());
@@ -534,4 +560,52 @@ fn bad_request(message: String) -> Response<Full<Bytes>> {
 
 fn not_found() -> Response<Full<Bytes>> {
     Response::builder().status(404).body(Full::new(Bytes::new())).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards the actual bug found live: a real client sends a single
+    /// combined `mode` param (`mode=1920x1080x30`), never separate
+    /// `width`/`height`/`fps` keys — an earlier version of this parser
+    /// looked for exactly those separate keys, which real requests never
+    /// contain, so every real launch silently used the hardcoded default
+    /// resolution regardless of what was actually requested.
+    #[test]
+    fn parses_real_client_mode_param() {
+        let mut params = HashMap::new();
+        params.insert("mode".to_string(), "1280x720x30".to_string());
+        assert_eq!(PairingServer::parse_mode(&params), (1280, 720, 30));
+    }
+
+    #[test]
+    fn falls_back_to_default_when_mode_is_missing() {
+        let params = HashMap::new();
+        assert_eq!(PairingServer::parse_mode(&params), (1920, 1080, 60));
+    }
+
+    #[test]
+    fn falls_back_to_default_when_mode_is_malformed() {
+        let mut params = HashMap::new();
+        params.insert("mode".to_string(), "not-a-mode".to_string());
+        assert_eq!(PairingServer::parse_mode(&params), (1920, 1080, 60));
+
+        let mut params = HashMap::new();
+        params.insert("mode".to_string(), "1280x720".to_string()); // missing fps
+        assert_eq!(PairingServer::parse_mode(&params), (1920, 1080, 60));
+    }
+
+    /// The literal separate `width`/`height`/`fps` keys the old (buggy)
+    /// parser looked for must NOT be picked up even if present — `mode` is
+    /// the only real source of truth, matching moonlight-common-rust's own
+    /// launch-request builder.
+    #[test]
+    fn ignores_separate_width_height_fps_keys() {
+        let mut params = HashMap::new();
+        params.insert("width".to_string(), "640".to_string());
+        params.insert("height".to_string(), "480".to_string());
+        params.insert("fps".to_string(), "15".to_string());
+        assert_eq!(PairingServer::parse_mode(&params), (1920, 1080, 60));
+    }
 }

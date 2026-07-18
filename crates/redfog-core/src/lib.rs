@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, Child};
 use std::sync::{Arc, Mutex};
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
@@ -448,6 +449,12 @@ where
 /// force-key-unit event generically.
 const ENCODER_ELEMENT_NAME: &str = "enc";
 
+/// Name of the always-present `identity` element at the head of the
+/// downstream encoder bin — see `install_fps_cap_probe`'s doc comment for
+/// why capping is done via a runtime pad probe on this element rather than
+/// embedded in the pipeline description string itself.
+const FPS_CAP_ELEMENT_NAME: &str = "fps_cap_gate";
+
 /// Which H.264 encoder [`make_encoder_pipeline`] builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoEncoder {
@@ -513,23 +520,21 @@ pub fn detect_video_encoder() -> VideoEncoder {
     }
 }
 
-/// Capture -> H.264 encode pipeline for network streaming (as opposed to
-/// [`make_pipeline`]'s raw-BGRx path for local display). Delivers Annex-B
-/// access units (one per encoded frame) to `on_access_unit(bytes, is_keyframe)`.
-pub fn make_encoder_pipeline<F>(
-    source: VideoSource,
-    client_name: &str,
-    encoder: VideoEncoder,
-    bitrate_kbps: u32,
-    on_access_unit: F,
-) -> gst::Pipeline
-where
-    F: Fn(Vec<u8>, bool) + Send + Sync + 'static,
-{
-    let src = source.into_element(client_name);
-    let downstream_desc = match encoder {
+/// Split out from `make_encoder_pipeline` purely so this is unit-testable
+/// without needing a live `VideoSource`/capture backend behind it.
+///
+/// Always starts with a passthrough `identity` element (see
+/// `install_fps_cap_probe`'s doc comment for why fps capping is done via a
+/// runtime pad probe attached to it, not embedded in this description
+/// string) — present unconditionally, with `sync=false` (its default) so
+/// it's a true no-op with no clock/latency effect when no probe is
+/// attached, matching the pipeline exactly as it was before fps capping
+/// existed at all.
+fn video_encoder_downstream_description(encoder: VideoEncoder, bitrate_kbps: u32) -> String {
+    match encoder {
         VideoEncoder::Software => format!(
-            "videoconvert \
+            "identity name={FPS_CAP_ELEMENT_NAME} \
+             ! videoconvert \
              ! video/x-raw,format=I420 \
              ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
                        byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
@@ -544,14 +549,81 @@ where
         // match the software path's own zerolatency/CBR intent.
         // `gop-size` is x264enc's `key-int-max` under a different name.
         VideoEncoder::Nvenc => format!(
-            "videoconvert \
+            "identity name={FPS_CAP_ELEMENT_NAME} \
+             ! videoconvert \
              ! video/x-raw,format=NV12 \
              ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
                          rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
              ! appsink name=sink sync=false"
         ),
-    };
+    }
+}
+
+/// Installs a buffer probe on `element`'s `src` pad that drops any buffer
+/// arriving less than `1/fps` seconds (measured in real wall-clock time,
+/// not buffer PTS/pipeline clock) after the last one it let through.
+///
+/// Deliberately not `videorate`: confirmed live that inserting `videorate
+/// max-rate={fps}` ahead of the encoder broke streaming completely —
+/// input buffers arrived continuously, but it pushed exactly one output
+/// buffer ever and dropped everything after, root cause not fully
+/// understood (see `make_encoder_pipeline`'s git history for the
+/// investigation). This is a deliberately much simpler mechanism: a
+/// stateless-per-buffer decision with no lookahead and no internal
+/// scheduling clock — nothing here can get stuck waiting for a "next"
+/// buffer, because it never looks at anything but the single buffer
+/// currently in hand and a plain `Instant` recorded from the last one it
+/// allowed through. Wall-clock time, not the buffer's own PTS, specifically
+/// so it can't be confused by whatever pipeline segment/base-time
+/// weirdness broke `videorate` in the first place. Same "ceiling, not a
+/// forced rate" property as `videorate max-rate` was meant to have: only
+/// ever drops excess buffers, never invents/duplicates ones, so a source
+/// producing frames slower than the cap is untouched.
+fn install_fps_cap_probe(element: &gst::Element, fps: u32) {
+    let min_interval = Duration::from_secs_f64(1.0 / fps as f64);
+    let last_allowed: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let pad = element.static_pad("src").expect("identity element always has a src pad");
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+        let now = Instant::now();
+        let mut last = last_allowed.lock().unwrap();
+        let allow = match *last {
+            None => true,
+            Some(t) => now.duration_since(t) >= min_interval,
+        };
+        if allow {
+            *last = Some(now);
+            gst::PadProbeReturn::Ok
+        } else {
+            gst::PadProbeReturn::Drop
+        }
+    });
+}
+
+/// Capture -> H.264 encode pipeline for network streaming (as opposed to
+/// [`make_pipeline`]'s raw-BGRx path for local display). Delivers Annex-B
+/// access units (one per encoded frame) to `on_access_unit(bytes, is_keyframe)`.
+///
+/// `fps_cap`: `None` leaves capture fully dynamic/damage-driven, byte-
+/// identical to the pipeline before fps capping existed at all (the
+/// `identity` gate element is still there, but nothing ever attaches a
+/// probe to it, so it's a true no-op). `Some(fps)` attaches a buffer-drop
+/// probe via `install_fps_cap_probe` — see its doc comment for why that
+/// mechanism (not `videorate`, which broke this pipeline outright — see
+/// git history) was chosen.
+pub fn make_encoder_pipeline<F>(
+    source: VideoSource,
+    client_name: &str,
+    encoder: VideoEncoder,
+    fps_cap: Option<u32>,
+    bitrate_kbps: u32,
+    on_access_unit: F,
+) -> gst::Pipeline
+where
+    F: Fn(Vec<u8>, bool) + Send + Sync + 'static,
+{
+    let src = source.into_element(client_name);
+    let downstream_desc = video_encoder_downstream_description(encoder, bitrate_kbps);
     // Named/self-contained panic message (not a bare `.expect()`) so a
     // missing/broken encoder plugin says exactly that, rather than a
     // generic "parse failed" with no indication of *which* encoder or
@@ -566,6 +638,10 @@ where
              If this is Nvenc, force REDFOG_VIDEO_ENCODER=software to rule out a broken/mismatched NVENC driver install."
         )
     });
+    if let Some(fps) = fps_cap.filter(|&fps| fps > 0) {
+        let gate = downstream.by_name(FPS_CAP_ELEMENT_NAME).expect("identity gate element always present");
+        install_fps_cap_probe(&gate, fps);
+    }
 
     let pipeline = gst::Pipeline::new();
     pipeline.add(&src).expect("failed to add source to pipeline");
@@ -600,6 +676,27 @@ pub fn request_keyframe(pipeline: &gst::Pipeline) {
     };
     let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
     encoder.send_event(event);
+}
+
+/// Live-adjust a [`make_encoder_pipeline`] pipeline's target bitrate — no
+/// rebuild/reconnect needed: `bitrate` is `changeable in NULL, READY,
+/// PAUSED or PLAYING state` on both `x264enc` and `nvh264enc` (confirmed
+/// via `gst-inspect-1.0`), and an H.264 bitstream doesn't need the decoder
+/// told anything when it changes — a decoder just decodes whatever NAL
+/// units arrive, whatever size they are. For server-side adaptive
+/// bitrate, reacting to the client's `LossStats` control-channel reports
+/// (see `control::ControlEventHandler::on_loss_stats`) — unlike a
+/// resolution/fps change, this needs no client-side protocol support at
+/// all, which is why it's the tractable half of "live renegotiation" (see
+/// project notes on the Foundation-Sunshine dynamic-stream-param-change
+/// extension, which bundles resolution/fps in too — those genuinely do
+/// need the client to know, since decoder output geometry isn't something
+/// downstream rendering can just shrug off).
+pub fn set_encoder_bitrate(pipeline: &gst::Pipeline, bitrate_kbps: u32) {
+    let Some(encoder) = pipeline.by_name(ENCODER_ELEMENT_NAME) else {
+        return;
+    };
+    encoder.set_property("bitrate", bitrate_kbps);
 }
 
 /// A per-session virtual audio sink: apps in the compositor session play
@@ -769,5 +866,81 @@ mod tests {
             VideoEncoder::Software
         };
         assert_eq!(detect_video_encoder(), expected);
+    }
+
+    /// Cheap sanity check that the gate element is always present — no
+    /// GStreamer pipeline needed, just the description string.
+    #[test]
+    fn downstream_description_always_has_the_fps_cap_gate() {
+        let desc = video_encoder_downstream_description(VideoEncoder::Software, 10_000);
+        assert!(desc.contains(&format!("identity name={FPS_CAP_ELEMENT_NAME}")), "pipeline description: {desc}");
+        assert!(!desc.contains("videorate"), "pipeline description: {desc}");
+    }
+
+    /// Real, live pipeline test — the whole reason `videorate` shipped
+    /// broken is that it was only ever tested against a well-behaved
+    /// continuous source, not a rapid-burst pattern (exactly what real
+    /// damage-driven capture produces). This deliberately exercises both
+    /// halves: a burst gets throttled to one buffer, AND — critically,
+    /// the part a naive test would have missed — a later buffer arriving
+    /// after the cap's interval has elapsed still gets through, proving
+    /// this can't get permanently stuck the way `videorate` did.
+    #[test]
+    fn fps_cap_probe_throttles_bursts_without_stalling() {
+        gst::init().expect("gst::init");
+
+        let appsrc = gst_app::AppSrc::builder()
+            .caps(
+                &gst::Caps::builder("video/x-raw")
+                    .field("format", "RGBx")
+                    .field("width", 4)
+                    .field("height", 4)
+                    .field("framerate", gst::Fraction::new(0, 1))
+                    .build(),
+            )
+            .build();
+        let identity = gst::ElementFactory::make("identity").name(FPS_CAP_ELEMENT_NAME).build().unwrap();
+        let appsink = gst_app::AppSink::builder().sync(false).build();
+
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([appsrc.upcast_ref(), &identity, appsink.upcast_ref()]).unwrap();
+        gst::Element::link_many([appsrc.upcast_ref(), &identity, appsink.upcast_ref()]).unwrap();
+
+        install_fps_cap_probe(&identity, 10); // 10fps cap => 100ms minimum spacing
+
+        let received = Arc::new(Mutex::new(0u32));
+        let received_cb = received.clone();
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let _ = sink.pull_sample();
+                    *received_cb.lock().unwrap() += 1;
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+
+        pipeline.set_state(gst::State::Playing).expect("pipeline should reach Playing");
+
+        // A rapid burst — matches the "20 buffers in a fraction of a
+        // second" pattern confirmed live to permanently break videorate.
+        for _ in 0..20 {
+            let buffer = gst::Buffer::with_size(16 * 4 * 4).unwrap();
+            appsrc.push_buffer(buffer).expect("push_buffer should succeed");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let after_burst = *received.lock().unwrap();
+        assert_eq!(after_burst, 1, "expected only the first buffer of a rapid burst to pass, got {after_burst}");
+
+        // The critical assertion videorate would have failed: does this
+        // recover, or is it stuck forever after the first buffer?
+        std::thread::sleep(Duration::from_millis(150));
+        let buffer = gst::Buffer::with_size(16 * 4 * 4).unwrap();
+        appsrc.push_buffer(buffer).expect("push_buffer should succeed");
+        std::thread::sleep(Duration::from_millis(50));
+        let after_wait = *received.lock().unwrap();
+        assert_eq!(after_wait, 2, "expected a buffer arriving after the cap interval to pass (not stuck), got {after_wait}");
+
+        let _ = pipeline.set_state(gst::State::Null);
     }
 }

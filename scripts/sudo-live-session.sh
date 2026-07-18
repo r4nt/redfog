@@ -109,18 +109,27 @@ BROKER_LOG="/tmp/redfog-live-broker.log"
 SERVER_LOG="/tmp/redfog-live-server.log"
 REDFOG_BROKER_PAM_SPAWN="${REDFOG_BROKER_PAM_SPAWN-1}"
 
-# TEMPORARY debugging aids for the "resume works but video updates are
-# severely throttled" investigation — see the doc comments at their
-# corresponding call sites (redfog-broker/src/session.rs's spawn_via_pam,
-# redfog-server/src/main.rs) for what these actually do. Override to ""
-# (empty) to disable either one; remove this whole block once that
-# investigation concludes.
+# Debugging aids for the "resume works but video updates are severely
+# throttled" investigation — see the doc comments at their corresponding
+# call sites (redfog-broker/src/session.rs's spawn_via_pam,
+# redfog-server/src/main.rs) for what these actually do. Off by default
+# (empty) since level-6 GST_DEBUG on pipewiresrc fires on every single
+# buffer poll — including no-op "popped buffer (nil)" polls — and was
+# measured generating ~370 log lines/sec of synchronous I/O on the
+# pipeline's own threads, a real perceptible overhead source, not just
+# log noise. Opt in explicitly when actively debugging that investigation:
+#   REDFOG_DEBUG_GST_DEBUG=pipewiresrc:6 ./scripts/sudo-live-session.sh
 # kwin_screencast/kwin_platform_virtual found via `strings` on the
 # installed screencast.so/libkwin.so — this repo has no KWin source.
-REDFOG_DEBUG_KWIN_LOGGING_RULES="${REDFOG_DEBUG_KWIN_LOGGING_RULES-kwin_screencast.debug=true;kwin_platform_virtual.debug=true}"
-# GStreamer debug level 6 ("LOG") on just the pipewiresrc category — verbose
-# enough to see buffer/negotiation timing without TRACE-level memory dumps.
-REDFOG_DEBUG_GST_DEBUG="${REDFOG_DEBUG_GST_DEBUG-pipewiresrc:6}"
+REDFOG_DEBUG_KWIN_LOGGING_RULES="${REDFOG_DEBUG_KWIN_LOGGING_RULES-}"
+REDFOG_DEBUG_GST_DEBUG="${REDFOG_DEBUG_GST_DEBUG-}"
+# `info` gets a periodic fps/kbps summary per video pipeline (see
+# `EncodedFrameStats` in redfog-moonlight/src/session.rs) without the
+# per-frame/per-input-event volume `debug` produces. Bump to `debug`
+# (or `trace`) when actually chasing something at that granularity:
+#   REDFOG_LIVE_SERVER_RUST_LOG=redfog_moonlight=debug,redfog_server=debug,gst_backend=debug ./scripts/sudo-live-session.sh
+REDFOG_LIVE_BROKER_RUST_LOG="${REDFOG_LIVE_BROKER_RUST_LOG-redfog_broker=info}"
+REDFOG_LIVE_SERVER_RUST_LOG="${REDFOG_LIVE_SERVER_RUST_LOG-redfog_moonlight=info,redfog_server=info,gst_backend=info}"
 
 cleanup() {
     echo "stopping..."
@@ -144,7 +153,7 @@ rm -f /tmp/redfog-live-broker.sock
 echo "starting redfog-broker (PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN:-<unset, systemd-unit path>}, real PAM auth)..."
 REDFOG_BROKER_PAM_SPAWN="$REDFOG_BROKER_PAM_SPAWN" \
 REDFOG_DEBUG_KWIN_LOGGING_RULES="$REDFOG_DEBUG_KWIN_LOGGING_RULES" \
-RUST_LOG=redfog_broker=debug \
+RUST_LOG="$REDFOG_LIVE_BROKER_RUST_LOG" \
 setsid "$REPO_DIR/target/release/redfog-broker" > "$BROKER_LOG" 2>&1 &
 BROKER_PID=$!
 
@@ -163,7 +172,7 @@ REDFOG_LOGIN_APP="$REPO_DIR/target/release/redfog-login" \
 REDFOG_USER_APP="plasmashell --no-respawn" \
 REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR="$PLUGIN_DIR" \
 REDFOG_DEBUG_GST_DEBUG="$REDFOG_DEBUG_GST_DEBUG" \
-RUST_LOG=redfog_moonlight=debug,redfog_server=debug,gst_backend=debug \
+RUST_LOG="$REDFOG_LIVE_SERVER_RUST_LOG" \
 setsid "$REPO_DIR/target/release/redfog-server" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 

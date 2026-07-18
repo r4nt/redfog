@@ -45,12 +45,21 @@ pub enum InputEvent {
 pub trait ControlEventHandler: Send + Sync {
     fn on_input(&self, event: InputEvent);
     fn on_request_idr_frame(&self);
+    /// `LossStats` (0x0201) — sent regularly by every real client (not a
+    /// Sunshine/Foundation extension, base protocol), carrying the frame
+    /// index of the last frame it fully received. Real Sunshine already
+    /// uses this signal to drive server-side adaptive bitrate; see
+    /// `redfog_core::set_encoder_bitrate`'s doc comment for why bitrate
+    /// specifically (unlike resolution/fps) needs no client cooperation
+    /// beyond this existing report.
+    fn on_loss_stats(&self, last_good_frame: u64);
 }
 
 pub struct NoopControlEventHandler;
 impl ControlEventHandler for NoopControlEventHandler {
     fn on_input(&self, _event: InputEvent) {}
     fn on_request_idr_frame(&self) {}
+    fn on_loss_stats(&self, _last_good_frame: u64) {}
 }
 
 pub struct ControlServer {
@@ -155,13 +164,15 @@ impl ControlServer {
                 None => tracing::trace!("unhandled/unknown input event"),
             },
             Ok(ControlMessage::RequestIdrFrame) => self.handler.on_request_idr_frame(),
-            Ok(ControlMessage::Other) => {} // Ping/LossStats/FrameStats/etc — ignored in v1.
+            Ok(ControlMessage::LossStats { last_good_frame }) => self.handler.on_loss_stats(last_good_frame),
+            Ok(ControlMessage::Other) => {} // Ping/FrameStats/etc — ignored in v1.
             Err(e) => tracing::debug!("bad control message: {e}"),
         }
     }
 }
 
 const CONTROL_MSG_ENCRYPTED: u16 = 0x0001;
+const CONTROL_MSG_LOSS_STATS: u16 = 0x0201;
 const CONTROL_MSG_INPUT_DATA: u16 = 0x0206;
 const CONTROL_MSG_REQUEST_IDR_FRAME: u16 = 0x0302;
 const CONTROL_MSG_INVALIDATE_REFERENCE_FRAMES: u16 = 0x0301;
@@ -169,6 +180,7 @@ const CONTROL_MSG_INVALIDATE_REFERENCE_FRAMES: u16 = 0x0301;
 enum ControlMessage {
     InputData(Vec<u8>),
     RequestIdrFrame,
+    LossStats { last_good_frame: u64 },
     Other,
 }
 
@@ -216,6 +228,19 @@ impl ControlMessage {
                 Ok(Self::InputData(payload[4..4 + event_len].to_vec()))
             }
             CONTROL_MSG_REQUEST_IDR_FRAME | CONTROL_MSG_INVALIDATE_REFERENCE_FRAMES => Ok(Self::RequestIdrFrame),
+            CONTROL_MSG_LOSS_STATS => {
+                // Layout (confirmed against moonlight-common-rust's own
+                // serialize/deserialize, not vendored into git — see
+                // scripts/fetch-patched-deps.sh):
+                // [u32 LE unknown][u32 LE loss_report_interval_ms][u32 LE unknown]
+                // [u64 LE last_good_frame][u32 LE unknown][u32 LE unknown][u32 LE unknown],
+                // 32 bytes total — we only need the 8 bytes at offset 12.
+                if payload.len() < 20 {
+                    return Err(format!("loss stats message too short: {} bytes", payload.len()));
+                }
+                let last_good_frame = u64::from_le_bytes(payload[12..20].try_into().unwrap());
+                Ok(Self::LossStats { last_good_frame })
+            }
             _ => Ok(Self::Other),
         }
     }
@@ -513,5 +538,38 @@ mod tests {
         buffer.extend(0u16.to_le_bytes());
         let key = [0u8; 16];
         assert!(matches!(ControlMessage::parse(&buffer, &key).unwrap(), ControlMessage::RequestIdrFrame));
+    }
+
+    #[test]
+    fn loss_stats_extracts_last_good_frame() {
+        let mut payload = Vec::new();
+        payload.extend(0u32.to_le_bytes()); // unknown1
+        payload.extend(1000u32.to_le_bytes()); // loss_report_interval_ms
+        payload.extend(1000u32.to_le_bytes()); // unknown2
+        payload.extend(424242u64.to_le_bytes()); // last_good_frame
+        payload.extend(0u32.to_le_bytes()); // unknown3
+        payload.extend(0u32.to_le_bytes()); // unknown4
+        payload.extend(0x14u32.to_le_bytes()); // unknown5
+
+        let mut buffer = Vec::new();
+        buffer.extend(CONTROL_MSG_LOSS_STATS.to_le_bytes());
+        buffer.extend((payload.len() as u16).to_le_bytes());
+        buffer.extend(&payload);
+
+        let key = [0u8; 16];
+        match ControlMessage::parse(&buffer, &key).unwrap() {
+            ControlMessage::LossStats { last_good_frame } => assert_eq!(last_good_frame, 424242),
+            _ => panic!("expected LossStats"),
+        }
+    }
+
+    #[test]
+    fn loss_stats_too_short_is_rejected() {
+        let mut buffer = Vec::new();
+        buffer.extend(CONTROL_MSG_LOSS_STATS.to_le_bytes());
+        buffer.extend(8u16.to_le_bytes());
+        buffer.extend([0u8; 8]);
+        let key = [0u8; 16];
+        assert!(ControlMessage::parse(&buffer, &key).is_err());
     }
 }
