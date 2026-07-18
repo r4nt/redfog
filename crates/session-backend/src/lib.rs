@@ -404,7 +404,7 @@ pub fn spawn_login_compositor(login_app: &[String], width: u32, height: u32) -> 
 /// Spawns the User compositor directly (no broker) — standalone use.
 pub fn spawn_user_compositor_direct(backend: Backend, username: &str, user_app: &[String], width: u32, height: u32, fps: u32) -> Result<SpawnedCompositor, String> {
     match backend {
-        Backend::Kwin => CompositorSession::spawn(SessionType::User(username.to_string()), "redfog-user-0", width as i32, height as i32, 1.0, user_app)
+        Backend::Kwin => CompositorSession::spawn(SessionType::User(username.to_string()), "redfog-user-0", width as i32, height as i32, 1.0, fps, user_app)
             .map(SpawnedCompositor::Kwin)
             .map_err(|e| format!("failed to spawn redfog-user-0: {e}")),
         Backend::GstWaylandDisplay => spawn_gst_compositor(width, height, fps, "redfog-user-0"),
@@ -482,6 +482,7 @@ pub async fn spawn_user_compositor_via_broker(
                 width as i32,
                 height as i32,
                 1.0,
+                fps,
             )
             .map(SpawnedCompositor::Kwin)
             .map_err(|e| format!("failed to attach to broker-spawned session: {e}"))

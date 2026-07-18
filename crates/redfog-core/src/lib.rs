@@ -108,7 +108,7 @@ impl VideoSource {
     fn into_element(self, client_name: &str, fps_cap: Option<u32>) -> gst::Element {
         match self {
             VideoSource::PipeWireNode(node_id) => {
-                let keepalive_time = 1000 / fps_cap.unwrap_or(60).min(60);
+                let keepalive_time = 2000 / fps_cap.unwrap_or(60);
                 let pipewiresrc = gst::ElementFactory::make("pipewiresrc")
                     .name("pipewiresrc")
                     .property("path", node_id.to_string())
@@ -119,6 +119,7 @@ impl VideoSource {
                     .expect("pipewiresrc should always be available");
                 let videorate = gst::ElementFactory::make("videorate")
                     .name("videorate")
+                    .property("skip-to-first", true)
                     .build()
                     .expect("videorate should always be available");
                 let bin = gst::Bin::builder().name("src").build();
@@ -169,6 +170,7 @@ impl CompositorSession {
         width: i32,
         height: i32,
         scale: f64,
+        fps: u32,
         payload_args: &[String],
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let runtime = default_runtime_dir();
@@ -215,7 +217,7 @@ impl CompositorSession {
             .stderr(Stdio::inherit())
             .spawn()?;
 
-        Self::wait_and_attach(session_type, socket_name, socket_path, width, height, scale, Some(child), &runtime, &pw_sock)
+        Self::wait_and_attach(session_type, socket_name, socket_path, width, height, scale, fps, Some(child), &runtime, &pw_sock)
     }
 
     /// For a session already spawned by redfog-broker (KWin running under a
@@ -230,10 +232,11 @@ impl CompositorSession {
         width: i32,
         height: i32,
         scale: f64,
+        fps: u32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let runtime = default_runtime_dir();
         let pw_sock = std::env::var("PIPEWIRE_REMOTE").unwrap_or_else(|_| "pipewire-0".to_string());
-        Self::wait_and_attach(session_type, socket_name, socket_path, width, height, scale, None, &runtime, &pw_sock)
+        Self::wait_and_attach(session_type, socket_name, socket_path, width, height, scale, fps, None, &runtime, &pw_sock)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -244,6 +247,7 @@ impl CompositorSession {
         width: i32,
         height: i32,
         scale: f64,
+        fps: u32,
         mut child: Option<Child>,
         runtime: &str,
         pw_sock: &str,
@@ -276,7 +280,7 @@ impl CompositorSession {
             .ok();
 
         // Connect CaptureSession to claim virtual output and get PipeWire node ID
-        let capture_session = CaptureSession::connect(&socket_path, "redfog-output", width, height, scale)?;
+        let capture_session = CaptureSession::connect(&socket_path, "redfog-output", width, height, scale, fps)?;
         let pipewire_node_id = capture_session.node_id();
 
         Ok(Self {
@@ -642,9 +646,11 @@ pub fn make_encoder_pipeline<F>(
 where
     F: Fn(Vec<u8>, bool) + Send + Sync + 'static,
 {
-    let framerate = match source {
-        VideoSource::PipeWireNode(_) => Some(fps_cap.unwrap_or(60).min(60)),
-        VideoSource::Element(_) => None,
+    let is_pipewire = matches!(source, VideoSource::PipeWireNode(_));
+    let framerate = if is_pipewire {
+        Some(fps_cap.unwrap_or(60))
+    } else {
+        None
     };
     let src = source.into_element(client_name, fps_cap);
     let downstream_desc = video_encoder_downstream_description(encoder, framerate, bitrate_kbps);
@@ -662,9 +668,11 @@ where
              If this is Nvenc, force REDFOG_VIDEO_ENCODER=software to rule out a broken/mismatched NVENC driver install."
         )
     });
-    if let Some(fps) = fps_cap.filter(|&fps| fps > 0) {
-        let gate = downstream.by_name(FPS_CAP_ELEMENT_NAME).expect("identity gate element always present");
-        install_fps_cap_probe(&gate, fps);
+    if !is_pipewire {
+        if let Some(fps) = fps_cap.filter(|&fps| fps > 0) {
+            let gate = downstream.by_name(FPS_CAP_ELEMENT_NAME).expect("identity gate element always present");
+            install_fps_cap_probe(&gate, fps);
+        }
     }
 
     let pipeline = gst::Pipeline::new();

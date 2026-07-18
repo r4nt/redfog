@@ -341,6 +341,7 @@ fn set_output_mode(
     conn: &Connection,
     w: i32,
     h: i32,
+    fps: u32,
 ) {
     let (Some(device), Some(mgmt)) = (state.our_device.clone(), state.output_management.clone())
     else {
@@ -364,7 +365,8 @@ fn set_output_mode(
     } else {
         let mode_list = mgmt.create_mode_list(qh, ());
         mode_list.set_resolution(w as u32, h as u32);
-        mode_list.set_refresh_rate(60_000);
+        let refresh_rate = if fps > 0 { fps * 1000 } else { 60_000 };
+        mode_list.set_refresh_rate(refresh_rate);
         mode_list.add_mode();
 
         let config = mgmt.create_configuration(qh, ());
@@ -432,6 +434,7 @@ fn create_stream(
     w: i32,
     h: i32,
     scale: f64,
+    fps: u32,
 ) -> Option<u32> {
     state.current_stream = None;
     conn.flush().ok();
@@ -466,7 +469,7 @@ fn create_stream(
     queue.roundtrip(state).ok();
     eprintln!("capture: stream+device ready, node={:?}", state.node_id);
 
-    set_output_mode(state, queue, qh, conn, w, h);
+    set_output_mode(state, queue, qh, conn, w, h, fps);
     state.node_id
 }
 
@@ -488,6 +491,7 @@ impl CaptureSession {
         width: i32,
         height: i32,
         scale: f64,
+        fps: u32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use std::os::unix::net::UnixStream;
 
@@ -500,7 +504,7 @@ impl CaptureSession {
         let mut state = State::new(output_name);
         queue.roundtrip(&mut state)?;
 
-        let node_id = create_stream(&mut state, &mut queue, &qh, &conn, width, height, scale)
+        let node_id = create_stream(&mut state, &mut queue, &qh, &conn, width, height, scale, fps)
             .ok_or("virtual output stream failed")?;
 
         let (resize_tx, resize_rx) = mpsc::channel::<(i32, i32, mpsc::Sender<()>)>();
@@ -540,7 +544,7 @@ impl CaptureSession {
 
                 while let Ok((w, h, reply_tx)) = resize_rx.try_recv() {
                     eprintln!("capture: resizing to {w}x{h}");
-                    set_output_mode(&mut state, &mut queue, &qh, &conn, w, h);
+                    set_output_mode(&mut state, &mut queue, &qh, &conn, w, h, fps);
                     let _ = reply_tx.send(());
                 }
             }

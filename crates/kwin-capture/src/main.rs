@@ -20,7 +20,7 @@ fn main() {
         std::path::Path::new(&runtime).join(display)
     };
 
-    let session = CaptureSession::connect(&socket, "redfog-output", width, height, scale)
+    let session = CaptureSession::connect(&socket, "redfog-output", width, height, scale, 60)
         .expect("failed to create capture session");
 
     println!("{}", session.node_id());

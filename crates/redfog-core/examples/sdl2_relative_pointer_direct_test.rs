@@ -38,6 +38,7 @@ fn main() {
         1280,
         720,
         1.0,
+        60,
         &[sdl_check.to_str().unwrap().to_string()],
     )
     .expect("spawn compositor");
