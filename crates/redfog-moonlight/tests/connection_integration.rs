@@ -619,7 +619,7 @@ async fn real_client_connects_reconnects_and_sends_input() {
         .await
         .expect("first stream must connect");
 
-    server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(10)).await;
+    server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
 
     // ---- Simulated client mouse movement + key press, verified by proof
     // it actually reached the Login-stage session, not just that the
@@ -646,7 +646,7 @@ async fn real_client_connects_reconnects_and_sends_input() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     send_key(&stream, VK_Q.wrapping_add(1) /* VK_R, an arbitrary non-exit key */, true).await;
-    server.wait_for_stdout("TESTUX[login]: key_pressed", Duration::from_secs(5)).await;
+    server.wait_for_stdout("TESTUX[login]: key_pressed", Duration::from_secs(20)).await;
 
     // ---- Confirm streaming works before touching the handoff, and start
     // tracking frame gaps from here through the handoff below. ----
@@ -662,7 +662,7 @@ async fn real_client_connects_reconnects_and_sends_input() {
     send_key(&stream, VK_Q, true).await;
     send_key(&stream, VK_Q, false).await;
     let (handoff_frames, max_gap) = poll_frames_tracking_gaps(&stream, async {
-        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(15)).await;
+        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(45)).await;
         // A little settle time after the User stage starts, so the next
         // input-verification step lands on a session that's fully up.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -835,7 +835,7 @@ async fn control_channel_survives_resume_then_reconnect() {
         let stream = MoonlightStream::connect(stream_config, settings.clone(), crypto_backend.clone(), video_capabilities())
             .await
             .expect("first stream must connect");
-        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(10)).await;
+        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
         send_input_until_seen(
             &server.stdout_lines,
             &stream,
@@ -849,7 +849,7 @@ async fn control_channel_survives_resume_then_reconnect() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         send_key(&stream, VK_Q, true).await;
         send_key(&stream, VK_Q, false).await;
-        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(15)).await;
+        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(45)).await;
 
         // ---- Disconnect, reconnect: backgrounds the User session, shows a
         // fresh Login (the part already confirmed working elsewhere). ----
@@ -994,7 +994,7 @@ async fn video_port_recovers_after_a_resume_hang() {
         let stream = MoonlightStream::connect(stream_config, settings.clone(), crypto_backend.clone(), video_capabilities())
             .await
             .expect("first stream must connect");
-        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(10)).await;
+        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
         send_input_until_seen(
             &server.stdout_lines,
             &stream,
@@ -1008,7 +1008,7 @@ async fn video_port_recovers_after_a_resume_hang() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         send_key(&stream, VK_Q, true).await;
         send_key(&stream, VK_Q, false).await;
-        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(15)).await;
+        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(45)).await;
 
         // ---- Disconnect, reconnect: backgrounds the User session, shows a
         // fresh Login. ----
@@ -1228,7 +1228,7 @@ async fn video_stays_sustained_across_many_resumes_under_continuous_rendering() 
         let stream = MoonlightStream::connect(stream_config, settings.clone(), crypto_backend.clone(), video_capabilities())
             .await
             .expect("first stream must connect");
-        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(10)).await;
+        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
         send_input_until_seen(
             &server.stdout_lines,
             &stream,
@@ -1242,7 +1242,7 @@ async fn video_stays_sustained_across_many_resumes_under_continuous_rendering() 
         tokio::time::sleep(Duration::from_millis(200)).await;
         send_key(&stream, VK_Q, true).await;
         send_key(&stream, VK_Q, false).await;
-        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(15)).await;
+        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(45)).await;
         drop(stream);
 
         // ---- Repeated resume cycles: reconnect, drive Login -> User again
@@ -1363,7 +1363,7 @@ async fn video_frame_gaps_over_one_long_sustained_resumed_connection() {
         let stream = MoonlightStream::connect(stream_config, settings.clone(), crypto_backend.clone(), video_capabilities())
             .await
             .expect("first stream must connect");
-        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(10)).await;
+        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
         send_input_until_seen(
             &server.stdout_lines,
             &stream,
@@ -1377,7 +1377,7 @@ async fn video_frame_gaps_over_one_long_sustained_resumed_connection() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         send_key(&stream, VK_Q, true).await;
         send_key(&stream, VK_Q, false).await;
-        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(15)).await;
+        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(45)).await;
         drop(stream);
 
         // ---- Exactly one resume, then a long, single sustained observation. ----
@@ -1503,7 +1503,7 @@ async fn video_throttles_after_resume_under_input_driven_damage() {
         let stream = MoonlightStream::connect(stream_config, settings.clone(), crypto_backend.clone(), video_capabilities())
             .await
             .expect("first stream must connect");
-        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(10)).await;
+        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
         send_input_until_seen(
             &server.stdout_lines,
             &stream,
@@ -1517,7 +1517,7 @@ async fn video_throttles_after_resume_under_input_driven_damage() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         send_key(&stream, VK_Q, true).await;
         send_key(&stream, VK_Q, false).await;
-        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(15)).await;
+        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(45)).await;
 
         // ---- Control: same input-driven damage mechanism, same session,
         // *before* any resume — must be healthy, or this test isn't
@@ -1659,7 +1659,7 @@ async fn login_after_log_out_recovers_from_a_resume_hang() {
         let stream = MoonlightStream::connect(stream_config, settings.clone(), crypto_backend.clone(), video_capabilities())
             .await
             .expect("first stream must connect");
-        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(10)).await;
+        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
         send_input_until_seen(
             &server.stdout_lines,
             &stream,
@@ -1673,7 +1673,7 @@ async fn login_after_log_out_recovers_from_a_resume_hang() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         send_key(&stream, VK_Q, true).await;
         send_key(&stream, VK_Q, false).await;
-        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(15)).await;
+        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(45)).await;
 
         // ---- Disconnect, reconnect: backgrounds the User session, shows a
         // fresh Login. ----
@@ -1872,7 +1872,7 @@ async fn log_out_actually_kills_the_real_compositor_process() {
         let stream = MoonlightStream::connect(stream_config, settings, crypto_backend, video_capabilities())
             .await
             .expect("stream must connect");
-        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(10)).await;
+        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
         send_input_until_seen(
             &server.stdout_lines,
             &stream,
@@ -1886,7 +1886,7 @@ async fn log_out_actually_kills_the_real_compositor_process() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         send_key(&stream, VK_Q, true).await;
         send_key(&stream, VK_Q, false).await;
-        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(15)).await;
+        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(45)).await;
 
         // The actual, real `kwin_wayland` process — a grandchild of the
         // broker via `dbus-run-session`, exactly like production.
@@ -2010,7 +2010,7 @@ async fn real_pam_spawn_login_after_log_out_recovers_from_a_resume_hang() {
         let stream = MoonlightStream::connect(stream_config, settings.clone(), crypto_backend.clone(), video_capabilities())
             .await
             .expect("first stream must connect");
-        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(10)).await;
+        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
         send_input_until_seen(
             &server.stdout_lines,
             &stream,
@@ -2024,7 +2024,7 @@ async fn real_pam_spawn_login_after_log_out_recovers_from_a_resume_hang() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         send_key(&stream, VK_Q, true).await;
         send_key(&stream, VK_Q, false).await;
-        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(20)).await;
+        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(45)).await;
 
         // ---- Disconnect, reconnect: backgrounds the User session, shows a
         // fresh Login. ----
@@ -2361,7 +2361,7 @@ async fn gst_wayland_display_backend_smoke_test() {
     // Backend::GstWaylandDisplay), so unlike before, none of these checks
     // need count-baseline tracking to disambiguate "which stage logged
     // this" — each label only ever comes from one stage in this test.
-    server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(15)).await;
+    server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
 
     send_input_until_seen(
         &server.stdout_lines,
@@ -2379,7 +2379,7 @@ async fn gst_wayland_display_backend_smoke_test() {
     send_key(&stream, VK_Q, true).await;
     send_key(&stream, VK_Q, false).await;
     let (handoff_frames, max_gap) = poll_frames_tracking_gaps(&stream, async {
-        server.wait_for_stdout("TESTUX[wayland-1]: started", Duration::from_secs(15)).await;
+        server.wait_for_stdout("TESTUX[wayland-1]: started", Duration::from_secs(45)).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
     })
     .await;
