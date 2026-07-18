@@ -48,7 +48,7 @@ pub const RENDER_NODE_SOFTWARE: &str = "software";
 /// symptom this fixes). KWin's `VideoSource::PipeWireNode` path doesn't
 /// need this — the real resolution is already baked into the PipeWire
 /// stream itself by the time it reaches `pipewiresrc`.
-pub fn make_source_element(render_node: &str, width: i32, height: i32) -> Result<gst::Element, String> {
+pub fn make_source_element(render_node: &str, width: i32, height: i32, fps: u32) -> Result<gst::Element, String> {
     let waylandsrc = gst::ElementFactory::make("waylanddisplaysrc")
         .name("waylanddisplaysrc")
         .property("render-node", render_node)
@@ -62,7 +62,7 @@ pub fn make_source_element(render_node: &str, width: i32, height: i32) -> Result
     let caps = gst::Caps::builder("video/x-raw")
         .field("width", width)
         .field("height", height)
-        .field("framerate", gst::Fraction::new(30, 1))
+        .field("framerate", gst::Fraction::new(fps as i32, 1))
         .build();
     let capsfilter = gst::ElementFactory::make("capsfilter")
         .name("src")

@@ -259,7 +259,7 @@ impl InputSink for HeadlessLoginInputSink {
 /// User stages (and a standalone viewer's single-session mode) are
 /// otherwise identical; only the eventual payload-spawn mechanism differs
 /// (see [`spawn_gst_payload`]).
-pub fn spawn_gst_compositor(width: u32, height: u32, label: &str) -> Result<SpawnedCompositor, String> {
+pub fn spawn_gst_compositor(width: u32, height: u32, fps: u32, label: &str) -> Result<SpawnedCompositor, String> {
     let render_node = std::env::var("REDFOG_GST_RENDER_NODE").unwrap_or_else(|_| gst_backend::RENDER_NODE_SOFTWARE.to_string());
     // `label` (e.g. "redfog-login-0") only names *our own* runtime dir,
     // keeping different sessions' sockets in separate directories —
@@ -274,7 +274,7 @@ pub fn spawn_gst_compositor(width: u32, height: u32, label: &str) -> Result<Spaw
     // pipeline.set_state(Playing) — must be set before that, not after
     // (confirmed live: a RuntimeDirNotSet panic otherwise).
     std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
-    let element = gst_backend::make_source_element(&render_node, width as i32, height as i32)?;
+    let element = gst_backend::make_source_element(&render_node, width as i32, height as i32, fps)?;
     let socket_name = "wayland-1";
     let socket_path = PathBuf::from(&runtime_dir).join(socket_name);
     Ok(SpawnedCompositor::GstWaylandDisplay {
@@ -402,12 +402,12 @@ pub fn spawn_login_compositor(login_app: &[String], width: u32, height: u32) -> 
 }
 
 /// Spawns the User compositor directly (no broker) — standalone use.
-pub fn spawn_user_compositor_direct(backend: Backend, username: &str, user_app: &[String], width: u32, height: u32) -> Result<SpawnedCompositor, String> {
+pub fn spawn_user_compositor_direct(backend: Backend, username: &str, user_app: &[String], width: u32, height: u32, fps: u32) -> Result<SpawnedCompositor, String> {
     match backend {
         Backend::Kwin => CompositorSession::spawn(SessionType::User(username.to_string()), "redfog-user-0", width as i32, height as i32, 1.0, user_app)
             .map(SpawnedCompositor::Kwin)
             .map_err(|e| format!("failed to spawn redfog-user-0: {e}")),
-        Backend::GstWaylandDisplay => spawn_gst_compositor(width, height, "redfog-user-0"),
+        Backend::GstWaylandDisplay => spawn_gst_compositor(width, height, fps, "redfog-user-0"),
     }
 }
 
@@ -432,6 +432,7 @@ pub async fn spawn_user_compositor_via_broker(
     user_app: &[String],
     width: u32,
     height: u32,
+    fps: u32,
 ) -> Result<SpawnedCompositor, String> {
     use redfog_broker_protocol::{read_response, write_request, BrokerRequest, BrokerResponse};
     use tokio::io::BufReader;
@@ -489,7 +490,7 @@ pub async fn spawn_user_compositor_via_broker(
         // later, in spawn_gst_payload, once the socket built here actually
         // exists — see SpawnedCompositor's doc comment. Authenticate above
         // still applies.
-        Backend::GstWaylandDisplay => spawn_gst_compositor(width, height, "redfog-user-0"),
+        Backend::GstWaylandDisplay => spawn_gst_compositor(width, height, fps, "redfog-user-0"),
     }
 }
 

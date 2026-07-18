@@ -686,7 +686,7 @@ impl SessionManager {
     /// since `spawn_gst_payload_in_background` reads the username back out
     /// of `RunningSession.kind` — a real, unrelated account, if one happens
     /// to exist on the target system, or a `SpawnPayload` failure otherwise.
-    async fn spawn_user_compositor(&self, width: u32, height: u32) -> Result<(SpawnedCompositor, String, Option<String>), String> {
+    async fn spawn_user_compositor(&self, width: u32, height: u32, fps: u32) -> Result<(SpawnedCompositor, String, Option<String>), String> {
         // `handle_login_report` sets this once `redfog-login`'s credentials
         // have already passed the broker's real, password-checked
         // `Authenticate` — re-sending an empty password through that same
@@ -707,7 +707,7 @@ impl SessionManager {
         let user_app = selected.as_ref().map(|s| s.user_app.clone()).unwrap_or_else(|| self.config.user_app.clone());
 
         let Some(broker_socket_path) = &self.config.broker_socket_path else {
-            return session_backend::spawn_user_compositor_direct(backend, &username, &user_app, width, height).map(|c| (c, username, None));
+            return session_backend::spawn_user_compositor_direct(backend, &username, &user_app, width, height, fps).map(|c| (c, username, None));
         };
 
         // The one `session_id` used for this whole User-stage spawn attempt
@@ -731,6 +731,7 @@ impl SessionManager {
             &user_app,
             width,
             height,
+            fps,
         )
         .await;
         tracing::info!(
@@ -1534,7 +1535,7 @@ impl SessionManager {
             None => {
                 tracing::info!("handoff_to_user: no backgrounded session for {username}, spawning a fresh user compositor");
                 let spawn_start = std::time::Instant::now();
-                let (compositor, username, broker_session_id) = self.spawn_user_compositor(width, height).await?;
+                let (compositor, username, broker_session_id) = self.spawn_user_compositor(width, height, fps).await?;
                 tracing::info!("handoff_to_user: spawn_user_compositor for {username} finished after {:?}", spawn_start.elapsed());
                 (self.spawn_session(SessionType::User(username), width, height, fps, compositor, broker_session_id)?, false)
             }

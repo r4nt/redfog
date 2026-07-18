@@ -105,15 +105,31 @@ impl VideoSource {
     /// wedged (abandoned-on-timeout) pipeline permanently poisons it for
     /// every later session too — confirmed live via matching mutex addresses
     /// across generations.
-    fn into_element(self, client_name: &str) -> gst::Element {
+    fn into_element(self, client_name: &str, fps_cap: Option<u32>) -> gst::Element {
         match self {
-            VideoSource::PipeWireNode(node_id) => gst::ElementFactory::make("pipewiresrc")
-                .name("src")
-                .property("path", node_id.to_string())
-                .property("client-name", client_name)
-                .property("do-timestamp", true)
-                .build()
-                .expect("pipewiresrc should always be available"),
+            VideoSource::PipeWireNode(node_id) => {
+                let keepalive_time = 1000 / fps_cap.unwrap_or(60).min(60);
+                let pipewiresrc = gst::ElementFactory::make("pipewiresrc")
+                    .name("pipewiresrc")
+                    .property("path", node_id.to_string())
+                    .property("client-name", client_name)
+                    .property("do-timestamp", true)
+                    .property("keepalive-time", keepalive_time as i32)
+                    .build()
+                    .expect("pipewiresrc should always be available");
+                let videorate = gst::ElementFactory::make("videorate")
+                    .name("videorate")
+                    .build()
+                    .expect("videorate should always be available");
+                let bin = gst::Bin::builder().name("src").build();
+                bin.add_many([&pipewiresrc, &videorate]).unwrap();
+                pipewiresrc.link(&videorate).unwrap();
+                let src_pad = videorate.static_pad("src").unwrap();
+                let ghost_pad = gst::GhostPad::with_target(&src_pad).unwrap();
+                ghost_pad.set_active(true).unwrap();
+                bin.add_pad(&ghost_pad).unwrap();
+                bin.upcast()
+            }
             VideoSource::Element(el) => el,
         }
     }
@@ -404,7 +420,7 @@ pub fn make_pipeline<F>(
 where
     F: Fn(bool) + Send + Sync + 'static,
 {
-    let src = source.into_element(client_name);
+    let src = source.into_element(client_name, None);
     let downstream = gst::parse_bin_from_description(
         "videoconvert ! video/x-raw,format=BGRx ! appsink name=sink sync=false",
         true,
@@ -530,12 +546,16 @@ pub fn detect_video_encoder() -> VideoEncoder {
 /// it's a true no-op with no clock/latency effect when no probe is
 /// attached, matching the pipeline exactly as it was before fps capping
 /// existed at all.
-fn video_encoder_downstream_description(encoder: VideoEncoder, bitrate_kbps: u32) -> String {
+fn video_encoder_downstream_description(encoder: VideoEncoder, framerate: Option<u32>, bitrate_kbps: u32) -> String {
+    let framerate_suffix = match framerate {
+        Some(fps) => format!(",framerate={fps}/1"),
+        None => "".to_string(),
+    };
     match encoder {
         VideoEncoder::Software => format!(
             "identity name={FPS_CAP_ELEMENT_NAME} \
              ! videoconvert \
-             ! video/x-raw,format=I420 \
+             ! video/x-raw,format=I420{framerate_suffix} \
              ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
                        byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
@@ -551,7 +571,7 @@ fn video_encoder_downstream_description(encoder: VideoEncoder, bitrate_kbps: u32
         VideoEncoder::Nvenc => format!(
             "identity name={FPS_CAP_ELEMENT_NAME} \
              ! videoconvert \
-             ! video/x-raw,format=NV12 \
+             ! video/x-raw,format=NV12{framerate_suffix} \
              ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
                          rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
@@ -622,8 +642,12 @@ pub fn make_encoder_pipeline<F>(
 where
     F: Fn(Vec<u8>, bool) + Send + Sync + 'static,
 {
-    let src = source.into_element(client_name);
-    let downstream_desc = video_encoder_downstream_description(encoder, bitrate_kbps);
+    let framerate = match source {
+        VideoSource::PipeWireNode(_) => Some(fps_cap.unwrap_or(60).min(60)),
+        VideoSource::Element(_) => None,
+    };
+    let src = source.into_element(client_name, fps_cap);
+    let downstream_desc = video_encoder_downstream_description(encoder, framerate, bitrate_kbps);
     // Named/self-contained panic message (not a bare `.expect()`) so a
     // missing/broken encoder plugin says exactly that, rather than a
     // generic "parse failed" with no indication of *which* encoder or
@@ -872,7 +896,7 @@ mod tests {
     /// GStreamer pipeline needed, just the description string.
     #[test]
     fn downstream_description_always_has_the_fps_cap_gate() {
-        let desc = video_encoder_downstream_description(VideoEncoder::Software, 10_000);
+        let desc = video_encoder_downstream_description(VideoEncoder::Software, None, 10_000);
         assert!(desc.contains(&format!("identity name={FPS_CAP_ELEMENT_NAME}")), "pipeline description: {desc}");
         assert!(!desc.contains("videorate"), "pipeline description: {desc}");
     }

@@ -395,7 +395,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut stage, mut compositor) = match args.mode {
         Mode::Single => {
             eprintln!("viewer: spawning compositor directly (single mode)...");
-            (SessionType::User("user".to_string()), session_backend::spawn_user_compositor_direct(args.backend, "user", &payload, args.width as u32, args.height as u32)?)
+            (SessionType::User("user".to_string()), session_backend::spawn_user_compositor_direct(args.backend, "user", &payload, args.width as u32, args.height as u32, 60)?)
         }
         Mode::Handoff | Mode::Broker => {
             eprintln!("viewer: spawning Login compositor...");
@@ -533,7 +533,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // was (already-exited Login compositor, still-Null-able
                 // pipeline) rather than half torn down.
                 let spawn_result = match args.mode {
-                    Mode::Handoff => session_backend::spawn_user_compositor_direct(args.backend, "user", &payload, args.width as u32, args.height as u32),
+                    Mode::Handoff => session_backend::spawn_user_compositor_direct(args.backend, "user", &payload, args.width as u32, args.height as u32, 60),
                     Mode::Broker => runtime.block_on(session_backend::spawn_user_compositor_via_broker(
                         args.backend,
                         args.broker_socket.as_deref().expect("--mode broker requires --broker-socket, checked in parse_args"),
@@ -544,6 +544,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &payload,
                         args.width as u32,
                         args.height as u32,
+                        60,
                     )),
                     Mode::Single => unreachable!("Mode::Single has no Login stage to hand off from"),
                 };
