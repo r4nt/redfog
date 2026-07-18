@@ -151,12 +151,20 @@ impl SessionManager {
 
         let kwin_path = which_kwin_wayland().unwrap_or_else(|| "kwin_wayland".to_string());
         let pipewire_socket_path = format!("{}/pipewire-0", default_runtime_dir());
+        // Like `pipewire_socket_path` above: PipeWire/wireplumber/pipewire-
+        // pulse all run under `redfog-server`'s own identity, in *its*
+        // runtime dir (`HeadlessRuntime::start`), not this session's private
+        // `runtime_dir` — pointing PULSE_SERVER at the session dir instead
+        // (an earlier bug here) meant it never had a pulse server listening
+        // on it at all.
+        let pulse_socket_path = format!("{}/pulse/native", default_runtime_dir());
 
         let mut cmd = tokio::process::Command::new(&kwin_path);
         cmd.env("KWIN_PLATFORM", "virtual")
             .env("KWIN_WAYLAND_NO_PERMISSION_CHECKS", "1")
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("PIPEWIRE_REMOTE", &pipewire_socket_path)
+            .env("PULSE_SERVER", format!("unix:{pulse_socket_path}"))
             .env("LIBGL_ALWAYS_SOFTWARE", "1")
             .arg("--virtual")
             .arg("--width")
@@ -254,6 +262,9 @@ impl SessionManager {
 
         let kwin_path = which_kwin_wayland().unwrap_or_else(|| "kwin_wayland".to_string());
         let pipewire_socket_path = format!("{}/pipewire-0", default_runtime_dir());
+        // See `spawn_fake`'s equivalent comment: must be `default_runtime_dir()`,
+        // not this session's own private `runtime_dir`.
+        let pulse_socket_path = format!("{}/pulse/native", default_runtime_dir());
         let unit_name = format!("redfog-fake-pam-session-{}-{session_id}", std::process::id());
 
         // `systemd-run --user --scope` needs the *real* `XDG_RUNTIME_DIR`
@@ -274,6 +285,7 @@ impl SessionManager {
             .arg("KWIN_WAYLAND_NO_PERMISSION_CHECKS=1")
             .arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
             .arg(format!("PIPEWIRE_REMOTE={pipewire_socket_path}"))
+            .arg(format!("PULSE_SERVER=unix:{pulse_socket_path}"))
             .arg("LIBGL_ALWAYS_SOFTWARE=1")
             // No `--` here: this `env` (GNU coreutils 9.11) doesn't treat
             // it as an option terminator between the `NAME=VALUE`
@@ -382,6 +394,10 @@ impl SessionManager {
         // there, not a bare name that'd resolve inside KWin's own (empty,
         // unrelated) runtime dir instead.
         let pipewire_socket_path = format!("{}/pipewire-0", default_runtime_dir());
+        // Same reasoning as pipewire_socket_path: pipewire-pulse also runs
+        // under redfog-server's own identity, in its runtime dir — not
+        // this session's private `runtime_dir`.
+        let pulse_socket_path = format!("{}/pulse/native", default_runtime_dir());
         // redfog-server owns and creates this socket under its own
         // identity (see design.md's "Cross-user socket reachability") — the
         // target user's KWin needs an explicit grant to connect in, since
@@ -421,6 +437,8 @@ impl SessionManager {
         for (path, perm, what) in [
             (default_runtime_dir(), "x", "traverse"),
             (pipewire_socket_path.clone(), "rw", "connect to"),
+            (format!("{}/pulse", default_runtime_dir()), "x", "traverse"),
+            (pulse_socket_path.clone(), "rw", "connect to"),
         ] {
             grant_acl(username, &path, perm, what).await;
         }
@@ -441,7 +459,7 @@ impl SessionManager {
              --no-lockscreen --wayland-fd 3 --socket {socket_name} --xwayland"
         );
         if !payload.is_empty() {
-            let session_script_path = write_session_script(&runtime_dir, socket_name, &pipewire_socket_path, payload)?;
+            let session_script_path = write_session_script(&runtime_dir, socket_name, &pipewire_socket_path, &pulse_socket_path, payload)?;
             exec_start.push_str(&format!(" --exit-with-session {session_script_path}"));
         }
         let home_dir = home_dir_for(username).await?;
@@ -452,6 +470,7 @@ impl SessionManager {
              WorkingDirectory={home_dir}\n\
              Environment=XDG_RUNTIME_DIR={runtime_dir}\n\
              Environment=PIPEWIRE_REMOTE={pipewire_socket_path}\n\
+             Environment=PULSE_SERVER=unix:{pulse_socket_path}\n\
              Environment=KWIN_PLATFORM=virtual\n\
              Environment=KWIN_WAYLAND_NO_PERMISSION_CHECKS=1\n\
              Environment=LIBGL_ALWAYS_SOFTWARE=1\n\
@@ -585,6 +604,10 @@ impl SessionManager {
         let wayland_fd = std::os::unix::io::AsRawFd::as_raw_fd(&listener);
 
         let pipewire_socket_path = format!("{}/pipewire-0", default_runtime_dir());
+        // Same reasoning as pipewire_socket_path: pipewire-pulse also runs
+        // under redfog-server's own identity, in its runtime dir — not
+        // this session's private `runtime_dir`.
+        let pulse_socket_path = format!("{}/pulse/native", default_runtime_dir());
         // The pre-bound fd handoff only helps *KWin itself* (which inherits
         // it directly via fork+exec, following FD_CLOEXEC being cleared
         // above) — it does nothing for any *other* client that connects to
@@ -601,6 +624,8 @@ impl SessionManager {
             (default_runtime_dir(), "x", "traverse"),
             (pipewire_socket_path.clone(), "rw", "connect to"),
             (wayland_socket_path.clone(), "rw", "connect to"),
+            (format!("{}/pulse", default_runtime_dir()), "x", "traverse"),
+            (pulse_socket_path.clone(), "rw", "connect to"),
         ] {
             match tokio::process::Command::new("setfacl").args(["-m", &format!("u:{username}:{perm}"), &path]).output().await {
                 Ok(output) if output.status.success() => tracing::info!("granted {username} {what} access on {path}"),
@@ -663,7 +688,7 @@ impl SessionManager {
             .arg(socket_name)
             .arg("--xwayland");
         if !payload.is_empty() {
-            let session_script_path = write_session_script(&runtime_dir, socket_name, &pipewire_socket_path, payload)?;
+            let session_script_path = write_session_script(&runtime_dir, socket_name, &pipewire_socket_path, &pulse_socket_path, payload)?;
             cmd.arg("--exit-with-session").arg(session_script_path);
         }
 
@@ -683,6 +708,7 @@ impl SessionManager {
             .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin")
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("PIPEWIRE_REMOTE", &pipewire_socket_path)
+            .env("PULSE_SERVER", &format!("unix:{pulse_socket_path}"))
             .env("KWIN_PLATFORM", "virtual")
             .env("KWIN_WAYLAND_NO_PERMISSION_CHECKS", "1")
             .env("LIBGL_ALWAYS_SOFTWARE", "1")
@@ -1140,14 +1166,15 @@ async fn resolve_user(username: &str) -> Result<(u32, u32, String), String> {
 /// compositor is already fully up) — so doing it here, right before
 /// exec'ing the real payload, gets that ordering for free, no separate
 /// wait-for-socket polling needed.
-fn write_session_script(runtime_dir: &str, socket_name: &str, pipewire_socket_path: &str, payload: &[String]) -> Result<String, String> {
+fn write_session_script(runtime_dir: &str, socket_name: &str, pipewire_socket_path: &str, pulse_socket_path: &str, payload: &[String]) -> Result<String, String> {
     fn shell_quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', r"'\''"))
     }
     let payload_cmd = payload.iter().map(|arg| shell_quote(arg)).collect::<Vec<_>>().join(" ");
     let session_script = format!(
         "#!/bin/sh\n\
-         dbus-update-activation-environment --systemd WAYLAND_DISPLAY={socket_name} XDG_RUNTIME_DIR={runtime_dir} PIPEWIRE_REMOTE={pipewire_socket_path}\n\
+         export PULSE_SERVER=unix:{pulse_socket_path}\n\
+         dbus-update-activation-environment --systemd WAYLAND_DISPLAY={socket_name} XDG_RUNTIME_DIR={runtime_dir} PIPEWIRE_REMOTE={pipewire_socket_path} PULSE_SERVER=unix:{pulse_socket_path}\n\
          exec {payload_cmd}\n"
     );
     let session_script_path = format!("{runtime_dir}/session-start.sh");

@@ -10,6 +10,7 @@
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes128Gcm, Key as GcmKey, Nonce};
+use cbc::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
@@ -127,6 +128,29 @@ pub fn gcm_encrypt(plaintext: &[u8], key: &[u8; 16], iv: &[u8; 12]) -> Result<(V
     Ok((buffer, tag.into()))
 }
 
+/// Encrypt with AES-128-CBC + PKCS7 padding — the base GameStream protocol's
+/// audio wire encryption. Unlike the control channel's AES-GCM (gated by the
+/// `x-ss-general.encryptionSupported` CONTROL_V2 bit), audio encryption is
+/// unconditional: confirmed by reading moonlight-common-rust's
+/// `AudioDepayloader::poll_frame` (not vendored into git, see
+/// scripts/fetch-patched-deps.sh), which decrypts every packet whenever a
+/// `SunshineEncryption` key is configured at all, with no SDP negotiation
+/// gating it. `key` is the client's `rikey` (from `/launch`'s `rikey` param);
+/// `iv` is derived by the caller from `rikeyid` + the packet's RTP sequence
+/// number (see `AudioStream.c`'s scheme, same source).
+pub fn cbc_encrypt(plaintext: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
+    type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+    let mut buffer = plaintext.to_vec();
+    let padded_len = plaintext.len().div_ceil(16) * 16 + 16;
+    buffer.resize(padded_len, 0);
+    let len = Aes128CbcEnc::new(key.into(), iv.into())
+        .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
+        .expect("buffer sized for pkcs7 padding")
+        .len();
+    buffer.truncate(len);
+    buffer
+}
+
 /// RSA-PKCS1v15-SHA256 sign `data` with the server's private key (PEM,
 /// PKCS8).
 pub fn rsa_sign(data: &[u8], private_key_pem: &str) -> Result<Vec<u8>, CryptoError> {
@@ -152,4 +176,36 @@ pub fn rsa_verify(data: &[u8], signature: &[u8], cert_pem: &str) -> Result<(), C
     public_key
         .verify(pkcs1v15_sha256(), &digest, signature)
         .map_err(|_| "signature verification failed".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cbc::cipher::BlockDecryptMut;
+
+    /// Independent decrypt path (not `cbc_encrypt`'s own code) — catches an
+    /// encode/decode asymmetry that a round-trip through the exact same
+    /// function couldn't.
+    fn cbc_decrypt_reference(ciphertext: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
+        type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+        let mut buffer = ciphertext.to_vec();
+        let plaintext = Aes128CbcDec::new(key.into(), iv.into())
+            .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+            .expect("valid pkcs7 padding");
+        plaintext.to_vec()
+    }
+
+    #[test]
+    fn cbc_encrypt_round_trips() {
+        let key = [0x42u8; 16];
+        let iv = [0x11u8; 16];
+        for len in [0, 1, 15, 16, 17, 100, 960] {
+            let plaintext: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let ciphertext = cbc_encrypt(&plaintext, &key, &iv);
+            // PKCS7 always adds at least one byte of padding, even when the
+            // input is already block-aligned.
+            assert_eq!(ciphertext.len(), (len / 16 + 1) * 16);
+            assert_eq!(cbc_decrypt_reference(&ciphertext, &key, &iv), plaintext);
+        }
+    }
 }

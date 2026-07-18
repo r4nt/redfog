@@ -511,8 +511,18 @@ pub fn request_keyframe(pipeline: &gst::Pipeline) {
 /// A per-session virtual audio sink: apps in the compositor session play
 /// audio to `sink_name`, which we then capture from `capture_name`. Backed
 /// by `pw-loopback` rather than PipeWire's own graph, since nothing creates
-/// a default sink in `HeadlessRuntime`'s isolated PipeWire instance
-/// otherwise (there's no real hardware for wireplumber to link to).
+/// a session-specific sink in `HeadlessRuntime`'s isolated PipeWire instance
+/// otherwise.
+///
+/// `HeadlessRuntime`'s PipeWire instance is isolated in D-Bus/socket
+/// namespace only — `/dev/snd` itself isn't namespaced, so wireplumber's
+/// ALSA monitor still sees and claims the host's *real* hardware sink there
+/// too, and by default picks it (not our loopback) as `default.audio.sink`.
+/// Confirmed live: without forcing the default below, an app's audio linked
+/// straight to `alsa_output.<real-card>` — playing out the host's actual
+/// speakers, completely bypassing capture, while this pipeline still
+/// happily encoded/sent real (just near-silent) packets the whole time, no
+/// error anywhere in that chain.
 pub struct AudioLoopback {
     pub sink_name: String,
     pub capture_name: String,
@@ -538,6 +548,34 @@ impl AudioLoopback {
             .spawn()
             .map_err(|e| format!("failed to spawn pw-loopback: {e}"))?;
 
+        // Force this session's sink to be the default target for new audio
+        // streams — see the struct doc comment for why this can't be left
+        // to wireplumber's own default-node policy. Setting
+        // `default.configured.audio.sink` on the "default" metadata object
+        // (not the separate "settings" one — that name looks right but
+        // doesn't actually drive default-node selection, confirmed live)
+        // is picked up by wireplumber's already-running default-nodes
+        // module, including re-routing streams that linked to the old
+        // default *before* this ran — no restart of the app or of
+        // wireplumber itself needed. Best-effort: a session should still
+        // work (just possibly without audio) rather than fail outright if
+        // `pw-metadata` is missing or this particular PipeWire build wires
+        // default-node selection differently.
+        match Command::new("pw-metadata")
+            .args(["-n", "default", "0", "default.configured.audio.sink", &format!(r#"{{"name":"{sink_name}"}}"#)])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                eprintln!("redfog-core: set default.configured.audio.sink to {sink_name}");
+            }
+            Ok(output) => eprintln!(
+                "redfog-core: pw-metadata set default.configured.audio.sink to {sink_name} exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(e) => eprintln!("redfog-core: failed to run pw-metadata to set default.configured.audio.sink to {sink_name}: {e}"),
+        }
+
         Ok(Self {
             sink_name,
             capture_name,
@@ -556,6 +594,20 @@ impl Drop for AudioLoopback {
 /// Capture -> Opus encode pipeline for network streaming: `pipewiresrc`
 /// targeting an [`AudioLoopback`]'s capture side -> stereo 48kHz -> Opus.
 /// Delivers one encoded Opus packet per callback invocation.
+///
+/// `frame-size=5`, NOT the more common VoIP default of 20ms: Moonlight's
+/// wire protocol hardcodes a 5ms audio packet duration on the *client* side
+/// (confirmed by reading moonlight-common-rust — not vendored into git, see
+/// scripts/fetch-patched-deps.sh — `stream/proto/mod.rs`'s
+/// `audio_packet_duration = Duration::from_millis(5)`, used to compute
+/// `samples_per_frame` for `OpusMultistreamConfig`). A downstream client
+/// (e.g. a WebRTC relay) that paces playback using that negotiated
+/// `samples_per_frame` value has no way to know we're actually sending 4x
+/// as much audio per packet as that implies — confirmed live: with
+/// `frame-size=20`, a WebRTC-based client's presentation clock advanced 4x
+/// slower than real audio arrived, causing a deterministic (not
+/// random-packet-loss-driven) queue-up-then-flush every few seconds —
+/// silence, then a fast, garbled burst, on a perfectly regular cycle.
 pub fn make_audio_pipeline<F>(loopback: &AudioLoopback, client_name: &str, on_packet: F) -> gst::Pipeline
 where
     F: Fn(Vec<u8>) + Send + Sync + 'static,
@@ -564,7 +616,7 @@ where
         "pipewiresrc target-object={capture_name} client-name={client_name} do-timestamp=true \
          ! audioconvert ! audioresample \
          ! audio/x-raw,format=S16LE,channels=2,rate=48000 \
-         ! opusenc frame-size=20 \
+         ! opusenc frame-size=5 \
          ! appsink name=sink sync=false",
         capture_name = loopback.capture_name,
     );

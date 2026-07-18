@@ -246,6 +246,12 @@ pub struct SessionManager {
     /// Shared with `control::ControlServer` — see its doc comment for why
     /// this is a cell rather than passed in at construction.
     rikey_cell: Arc<Mutex<Option<[u8; 16]>>>,
+    /// `rikeyid` — kept alongside `rikey_cell` (not folded into it, to avoid
+    /// touching `control::ControlServer`'s existing `Arc<Mutex<Option<[u8;
+    /// 16]>>>`-typed reader) purely for audio's AES-CBC IV derivation (see
+    /// `AudioPacketizer::packetize_encrypted`). Always set in lockstep with
+    /// `rikey_cell` — every write site touches both.
+    rikey_key_id: Arc<Mutex<Option<u32>>>,
     /// Bumped whenever `rikey_cell` changes for a reconnect/takeover (see
     /// `set_rikey`) — see `control::ControlServer::rikey_generation`'s doc
     /// comment for the full reasoning (a plain "disconnect everyone
@@ -331,6 +337,7 @@ impl SessionManager {
             spawn_done: Condvar::new(),
             self_ref: OnceLock::new(),
             rikey_cell: Arc::new(Mutex::new(None)),
+            rikey_key_id: Arc::new(Mutex::new(None)),
             rikey_generation: Arc::new(AtomicU64::new(0)),
             video_packetizer: Mutex::new(Arc::new(Mutex::new(VideoPacketizer::new()))),
             audio_packetizer: Mutex::new(Arc::new(Mutex::new(AudioPacketizer::new()))),
@@ -574,8 +581,9 @@ impl SessionManager {
     /// Sets the active `rikey` for a reconnect/takeover and bumps the
     /// generation counter so `control::ControlServer` disconnects peers left
     /// over from before this point — see `rikey_generation`'s doc comment.
-    fn set_rikey(&self, key: [u8; 16]) {
+    fn set_rikey(&self, key: [u8; 16], key_id: u32) {
         *self.rikey_cell.lock().unwrap() = Some(key);
+        *self.rikey_key_id.lock().unwrap() = Some(key_id);
         self.rikey_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
@@ -794,15 +802,59 @@ impl SessionManager {
                 let Some(sender) = shared.audio_sender.clone() else { return };
                 sender
             };
+            // Audio is unconditionally AES-128-CBC-encrypted in the base
+            // protocol (see `crypto::cbc_encrypt`'s doc comment) — `rikey`
+            // is set synchronously during `/launch`, before this pipeline is
+            // ever built, so `None` here would mean a real ordering bug
+            // rather than an expected race; drop the packet rather than
+            // sending it unencrypted (the client would just fail to decrypt
+            // it anyway).
+            let (key, key_id) = {
+                let key = *this.rikey_cell.lock().unwrap();
+                let key_id = *this.rikey_key_id.lock().unwrap();
+                match (key, key_id) {
+                    (Some(key), Some(key_id)) => (key, key_id),
+                    _ => {
+                        tracing::warn!("dropping audio packet: rikey not yet known");
+                        return;
+                    }
+                }
+            };
             let audio_packetizer = this.audio_packetizer.lock().unwrap().clone();
             let stream_start = *this.stream_start.lock().unwrap();
-            // Opus's RTP clock rate is 48kHz regardless of the actual sample rate.
-            let rtp_timestamp = (stream_start.elapsed().as_secs_f64() * 48_000.0) as u32;
-            let opus_packet = audio_packetizer.lock().unwrap().packetize(&packet, rtp_timestamp);
-            handle.spawn(async move {
-                // Bounded — see the video callback's own doc comment above
-                // for why (same mechanism, same fix, applied to the audio
-                // UDP port too).
+            // NOT a 48kHz sample-rate clock, despite that being the
+            // textbook RTP/Opus answer (and what this line used to do) —
+            // Moonlight's audio wire format is a genuine protocol deviation
+            // here: the timestamp field is plain milliseconds. Confirmed
+            // against moonlight-common-rust, which documents this directly
+            // (`stream/audio.rs`: "Timestamps are in milliseconds") and
+            // simulates it the same way for its C-bindings fallback
+            // (incrementing by `frame_duration.as_millis()` per packet).
+            // Sending 48000x too fast made the client's presentation clock
+            // run ~48x ahead of real time, which it then had to "catch up"
+            // to — confirmed live: audio played in silent-then-rushed-
+            // garbled-burst cycles until this was fixed.
+            let rtp_timestamp = stream_start.elapsed().as_millis() as u32;
+            let opus_packet = audio_packetizer.lock().unwrap().packetize_encrypted(&packet, rtp_timestamp, &key, key_id);
+            // `block_on`, deliberately NOT `handle.spawn` (unlike the video
+            // callback above): spawned tasks have no ordering guarantee
+            // relative to each other once handed to tokio's scheduler, so
+            // under any scheduling jitter two packets could hit the wire
+            // out of the order they were captured in. The client's audio
+            // depayloader has zero tolerance for that — any packet arriving
+            // with a sequence number lower than one it's already seen gets
+            // dropped as permanently stale (no FEC to recover it, since we
+            // send redundancy=0), which stalls its jitter buffer until
+            // enough forward packets pile up to skip past the gap, then
+            // dumps them all at once. Confirmed live: the client logged
+            // exactly this ("Network dropped audio data (expected 990, but
+            // received 991)") and audio played in silent-then-rushed-burst
+            // cycles until sends were forced strictly in-order here.
+            // GStreamer already calls `new_sample` serially on one thread
+            // per pipeline, so blocking this thread on the send (bounded,
+            // same as video's spawn-based timeout) is enough to guarantee
+            // that ordering all the way onto the wire.
+            handle.block_on(async move {
                 match tokio::time::timeout(Duration::from_secs(2), sender.send_packet(&opus_packet)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => tracing::warn!("audio send failed: {e}"),
@@ -1454,7 +1506,7 @@ impl LaunchHandler for SessionManager {
                 // does below.
                 if matches!(shared.state, State::Launched { .. } | State::Streaming { .. }) {
                     drop(shared);
-                    self.set_rikey(rikey.key);
+                    self.set_rikey(rikey.key, rikey.key_id as u32);
                     return Ok(());
                 }
                 // The in-flight spawn failed (back to `Idle`) — fall
@@ -1527,8 +1579,9 @@ impl LaunchHandler for SessionManager {
         // reconnect-takeover case always did.
         if was_idle {
             *self.rikey_cell.lock().unwrap() = Some(rikey.key);
+            *self.rikey_key_id.lock().unwrap() = Some(rikey.key_id as u32);
         } else {
-            self.set_rikey(rikey.key);
+            self.set_rikey(rikey.key, rikey.key_id as u32);
         }
         let mut shared = self.shared.lock().unwrap();
         shared.state = State::Launched { session };

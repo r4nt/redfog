@@ -34,6 +34,22 @@ impl AudioPacketizer {
         Self { sequence_number: 0 }
     }
 
+    /// Encrypt one Opus frame (AES-128-CBC + PKCS7, base-protocol audio
+    /// encryption — see `crypto::cbc_encrypt`'s doc comment for why this
+    /// isn't optional) and wrap it in Moonlight's audio RTP-style header.
+    /// `key` is the client's `rikey`; `key_id` is `rikeyid`. The IV's first 4
+    /// bytes must be `key_id + this packet's RTP sequence number` — computed
+    /// here, *before* `packetize` assigns and increments that same sequence
+    /// number, so the two stay in lockstep the way the client's depayloader
+    /// expects (it derives the same IV from the header's own sequence
+    /// number).
+    pub fn packetize_encrypted(&mut self, opus_frame: &[u8], rtp_timestamp: u32, key: &[u8; 16], key_id: u32) -> Vec<u8> {
+        let mut iv = [0u8; 16];
+        iv[0..4].copy_from_slice(&key_id.wrapping_add(self.sequence_number as u32).to_be_bytes());
+        let ciphertext = crate::crypto::cbc_encrypt(opus_frame, key, &iv);
+        self.packetize(&ciphertext, rtp_timestamp)
+    }
+
     /// Wrap one Opus frame in Moonlight's audio RTP-style header.
     pub fn packetize(&mut self, opus_frame: &[u8], rtp_timestamp: u32) -> Vec<u8> {
         let mut packet = vec![0u8; RTP_HEADER_SIZE + opus_frame.len()];

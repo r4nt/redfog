@@ -58,6 +58,7 @@ pub struct HeadlessRuntime {
     pub pipewire_socket: PathBuf,
     pipewire: Child,
     wireplumber: Child,
+    pipewire_pulse: Child,
 }
 
 impl HeadlessRuntime {
@@ -83,49 +84,39 @@ impl HeadlessRuntime {
 
         // By default, libpipewire-module-access assigns new clients on the
         // regular pipewire-0 socket "default" (restricted) access, and they
-        // wait forever for wireplumber to explicitly upgrade it — which
-        // never happens for a client connecting under a different uid than
-        // this (private, headless-only) PipeWire instance runs as. Confirmed
-        // live: a broker-spawned KWin, granted socket-file access via ACL,
-        // still hung on "Failed to connect PipeWire context" without this.
-        // Since this instance is already fully isolated from the user's real
-        // desktop PipeWire (own XDG_RUNTIME_DIR, own D-Bus session, nothing
-        // else ever shares it), granting "unrestricted" to all clients on it
-        // is safe — there's nothing else on it to protect against.
-        //
-        // This instance is already entirely bespoke, so rather than merge a
-        // drop-in into the system's config search path (uncertain semantics,
-        // and would also make it depend on $HOME/$XDG_CONFIG_HOME, which
-        // this deliberately isolated setup otherwise doesn't touch), it owns
-        // a self-contained config directory outright: the system's default
-        // pipewire.conf copied in once, plus our own override on top, with
-        // PIPEWIRE_CONFIG_DIR pointed at nothing else. No dependency on the
-        // real user's config space at all, in either direction.
+        // are unable to see the virtual video/audio nodes wireplumber later
+        // registers (confirmed live: the RTSP/GST client could pair and
+        // connect, but sat waiting forever on a video stream whose source
+        // node it didn't have PipeWire permission to see).
+        // Since we are running in a dedicated, isolated runtime directory and
+        // own process group anyway, we don't need any client-isolation
+        // controls. Switch access control to "unrestricted" so clients can
+        // see all nodes.
+        // We configure this by writing a custom config override for this
+        // isolated PipeWire run. Since we override PIPEWIRE_CONFIG_DIR, we need to
+        // copy the system config in first.
         let pipewire_config_dir = runtime_dir.join("pipewire-config");
         std::fs::create_dir_all(pipewire_config_dir.join("pipewire.conf.d"))?;
         const SYSTEM_PIPEWIRE_CONF: &str = "/usr/share/pipewire/pipewire.conf";
         std::fs::copy(SYSTEM_PIPEWIRE_CONF, pipewire_config_dir.join("pipewire.conf"))
             .map_err(|e| format!("failed to copy {SYSTEM_PIPEWIRE_CONF} into {pipewire_config_dir:?}: {e}"))?;
+
+        const SYSTEM_PULSE_CONF: &str = "/usr/share/pipewire/pipewire-pulse.conf";
+        if std::path::Path::new(SYSTEM_PULSE_CONF).exists() {
+            let _ = std::fs::copy(SYSTEM_PULSE_CONF, pipewire_config_dir.join("pipewire-pulse.conf"));
+        }
+
         // Specifying access.socket at all switches libpipewire-module-access
-        // out of its "legacy" mode (which defaults every client to
-        // unrestricted with no config at all) into explicit socket-based
-        // mode — where any socket *not* listed here falls back to
+        // to socket-based policy. Map our custom socket name
+        // "pipewire-0-manager" to unrestricted, and fall back to mapping
         // "default" (restricted). pipewire-0-manager (wireplumber's own
-        // socket) must stay listed as unrestricted too, or this would
-        // silently break wireplumber's ability to manage the graph at all
-        // — confirmed live: omitting it here still left KWin unable to
+        // connection to pipewire) needs unrestricted permissions so it can
         // connect, even with pipewire-0 itself correctly set.
         std::fs::write(
             pipewire_config_dir.join("pipewire.conf.d/99-redfog-unrestricted-access.conf"),
             "module.access.args = {\n    access.socket = {\n        pipewire-0 = \"unrestricted\"\n        pipewire-0-manager = \"unrestricted\"\n    }\n}\n",
         )?;
 
-        // TEMPORARY debugging aid for the cross-UID PipeWire access
-        // investigation (see design.md) — un-suppresses PipeWire's own
-        // stdout/stderr and adds verbosity so its actual server-side
-        // rejection reason is visible, instead of only KWin's generic
-        // "Failed to connect PipeWire context" wrapper message. Remove once
-        // that's understood.
         let debug_pipewire = std::env::var_os("REDFOG_DEBUG_PIPEWIRE_LOG").is_some();
         let mut pipewire_cmd = Command::new("pipewire");
         pipewire_cmd.env("XDG_RUNTIME_DIR", &runtime_dir).env("PIPEWIRE_CONFIG_DIR", &pipewire_config_dir);
@@ -140,13 +131,35 @@ impl HeadlessRuntime {
             return Err("PipeWire socket did not appear within 10s".into());
         }
 
-        let wireplumber = Command::new("wireplumber")
-            .env("XDG_RUNTIME_DIR", &runtime_dir)
+        let mut wireplumber_cmd = Command::new("wireplumber");
+        wireplumber_cmd.env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("PIPEWIRE_REMOTE", &pipewire_socket)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("failed to spawn wireplumber: {e}"))?;
+            .env("PIPEWIRE_CONFIG_DIR", &pipewire_config_dir);
+        if debug_pipewire {
+            wireplumber_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        } else {
+            wireplumber_cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        let wireplumber = wireplumber_cmd.spawn().map_err(|e| format!("failed to spawn wireplumber: {e}"))?;
+
+        let mut pipewire_pulse_cmd = Command::new("pipewire-pulse");
+        pipewire_pulse_cmd.env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("PIPEWIRE_REMOTE", &pipewire_socket)
+            .env("PIPEWIRE_CONFIG_DIR", &pipewire_config_dir)
+            .env_remove("PULSE_SERVER")
+            .env_remove("PULSE_RUNTIME_PATH");
+        if debug_pipewire {
+            pipewire_pulse_cmd.arg("-v").stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        } else {
+            pipewire_pulse_cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        let pipewire_pulse = pipewire_pulse_cmd.spawn().map_err(|e| format!("failed to spawn pipewire-pulse: {e}"))?;
+
+        let pulse_socket = runtime_dir.join("pulse/native");
+        if !wait_for_path(&pulse_socket, Duration::from_secs(10)) {
+            return Err("PipeWire-Pulse socket did not appear within 10s".into());
+        }
+
         // wireplumber needs a moment to bring the PipeWire graph out of
         // 'suspended' before nodes will transition to running.
         std::thread::sleep(Duration::from_secs(1));
@@ -158,6 +171,7 @@ impl HeadlessRuntime {
             pipewire_socket,
             pipewire,
             wireplumber,
+            pipewire_pulse,
         })
     }
 }
@@ -166,6 +180,8 @@ impl Drop for HeadlessRuntime {
     fn drop(&mut self) {
         let _ = self.wireplumber.kill();
         let _ = self.wireplumber.wait();
+        let _ = self.pipewire_pulse.kill();
+        let _ = self.pipewire_pulse.wait();
         let _ = self.pipewire.kill();
         let _ = self.pipewire.wait();
     }
