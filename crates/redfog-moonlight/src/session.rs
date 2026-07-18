@@ -48,6 +48,7 @@ pub struct SessionConfig {
     /// gst-wayland-display backend).
     pub user_app: Vec<String>,
     pub bitrate_kbps: u32,
+    pub video_encoder: redfog_core::VideoEncoder,
     /// Logs every mouse input event (move/button/scroll) at `info` level
     /// when true — separate from `RUST_LOG=debug`, which also floods with
     /// per-frame video encoder logs. For diagnosing real-client mouse
@@ -724,6 +725,7 @@ impl SessionManager {
         // the *current* sender up fresh on every frame via `self`, rather
         // than capturing today's (always-`None`) value once here.
         let bitrate = self.config.bitrate_kbps;
+        let video_encoder = self.config.video_encoder;
         let this = self.arc_self();
         // `video_packetizer`/`audio_packetizer`/`stream_start` are looked up
         // fresh from `this` inside each closure below, NOT captured once
@@ -747,7 +749,7 @@ impl SessionManager {
         // confirmed live via matching mutex addresses across generations.
         let video_client_name = format!("redfog-video-gen-{generation}");
         let audio_client_name = format!("redfog-audio-gen-{generation}");
-        let video_pipeline = redfog_core::make_encoder_pipeline(compositor.video_source(), &video_client_name, bitrate, {
+        let video_pipeline = redfog_core::make_encoder_pipeline(compositor.video_source(), &video_client_name, video_encoder, bitrate, {
             let handle = handle.clone();
             let this = this.clone();
             move |data, is_key_frame| {

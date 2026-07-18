@@ -440,21 +440,86 @@ where
     pipeline
 }
 
-/// Name of the `x264enc` element in the pipeline built by
+/// Name of the H.264 encoder element (`x264enc` or `nvh264enc`, whichever
+/// [`VideoEncoder`] selected) in the pipeline built by
 /// [`make_encoder_pipeline`], so callers can address it (e.g. [`request_keyframe`]).
+/// Kept identical across both so `request_keyframe` stays encoder-agnostic —
+/// both subclass `GstVideoEncoder`, which handles the upstream
+/// force-key-unit event generically.
 const ENCODER_ELEMENT_NAME: &str = "enc";
+
+/// Which H.264 encoder [`make_encoder_pipeline`] builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoEncoder {
+    /// `x264enc` — always available, no GPU dependency. Default: safe on
+    /// any machine, including CI/dev boxes without an NVIDIA GPU.
+    #[default]
+    Software,
+    /// `nvh264enc` (NVCODEC/NVENC) — confirmed live on an RTX 2080 to work
+    /// cleanly with plain system-memory NV12 input (no explicit CUDA
+    /// upload element needed; the element negotiates its own CUDA context
+    /// and does the upload internally). This is a genuinely separate GPU
+    /// path from KWin's virtual-output rendering (DRM/GBM), which is why
+    /// it isn't blocked by the unrelated `gbm_create_device` segfault seen
+    /// there — see project notes on the NVIDIA GBM issue.
+    Nvenc,
+}
+
+impl VideoEncoder {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VideoEncoder::Software => "software",
+            VideoEncoder::Nvenc => "nvenc",
+        }
+    }
+}
+
+/// Wire/env-var representation — `"software"` / `"nvenc"`
+/// (`REDFOG_VIDEO_ENCODER`, see `redfog-server::main`), mirroring
+/// `session_backend::Backend`'s `FromStr` shape.
+impl std::str::FromStr for VideoEncoder {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "software" => Ok(VideoEncoder::Software),
+            "nvenc" => Ok(VideoEncoder::Nvenc),
+            other => Err(format!("unknown video encoder {other:?} (expected \"software\" or \"nvenc\")")),
+        }
+    }
+}
+
+/// Picks `Nvenc` if the `nvh264enc` element is registered, `Software`
+/// otherwise. Requires `gst::init()` to have already run (element factory
+/// lookups return nothing before then) — `redfog-server::main` calls this
+/// after `gstreamer::init()`, only as the fallback when `REDFOG_VIDEO_ENCODER`
+/// isn't set explicitly, so the env var always wins over auto-detection in
+/// either direction.
+///
+/// Deliberately just a factory-registration check, not a real pipeline
+/// construction attempt: cheap, and doesn't open a CUDA context just to
+/// answer the question. That means this can say "available" for a plugin
+/// that's installed but unhealthy (wrong driver, no GPU) — a real
+/// mismatch will only surface when [`make_encoder_pipeline`] actually
+/// tries to build the pipeline, which is why *that* failure path needs to
+/// say something useful (see its own panic message) rather than relying
+/// on this check to have already ruled it out.
+pub fn detect_video_encoder() -> VideoEncoder {
+    if gst::ElementFactory::find("nvh264enc").is_some() {
+        eprintln!("redfog-core: nvh264enc is available, defaulting to hardware video encoding");
+        VideoEncoder::Nvenc
+    } else {
+        eprintln!("redfog-core: nvh264enc not found, defaulting to software video encoding (x264enc)");
+        VideoEncoder::Software
+    }
+}
 
 /// Capture -> H.264 encode pipeline for network streaming (as opposed to
 /// [`make_pipeline`]'s raw-BGRx path for local display). Delivers Annex-B
 /// access units (one per encoded frame) to `on_access_unit(bytes, is_keyframe)`.
-///
-/// Software `x264enc` for this iteration; `nvh264enc` is a drop-in swap once
-/// hardware encoding is worth the complexity (see project notes on the
-/// NVIDIA GBM issue — encoding is a separate GPU path from KWin's virtual
-/// backend rendering, so it isn't necessarily blocked by the same bug).
 pub fn make_encoder_pipeline<F>(
     source: VideoSource,
     client_name: &str,
+    encoder: VideoEncoder,
     bitrate_kbps: u32,
     on_access_unit: F,
 ) -> gst::Pipeline
@@ -462,16 +527,45 @@ where
     F: Fn(Vec<u8>, bool) + Send + Sync + 'static,
 {
     let src = source.into_element(client_name);
-    let downstream_desc = format!(
-        "videoconvert \
-         ! video/x-raw,format=I420 \
-         ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
-                   byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
-         ! video/x-h264,stream-format=byte-stream,alignment=au \
-         ! appsink name=sink sync=false"
-    );
-    let downstream = gst::parse_bin_from_description(&downstream_desc, true)
-        .expect("downstream encoder bin parse failed");
+    let downstream_desc = match encoder {
+        VideoEncoder::Software => format!(
+            "videoconvert \
+             ! video/x-raw,format=I420 \
+             ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
+                       byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=sink sync=false"
+        ),
+        // `repeat-sequence-header=true` is the NVENC equivalent of
+        // x264enc's default byte-stream SPS/PPS-per-IDR behavior — without
+        // it a client that (re)joins mid-stream, or loses the very first
+        // access unit, never gets a parameter set to decode against.
+        // `zerolatency=true` + `tune=ultra-low-latency` + `rc-mode=cbr`
+        // match the software path's own zerolatency/CBR intent.
+        // `gop-size` is x264enc's `key-int-max` under a different name.
+        VideoEncoder::Nvenc => format!(
+            "videoconvert \
+             ! video/x-raw,format=NV12 \
+             ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
+                         rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=sink sync=false"
+        ),
+    };
+    // Named/self-contained panic message (not a bare `.expect()`) so a
+    // missing/broken encoder plugin says exactly that, rather than a
+    // generic "parse failed" with no indication of *which* encoder or
+    // *why* — this is the failure mode `detect_video_encoder`'s doc
+    // comment warns about (plugin registered but unhealthy driver/no GPU),
+    // and it's much more common in practice than a typo in the pipeline
+    // description string.
+    let downstream = gst::parse_bin_from_description(&downstream_desc, true).unwrap_or_else(|e| {
+        panic!(
+            "failed to build the {encoder:?} video encoder pipeline: {e}\n\
+             (pipeline description: {downstream_desc:?})\n\
+             If this is Nvenc, force REDFOG_VIDEO_ENCODER=software to rule out a broken/mismatched NVENC driver install."
+        )
+    });
 
     let pipeline = gst::Pipeline::new();
     pipeline.add(&src).expect("failed to add source to pipeline");
@@ -660,5 +754,20 @@ mod tests {
     fn audio_pipeline_requests_5ms_opus_frames() {
         let desc = audio_pipeline_description("some-capture-node", "some-client");
         assert!(desc.contains("opusenc frame-size=5"), "pipeline description: {desc}");
+    }
+
+    /// Can't assert *which* encoder without depending on the test machine
+    /// having (or not having) an NVENC-capable GPU — this just guards the
+    /// detection logic itself: it must agree with a direct factory lookup,
+    /// not e.g. always return `Software` regardless of what's installed.
+    #[test]
+    fn detect_video_encoder_matches_element_factory_lookup() {
+        gst::init().expect("gst::init");
+        let expected = if gst::ElementFactory::find("nvh264enc").is_some() {
+            VideoEncoder::Nvenc
+        } else {
+            VideoEncoder::Software
+        };
+        assert_eq!(detect_video_encoder(), expected);
     }
 }

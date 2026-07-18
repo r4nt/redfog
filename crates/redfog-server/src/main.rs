@@ -102,6 +102,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(s) => s.parse::<redfog_moonlight::session::Backend>()?,
         Err(_) => redfog_moonlight::session::Backend::default(),
     };
+    // Auto-detected (prefers nvenc if the plugin is registered — see
+    // `detect_video_encoder`'s doc comment) unless explicitly overridden in
+    // either direction, e.g. REDFOG_VIDEO_ENCODER=software to force
+    // software even when a (possibly unhealthy) NVENC install is present.
+    let video_encoder = match std::env::var("REDFOG_VIDEO_ENCODER") {
+        Ok(s) => s.parse::<redfog_core::VideoEncoder>()?,
+        Err(_) => redfog_core::detect_video_encoder(),
+    };
 
     // The login screen's session picker (see redfog_login_protocol's own
     // doc comment for why redfog-login reads this same file directly
@@ -137,6 +145,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         login_app,
         user_app,
         bitrate_kbps: 10_000,
+        video_encoder,
         broker_socket_path,
         log_mouse_events,
         backend,
