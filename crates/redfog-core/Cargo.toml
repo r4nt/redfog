@@ -10,7 +10,9 @@ wayland-scanner = "0.31"
 wayland-backend = "0.3"
 gstreamer = "0.21"
 gstreamer-app = "0.21"
-gstreamer-video = "0.21"
+gstreamer-video = { version = "0.21", features = ["v1_24"] }
+gstreamer-allocators = "0.21"
+libc = "0.2"
 
 [dev-dependencies]
 nix = { version = "0.26", features = ["signal"] }

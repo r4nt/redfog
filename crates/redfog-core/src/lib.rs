@@ -1,12 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, Child};
 use std::sync::{Arc, Mutex};
+use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 use gstreamer as gst;
+use gstreamer_allocators as gst_allocators;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gst::prelude::*;
+use kwin_capture::pipewire_capture::PipewireCapture;
 
 use wayland_client::{
     delegate_noop,
@@ -82,6 +85,13 @@ pub struct CompositorSession {
     kwin_process: Option<Child>,
     pub capture_session: CaptureSession,
     pub pipewire_node_id: u32,
+    /// Only used to build [`VideoSource::KwinNativeDmaBuf`]'s appsrc caps —
+    /// see [`CompositorSession::video_source`]. Not kept in sync with
+    /// `capture_session.resize()`; the native path doesn't support live
+    /// resize yet (same limitation `GstWaylandDisplay`/`Login` already have).
+    width: i32,
+    height: i32,
+    fps: u32,
 }
 
 /// A video frame source for [`make_pipeline`]/[`make_encoder_pipeline`] —
@@ -101,6 +111,16 @@ pub struct CompositorSession {
 /// frames through, not a live `AppSrc` handle up front.
 pub enum VideoSource {
     PipeWireNode(u32),
+    /// Opt-in (`REDFOG_NATIVE_CAPTURE=1`, see [`CompositorSession::video_source`])
+    /// alternative to `PipeWireNode` for the KWin backend: `kwin_capture::
+    /// pipewire_capture::PipewireCapture` does its own PipeWire negotiation
+    /// (real EGL-queried DMA-BUF modifiers, not `pipewiresrc`'s implicit
+    /// negotiation) instead of GStreamer's `pipewiresrc` element, feeding an
+    /// `appsrc` via `spawn_kwin_native_frame_pusher`. `wayland_socket_path` is
+    /// for the capture's own throwaway EGL/Wayland connection (see
+    /// `kwin_capture::egl_dmabuf`) — has nothing to do with the video data
+    /// path itself.
+    KwinNativeDmaBuf { node_id: u32, wayland_socket_path: PathBuf, width: u32, height: u32, fps: u32 },
     /// gst-wayland-display's `waylanddisplaysrc` — the compositor *is* this
     /// element, no PipeWire involvement at all. `render_node` is either a
     /// real DRM render node path or `gst_backend::RENDER_NODE_SOFTWARE`.
@@ -150,8 +170,25 @@ impl CompositorSession {
     /// The abstracted form of `pipewire_node_id`, for callers that build
     /// pipelines via [`make_pipeline`]/[`make_encoder_pipeline`] against
     /// [`VideoSource`] rather than a raw node id.
+    ///
+    /// `REDFOG_NATIVE_CAPTURE=1` opts into [`VideoSource::KwinNativeDmaBuf`]
+    /// instead of the default `PipeWireNode` (GStreamer's own `pipewiresrc`)
+    /// — see that variant's doc comment. Env-var gated (matching this
+    /// project's existing style, e.g. `REDFOG_ALWAYS_SOFTWARE`) rather than
+    /// the default, since it's new and unproven against a real streaming
+    /// session — `pipewiresrc` stays the safe, unconditional fallback.
     pub fn video_source(&self) -> VideoSource {
-        VideoSource::PipeWireNode(self.pipewire_node_id)
+        if std::env::var("REDFOG_NATIVE_CAPTURE").as_deref() == Ok("1") {
+            VideoSource::KwinNativeDmaBuf {
+                node_id: self.pipewire_node_id,
+                wayland_socket_path: self.socket_path.clone(),
+                width: self.width as u32,
+                height: self.height as u32,
+                fps: self.fps,
+            }
+        } else {
+            VideoSource::PipeWireNode(self.pipewire_node_id)
+        }
     }
 
     pub fn spawn(
@@ -179,7 +216,7 @@ impl CompositorSession {
             .env("KWIN_WAYLAND_NO_PERMISSION_CHECKS", "1")
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("PIPEWIRE_REMOTE", &pw_sock)
-            .env("LIBGL_ALWAYS_SOFTWARE", "1")
+            .env("LIBGL_ALWAYS_SOFTWARE", &std::env::var("REDFOG_ALWAYS_SOFTWARE").unwrap_or_else(|_| "1".to_string()))
             .arg("--virtual")
             .arg("--width")
             .arg(&width.to_string())
@@ -280,6 +317,9 @@ impl CompositorSession {
             kwin_process: child,
             capture_session,
             pipewire_node_id,
+            width,
+            height,
+            fps,
         })
     }
 
@@ -442,6 +482,174 @@ fn spawn_login_frame_pusher(pipeline: &gst::Pipeline, frame_rx: std::sync::mpsc:
     });
 }
 
+/// SPA video format id (from `pw::spa::param::video::VideoFormat`, see
+/// `kwin_capture::pipewire_capture`'s `FORMAT_MAP`/`CapturedFrame::format`) to
+/// the matching `gstreamer_video::VideoFormat` — only the two formats
+/// `PipewireCapture` ever actually negotiates (`BGRx`=8, `BGRA`=12).
+fn spa_video_format_to_gst(format: u32) -> gst_video::VideoFormat {
+    match format {
+        8 => gst_video::VideoFormat::Bgrx,
+        12 => gst_video::VideoFormat::Bgra,
+        other => panic!("unexpected SPA video format id {other} from PipewireCapture (expected BGRx=8 or BGRA=12)"),
+    }
+}
+
+/// Starts a [`PipewireCapture`] and relays its frames into the `appsrc`
+/// (named [`KWIN_NATIVE_APPSRC_NAME`]) a pipeline built from a
+/// [`VideoSource::KwinNativeDmaBuf`] description always contains — the
+/// `KwinNativeDmaBuf` counterpart to `spawn_login_frame_pusher` above.
+///
+/// DMA-BUF frames become zero-copy `gst::Memory` via
+/// `gstreamer_allocators::DmaBufAllocator` (ownership of the fd transfers to
+/// the allocator — never closed here) with a `gstreamer_video::VideoMeta`
+/// describing the real plane layout, and the appsrc's caps are (re)computed
+/// via `gstreamer_video::VideoInfoDmaDrm` — the exact `format=DMA_DRM,
+/// drm-format=<fourcc>:<modifier>` convention `glupload`'s sink template
+/// requires (confirmed live in `kwin-capture`'s `dmabuf_gl_upload` test —
+/// plain `format=BGRx` caps don't match it at all). `PipewireCapture` can
+/// also fall back to a plain (non-DMA-BUF) frame if the compositor genuinely
+/// can't export one for this format (see its own doc comments) — that's
+/// mmap'd and copied into an ordinary system-memory buffer instead, same as
+/// `spawn_login_frame_pusher`'s frames, still readable by `glupload` (its
+/// sink template also lists plain `video/x-raw`).
+///
+/// Caps are only rebuilt/`set_caps` when the negotiated format actually
+/// changes (first frame, or after a renegotiation) — not on every frame.
+fn spawn_kwin_native_frame_pusher(pipeline: &gst::Pipeline, node_id: u32, wayland_socket_path: PathBuf) {
+    let app_src = pipeline
+        .by_name(KWIN_NATIVE_APPSRC_NAME)
+        .expect("a VideoSource::KwinNativeDmaBuf pipeline always names its appsrc KWIN_NATIVE_APPSRC_NAME")
+        .dynamic_cast::<gst_app::AppSrc>()
+        .expect("KWIN_NATIVE_APPSRC_NAME is always an appsrc");
+
+    let capture = match PipewireCapture::start(node_id, wayland_socket_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("redfog-core: failed to start native PipewireCapture: {e}");
+            return;
+        }
+    };
+
+    std::thread::spawn(move || {
+        // (format, width, height, modifier, is_dma_buf) of the caps currently
+        // set on `app_src` — `None` until the first frame arrives.
+        let mut current_caps_key: Option<(u32, u32, u32, u64, bool)> = None;
+        // Constructed once, not per-frame — it's stateless (just a GObject
+        // wrapper around gst_dmabuf_allocator_alloc), so reallocating one on
+        // every single frame was pure GObject-construction/refcounting
+        // overhead for no benefit.
+        let dmabuf_allocator = gst_allocators::DmaBufAllocator::new();
+        // Keyed on CapturedFrame::buffer_identity — PipeWire negotiates a
+        // small fixed pool of real GPU buffers and cycles through them
+        // (confirmed live: 3 distinct buffers over 303 frames of a 5s
+        // capture), not a fresh buffer every frame. Reusing the same
+        // gst::Buffer/GstMemory object (a cheap refcount clone) on repeat
+        // occurrences, instead of building a fresh DMA-BUF-backed one every
+        // time, lets glupload's own EGLImage-import cache (keyed on GstMemory
+        // identity) recognize "already imported this one" and skip a real,
+        // measured cost (67.6% of the GL thread's time was inside NVIDIA's
+        // driver doing this exact import — see project notes/profiling
+        // session) instead of re-importing from scratch on every single
+        // frame. Correct despite content changing underneath between reuses:
+        // that's exactly what DMA-BUF's implicit-fencing model exists for —
+        // the GPU driver transparently waits on the exporter's write-fence
+        // before a read, so an already-imported EGLImage/texture always shows
+        // whatever the buffer's current content is, no re-import needed.
+        // Cleared on every caps change (below) since a cached entry's size/
+        // format would otherwise be stale.
+        let mut buffer_cache: std::collections::HashMap<i64, gst::Buffer> = std::collections::HashMap::new();
+
+        while let Some(frame) = capture.next_frame() {
+            let caps_key = (frame.format, frame.width, frame.height, frame.modifier, frame.is_dma_buf);
+            if current_caps_key != Some(caps_key) {
+                let gst_format = spa_video_format_to_gst(frame.format);
+                let video_info = gst_video::VideoInfo::builder(gst_format, frame.width, frame.height)
+                    .build()
+                    .expect("valid VideoInfo from a real negotiated format/size");
+                let caps = if frame.is_dma_buf {
+                    gst_video::VideoInfoDmaDrm::from_video_info(&video_info, frame.modifier)
+                        .expect("VideoInfoDmaDrm::from_video_info")
+                        .to_caps()
+                        .expect("VideoInfoDmaDrm::to_caps")
+                } else {
+                    video_info.to_caps().expect("VideoInfo::to_caps")
+                };
+                app_src.set_caps(Some(&caps));
+                current_caps_key = Some(caps_key);
+                buffer_cache.clear();
+            }
+
+            let buffer = if frame.is_dma_buf {
+                if let Some(cached) = buffer_cache.get(&frame.buffer_identity) {
+                    // Not needed — reusing the cached GstMemory instead — and
+                    // not owned by anything else, so it must be closed here or
+                    // it leaks.
+                    unsafe { libc::close(frame.fd) };
+                    cached.clone()
+                } else {
+                    // SAFETY: `frame.fd` is a `dup()`'d fd PipewireCapture hands
+                    // off uniquely to us; `OwnedFd` takes ownership, transferred
+                    // again to the allocator by `alloc()` below (which closes it
+                    // once the resulting GstMemory is freed) — never closed by
+                    // this thread.
+                    let owned_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(frame.fd) };
+                    let size = (frame.stride as u32 * frame.height) as usize;
+                    let memory = match unsafe { dmabuf_allocator.alloc(owned_fd, size) } {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("redfog-core: DmaBufAllocator::alloc failed: {e}");
+                            continue;
+                        }
+                    };
+                    let mut buffer = gst::Buffer::new();
+                    {
+                        let buffer_mut = buffer.get_mut().expect("freshly allocated buffer is never shared");
+                        buffer_mut.append_memory(memory);
+                        gst_video::VideoMeta::add_full(
+                            buffer_mut,
+                            gst_video::VideoFrameFlags::empty(),
+                            spa_video_format_to_gst(frame.format),
+                            frame.width,
+                            frame.height,
+                            &[0],
+                            &[frame.stride],
+                        ).expect("VideoMeta::add_full");
+                    }
+                    buffer_cache.insert(frame.buffer_identity, buffer.clone());
+                    buffer
+                }
+            } else {
+                // Fallback: mmap the fd, copy into an ordinary system-memory
+                // buffer, then close it ourselves (not handed to any allocator).
+                let size = (frame.stride as u32 * frame.height) as usize;
+                let ptr = unsafe {
+                    libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_SHARED, frame.fd, 0)
+                };
+                if ptr == libc::MAP_FAILED {
+                    eprintln!("redfog-core: mmap of MemPtr/MemFd capture frame failed");
+                    unsafe { libc::close(frame.fd) };
+                    continue;
+                }
+                let mut buffer = gst::Buffer::with_size(size).expect("buffer allocation");
+                {
+                    let buffer_mut = buffer.get_mut().expect("freshly allocated buffer is never shared");
+                    let src = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
+                    buffer_mut.copy_from_slice(0, src).expect("buffer sized exactly for frame");
+                }
+                unsafe {
+                    libc::munmap(ptr, size);
+                    libc::close(frame.fd);
+                }
+                buffer
+            };
+
+            if app_src.push_buffer(buffer).is_err() {
+                break; // pipeline gone/EOS
+            }
+        }
+    });
+}
+
 /// THE single place — in this crate, and by extension this whole workspace,
 /// since no other crate constructs a GStreamer element or pipeline string at
 /// all anymore (see `VideoSource`'s doc comment) — that knows the actual
@@ -592,6 +800,62 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
                  ! appsink name=sink sync=false",
                 2000 / fps,
             )
+        }
+        // `KwinNativeDmaBuf`'s appsrc — see that variant's doc comment for how
+        // frames actually reach it (`spawn_kwin_native_frame_pusher`, spawned
+        // by `make_encoder_pipeline` below, mirroring `spawn_login_frame_pusher`).
+        // `glupload`/`glcolorconvert` are required, not optional, upstream of
+        // `nvh264enc`: confirmed via `gst-inspect-1.0 nvh264enc` that its sink
+        // pad only accepts `memory:CUDAMemory`/`memory:GLMemory`/plain system
+        // memory, never `memory:DMABuf` directly — a raw DMA-BUF buffer needs
+        // `glupload`'s EGLImage import to become something `nvh264enc` can
+        // consume via CUDA-GL interop. No caps filter between `appsrc` and
+        // `glupload`: the pusher sets the appsrc's caps per-frame based on
+        // what `PipewireCapture` actually negotiated (`format=DMA_DRM,
+        // drm-format=<fourcc>:<modifier>` when it got real DMA-BUF, confirmed
+        // live via `gstreamer_video::VideoInfoDmaDrm` to be exactly what
+        // `glupload`'s sink template requires — plain `format=BGRx` caps don't
+        // match it at all; plain system-memory caps otherwise), not something
+        // fixed in this string. Same `GST_GL_WINDOW=surfaceless`/
+        // `GST_GL_PLATFORM=egl` requirement as the `PipeWireNode`/`Nvenc` arm above.
+        //
+        // `queue` right after `appsrc` is load-bearing, not optional, unlike
+        // the `PipeWireNode` arms above (`pipewiresrc`, a `basesrc`-derived
+        // push element, always gets its own GStreamer-managed streaming
+        // thread regardless — confirmed live: `pipewiresrc1:sr` shows up as
+        // its own thread in a profile even with no queue downstream).
+        // `GstAppSrc::push_buffer()` has no such automatic thread of its
+        // own — it runs the entire downstream chain synchronously on
+        // whatever thread calls it. Without this queue, that thread is
+        // `spawn_kwin_native_frame_pusher`'s: confirmed live via
+        // `scripts/profile-samply.sh` that `glupload`/`nvh264enc` activity
+        // (including a real NVIDIA-driver-side EGLImage-import cost) was
+        // showing up entirely on the `kwin-native-app` thread, serializing
+        // capture and GL/encode work onto one core exactly the way the
+        // (currently unused) commented-out `queue` in the `PipeWireNode`/
+        // `Nvenc` arm above was trying to avoid.
+        (VideoSource::KwinNativeDmaBuf { .. }, VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps }) => {
+            format!(
+                "appsrc name={KWIN_NATIVE_APPSRC_NAME} format=time is-live=true do-timestamp=false \
+                 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
+                 ! glupload \
+                 ! glcolorconvert \
+                 ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
+                             rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
+                 ! video/x-h264,stream-format=byte-stream,alignment=au \
+                 ! appsink name=sink sync=false"
+            )
+        }
+        // Never implemented: `KwinNativeDmaBuf` only exists to feed `Nvenc`
+        // (see its doc comment) — there's no CPU-side consumer of a raw
+        // DMA-BUF frame without the same `glupload` GL round-trip the `Nvenc`
+        // arm above needs, and neither `LocalDisplay` (the `viewer` debug
+        // tool) nor `Software` (`x264enc`, no GPU dependency by design) has
+        // any reason to pull in a GL context for that. Use `PipeWireNode`
+        // (the default) for either of those.
+        (VideoSource::KwinNativeDmaBuf { .. }, VideoSink::LocalDisplay)
+        | (VideoSource::KwinNativeDmaBuf { .. }, VideoSink::Encode { encoder: VideoEncoder::Software, .. }) => {
+            panic!("VideoSource::KwinNativeDmaBuf only supports VideoSink::Encode{{encoder: VideoEncoder::Nvenc, ..}} — use VideoSource::PipeWireNode for local display or software encoding")
         }
         // `waylanddisplaysrc` — the compositor *is* this element (see
         // `VideoSource::GstWaylandDisplay`'s doc comment). The capsfilter
@@ -745,6 +1009,10 @@ const ENCODER_ELEMENT_NAME: &str = "enc";
 /// why capping is done via a runtime pad probe on this element rather than
 /// embedded in the pipeline description string itself.
 const FPS_CAP_ELEMENT_NAME: &str = "fps_cap_gate";
+
+/// Name of the `appsrc` in a [`VideoSource::KwinNativeDmaBuf`] pipeline —
+/// see [`spawn_kwin_native_frame_pusher`].
+const KWIN_NATIVE_APPSRC_NAME: &str = "kwin-native-appsrc";
 
 /// Which H.264 encoder [`make_encoder_pipeline`] builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -912,14 +1180,23 @@ where
         .dynamic_cast::<gst::Pipeline>()
         .expect("gst::parse_launch on a plain top-level description (no bin.(...)) always yields a Pipeline");
 
-    if !matches!(source, VideoSource::PipeWireNode(_)) {
+    // `KwinNativeDmaBuf` paces itself the same way `PipeWireNode` does (it's
+    // the same underlying PipeWire-negotiated stream, just consumed via our
+    // own `PipewireCapture` instead of `pipewiresrc`) — exempt for the same
+    // reason, and because its pipeline string has no `identity` gate element
+    // to attach a probe to in the first place.
+    if !matches!(source, VideoSource::PipeWireNode(_) | VideoSource::KwinNativeDmaBuf { .. }) {
         if let Some(fps) = fps_cap.filter(|&fps| fps > 0) {
             let gate = pipeline.by_name(FPS_CAP_ELEMENT_NAME).expect("identity gate element always present for a damage-driven source");
             install_fps_cap_probe(&gate, fps);
         }
     }
-    if let VideoSource::Login { frame_rx, .. } = source {
-        spawn_login_frame_pusher(&pipeline, frame_rx);
+    match source {
+        VideoSource::Login { frame_rx, .. } => spawn_login_frame_pusher(&pipeline, frame_rx),
+        VideoSource::KwinNativeDmaBuf { node_id, wayland_socket_path, .. } => {
+            spawn_kwin_native_frame_pusher(&pipeline, node_id, wayland_socket_path)
+        }
+        VideoSource::PipeWireNode(_) | VideoSource::GstWaylandDisplay { .. } => {}
     }
 
     let appsink = pipeline

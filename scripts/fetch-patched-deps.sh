@@ -42,3 +42,15 @@ fetch_and_patch \
     "https://github.com/MrCreativ3001/moonlight-common-rust" \
     "06f0d2efbb4e1c769cdd8f8d5a92e00fc192842b" \
     "patches/moonlight-common-rust-rtsp-port-parsing.patch"
+
+# MIT/Apache-2.0 — vendored here (see Cargo.toml's [patch.crates-io] comment)
+# only because pam-sys 1.0.0-alpha5 never published a release with a newer
+# bindgen; its own build-dependency pin (bindgen "0.69") panics against this
+# machine's clang/LLVM 22.1.8 ("a `libclang` shared library is not loaded on
+# this thread" — confirmed live, root cause not fully chased down, but
+# unrelated bindgen 0.72+ users elsewhere in this workspace are unaffected).
+fetch_and_patch \
+    "pam-sys" \
+    "https://github.com/1wilkens/pam-sys" \
+    "v1.0.0-alpha5" \
+    "patches/pam-sys-bindgen-bump.patch"

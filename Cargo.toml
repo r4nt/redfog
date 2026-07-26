@@ -18,6 +18,16 @@ members = [
 ]
 resolver = "2"
 
+# Release without debug info gives flamegraph-rs (`cargo flamegraph`)/samply
+# bare addresses instead of function names/line numbers — worthless for
+# actually reading a profile. `debug = true` (full DWARF, not just line
+# tables) is needed for inlined-frame attribution, which matters a lot here
+# since a lot of the CPU cost under investigation is inside GStreamer/NVENC's
+# own thin Rust binding wrappers, expected to be heavily inlined. See
+# scripts/flamegraph.sh / scripts/profile-samply.sh.
+[profile.release]
+debug = true
+
 # Dev-only test dependency (redfog-moonlight's integration tests/examples),
 # never shipped in our own server. Patches upstream bugs in its RTSP
 # Transport-header parsing (wrong delimiter, wrong port fallback constant,
@@ -31,3 +41,19 @@ resolver = "2"
 # `patches/moonlight-common-rust-rtsp-port-parsing.patch`.
 [patch."https://github.com/MrCreativ3001/moonlight-common-rust"]
 moonlight-common = { path = "vendor/moonlight-common-rust" }
+
+# pam-sys 1.0.0-alpha5 (pulled in transitively by the `pam` crate redfog-broker/
+# redfog-session-init depend on for real PAM auth) pins `bindgen = "0.69"`.
+# Confirmed live: that combination panics at build time — "a `libclang` shared
+# library is not loaded on this thread" — against this machine's clang/LLVM
+# 22.1.8, a version far newer than bindgen 0.69/clang-sys 1.8.1 was ever tested
+# against (other sys crates in this workspace already use bindgen 0.72+
+# successfully in this exact environment, unaffected). MIT/Apache-2.0 (unlike
+# moonlight-common-rust above), so vendoring it here isn't a licensing concern
+# — it's `[patch]`ed rather than a straight version bump only because pam-sys
+# itself never published a release with a newer bindgen; this is that same
+# v1.0.0-alpha5 release with just its `bindgen` build-dependency bumped to
+# "0.72". Not vendored into git — run `./scripts/fetch-patched-deps.sh` once to
+# fetch it into `vendor/` (gitignored).
+[patch.crates-io]
+pam-sys = { path = "vendor/pam-sys" }

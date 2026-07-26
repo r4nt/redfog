@@ -18,3 +18,17 @@ wayland-backend = "0.3"
 wayland-scanner = "0.31"
 bitflags = "2"
 libc = "0.2"
+pipewire = { version = "0.10", features = ["v0_3_65"] }
+khronos-egl = { version = "6", features = ["dynamic"] }
+libloading = "0.8"
+
+[dev-dependencies]
+redfog-core = { path = "../redfog-core" }
+session-backend = { path = "../session-backend" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+uuid = { version = "1", features = ["v4"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+gstreamer = "0.21"
+gstreamer-app = "0.21"
+gstreamer-video = { version = "0.21", features = ["v1_24"] }
+gstreamer-allocators = "0.21"

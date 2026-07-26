@@ -3,6 +3,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
+pub mod egl_dmabuf;
+pub mod pipewire_capture;
+
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
         let now = std::time::SystemTime::now()
