@@ -131,9 +131,12 @@ impl SpawnedCompositor {
     /// `redfog-moonlight::session`'s `build_pipelines`, called exactly once
     /// per `spawn_session` — resume never rebuilds it, see
     /// `rebuild_for_resume`'s doc comment).
-    pub fn video_source(&self) -> VideoSource {
+    /// `encoder`: see `redfog_core::CompositorSession::video_source`'s doc
+    /// comment — only the `Kwin` variant actually uses it (to decide between
+    /// `PipeWireNode` and `KwinNativeDmaBuf`); every other variant ignores it.
+    pub fn video_source(&self, encoder: Option<redfog_core::VideoEncoder>) -> VideoSource {
         match self {
-            Self::Kwin(session) => session.video_source(),
+            Self::Kwin(session) => session.video_source(encoder),
             Self::GstWaylandDisplay { render_node, width, height, fps, .. } => {
                 VideoSource::GstWaylandDisplay { render_node: render_node.clone(), width: *width, height: *height, fps: *fps }
             }

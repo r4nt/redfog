@@ -47,11 +47,17 @@ impl PipewireCapture {
     /// query (see egl_dmabuf.rs) — an explicit path rather than relying on
     /// `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` env vars, which can't disambiguate
     /// between concurrent sessions in a multi-session server.
-    pub fn start(target_node_id: u32, wayland_socket_path: PathBuf) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    ///
+    /// `prefer_linear`: restrict DMA-BUF negotiation to the driver's
+    /// `DRM_FORMAT_MOD_LINEAR` (0) modifier alternative only, instead of
+    /// whatever it prefers (usually a proprietary tiled mode — see
+    /// `cuda_import.rs`'s doc comment for why the direct-CUDA-import path
+    /// needs this and the GL/`glupload` path doesn't).
+    pub fn start(target_node_id: u32, wayland_socket_path: PathBuf, prefer_linear: bool) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (frame_tx, frame_rx) = channel::<CapturedFrame>();
 
         std::thread::spawn(move || {
-            if let Err(e) = Self::run_loop(target_node_id, wayland_socket_path, frame_tx) {
+            if let Err(e) = Self::run_loop(target_node_id, wayland_socket_path, prefer_linear, frame_tx) {
                 eprintln!("Pipewire background loop failed: {e}");
             }
         });
@@ -59,7 +65,7 @@ impl PipewireCapture {
         Ok(Self { frame_rx })
     }
 
-    fn run_loop(target_node_id: u32, wayland_socket_path: PathBuf, frame_tx: std::sync::mpsc::Sender<CapturedFrame>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn run_loop(target_node_id: u32, wayland_socket_path: PathBuf, prefer_linear: bool, frame_tx: std::sync::mpsc::Sender<CapturedFrame>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pw::init();
 
         let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -307,9 +313,19 @@ impl PipewireCapture {
 
         // One format entry per (SPA format, real modifier list) pair, DMA-BUF only,
         // highest priority first.
+        const DRM_FORMAT_MOD_LINEAR: i64 = 0;
+
         for &(fourcc, spa_format) in FORMAT_MAP {
             let Some(info) = dmabuf_formats.iter().find(|f| f.drm_fourcc == fourcc) else { continue };
-            if info.modifiers.is_empty() {
+            let modifiers: Vec<i64> = if prefer_linear {
+                // Restrict to LINEAR only — skip this format entirely (fall
+                // through to the MemPtr fallback below) if the driver doesn't
+                // offer it as an alternative at all.
+                info.modifiers.iter().copied().filter(|&m| m == DRM_FORMAT_MOD_LINEAR).collect()
+            } else {
+                info.modifiers.clone()
+            };
+            if modifiers.is_empty() {
                 continue;
             }
             let mut props = base_format_properties(1280, 720);
@@ -325,9 +341,10 @@ impl PipewireCapture {
                     pw::spa::utils::Choice(
                         pw::spa::utils::ChoiceFlags::empty(),
                         pw::spa::utils::ChoiceEnum::Enum {
-                            // Driver's preferred modifier first (modifiers[0]).
-                            default: info.modifiers[0],
-                            alternatives: info.modifiers.clone(),
+                            // Driver's preferred modifier first (modifiers[0]),
+                            // unless prefer_linear already restricted the list.
+                            default: modifiers[0],
+                            alternatives: modifiers,
                         }
                     )
                 )),

@@ -3,8 +3,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
+pub mod cuda_import;
 pub mod egl_dmabuf;
+pub mod nvenc_session;
 pub mod pipewire_capture;
+pub mod vulkan_bridge;
 
 macro_rules! eprintln {
     ($($arg:tt)*) => {{

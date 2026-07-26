@@ -21,6 +21,15 @@ libc = "0.2"
 pipewire = { version = "0.10", features = ["v0_3_65"] }
 khronos-egl = { version = "6", features = ["dynamic"] }
 libloading = "0.8"
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-13000"] }
+ash = "0.38"
+nvidia-video-codec-sdk = "0.4"
+# nvidia-video-codec-sdk pins cudarc 0.16.x with only "cuda-version-from-build-system"
+# enabled, which shells out to `nvcc` (not installed here). Cargo unifies features
+# across the whole graph for a given resolved version, so adding an explicit
+# cuda-12080 feature here for the same 0.16 line makes cudarc's build.rs take its
+# explicit-version branch instead, skipping the nvcc probe entirely.
+cudarc016 = { package = "cudarc", version = "0.16", features = ["cuda-12080"] }
 
 [dev-dependencies]
 redfog-core = { path = "../redfog-core" }
@@ -32,3 +41,12 @@ gstreamer = "0.21"
 gstreamer-app = "0.21"
 gstreamer-video = { version = "0.21", features = ["v1_24"] }
 gstreamer-allocators = "0.21"
+# gstreamer-vulkan only exists starting at 0.25 (no 0.21 release was ever
+# published) — aliased since it pulls in gstreamer 0.25 transitively, a
+# separate semver-incompatible instance from our main gstreamer 0.21 line
+# used by tests that interoperate with redfog-core's (0.21-typed) public API.
+# This Vulkan test is self-contained and never crosses that boundary.
+gstreamer025 = { package = "gstreamer", version = "0.25" }
+gstreamer-app025 = { package = "gstreamer-app", version = "0.25" }
+gstreamer-vulkan = "0.25"
+glib = "0.22"

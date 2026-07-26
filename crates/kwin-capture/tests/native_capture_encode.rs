@@ -6,8 +6,9 @@
 //!
 //! Complements `dmabuf_gl_upload.rs` (which only validates the DMA-BUF ->
 //! `glupload` import in isolation) by exercising the actual production code
-//! path: `CompositorSession::video_source()`'s `REDFOG_NATIVE_CAPTURE=1` gate,
-//! `spawn_kwin_native_frame_pusher`, and the real `nvh264enc` encode.
+//! path: `CompositorSession::video_source(Some(VideoEncoder::Nvenc))`'s
+//! default selection of `KwinNativeDmaBuf`, `spawn_kwin_native_frame_pusher`,
+//! and the real `nvh264enc` encode.
 
 use gstreamer::prelude::*;
 
@@ -19,7 +20,6 @@ async fn native_capture_produces_encoded_h264() {
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::env::set_var("REDFOG_RUNTIME_DIR", &runtime_dir);
     std::env::set_var("REDFOG_ALWAYS_SOFTWARE", "0");
-    std::env::set_var("REDFOG_NATIVE_CAPTURE", "1");
     std::env::set_var("GST_GL_WINDOW", "surfaceless");
     std::env::set_var("GST_GL_PLATFORM", "egl");
 
@@ -36,10 +36,10 @@ async fn native_capture_produces_encoded_h264() {
         60,
     ).unwrap();
 
-    let source = compositor.video_source();
+    let source = compositor.video_source(Some(redfog_core::VideoEncoder::Nvenc));
     assert!(
         matches!(source, redfog_core::VideoSource::KwinNativeDmaBuf { .. }),
-        "expected REDFOG_NATIVE_CAPTURE=1 to select VideoSource::KwinNativeDmaBuf, got a different variant"
+        "expected video_source(Some(Nvenc)) to default to VideoSource::KwinNativeDmaBuf, got a different variant"
     );
 
     gstreamer::init().unwrap();

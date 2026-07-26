@@ -23,7 +23,7 @@ async fn kwin_native_pipewire_capture_glxgears_test() {
         60,
     ).unwrap();
 
-    let node_id = match compositor.video_source() {
+    let node_id = match compositor.video_source(None) {
         redfog_core::VideoSource::PipeWireNode(node) => node,
         _ => panic!("Expected PipeWireNode"),
     };
@@ -36,7 +36,7 @@ async fn kwin_native_pipewire_capture_glxgears_test() {
 
     // 4. Start our native PipeWire capture
     eprintln!("Starting native Pipewire capture...");
-    let capture = kwin_capture::pipewire_capture::PipewireCapture::start(node_id, socket_path).unwrap();
+    let capture = kwin_capture::pipewire_capture::PipewireCapture::start(node_id, socket_path, false).unwrap();
 
     // 5. Measure FPS over 5 seconds
     eprintln!("Measuring FPS for 5 seconds...");

@@ -125,9 +125,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `detect_video_encoder`'s doc comment) unless explicitly overridden in
     // either direction, e.g. REDFOG_VIDEO_ENCODER=software to force
     // software even when a (possibly unhealthy) NVENC install is present.
+    // Empty (not just unset) is treated as "no override" too — env-var
+    // passthrough chains (e.g. scripts/sudo-live-session.sh's
+    // systemd-run --setenv hop) commonly forward an optional var as
+    // present-but-empty rather than omitting it conditionally.
     let video_encoder = match std::env::var("REDFOG_VIDEO_ENCODER") {
-        Ok(s) => s.parse::<redfog_core::VideoEncoder>()?,
-        Err(_) => redfog_core::detect_video_encoder(),
+        Ok(s) if !s.is_empty() => s.parse::<redfog_core::VideoEncoder>()?,
+        _ => redfog_core::detect_video_encoder(),
     };
 
     // The login screen's session picker (see redfog_login_protocol's own

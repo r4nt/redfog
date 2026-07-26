@@ -111,13 +111,14 @@ pub struct CompositorSession {
 /// frames through, not a live `AppSrc` handle up front.
 pub enum VideoSource {
     PipeWireNode(u32),
-    /// Opt-in (`REDFOG_NATIVE_CAPTURE=1`, see [`CompositorSession::video_source`])
-    /// alternative to `PipeWireNode` for the KWin backend: `kwin_capture::
-    /// pipewire_capture::PipewireCapture` does its own PipeWire negotiation
-    /// (real EGL-queried DMA-BUF modifiers, not `pipewiresrc`'s implicit
-    /// negotiation) instead of GStreamer's `pipewiresrc` element, feeding an
-    /// `appsrc` via `spawn_kwin_native_frame_pusher`. `wayland_socket_path` is
-    /// for the capture's own throwaway EGL/Wayland connection (see
+    /// Default (see [`CompositorSession::video_source`]) alternative to
+    /// `PipeWireNode` for the KWin backend when encoding with `Nvenc`:
+    /// `kwin_capture::pipewire_capture::PipewireCapture` does its own
+    /// PipeWire negotiation (real EGL-queried DMA-BUF modifiers, not
+    /// `pipewiresrc`'s implicit negotiation) instead of GStreamer's
+    /// `pipewiresrc` element, feeding an `appsrc` via
+    /// `spawn_kwin_native_frame_pusher`. `wayland_socket_path` is for the
+    /// capture's own throwaway EGL/Wayland connection (see
     /// `kwin_capture::egl_dmabuf`) — has nothing to do with the video data
     /// path itself.
     KwinNativeDmaBuf { node_id: u32, wayland_socket_path: PathBuf, width: u32, height: u32, fps: u32 },
@@ -171,14 +172,23 @@ impl CompositorSession {
     /// pipelines via [`make_pipeline`]/[`make_encoder_pipeline`] against
     /// [`VideoSource`] rather than a raw node id.
     ///
-    /// `REDFOG_NATIVE_CAPTURE=1` opts into [`VideoSource::KwinNativeDmaBuf`]
-    /// instead of the default `PipeWireNode` (GStreamer's own `pipewiresrc`)
-    /// — see that variant's doc comment. Env-var gated (matching this
-    /// project's existing style, e.g. `REDFOG_ALWAYS_SOFTWARE`) rather than
-    /// the default, since it's new and unproven against a real streaming
-    /// session — `pipewiresrc` stays the safe, unconditional fallback.
-    pub fn video_source(&self) -> VideoSource {
-        if std::env::var("REDFOG_NATIVE_CAPTURE").as_deref() == Ok("1") {
+    /// `encoder`: the `VideoEncoder` the caller is about to build a pipeline
+    /// for, or `None` for a non-encoding (`VideoSink::LocalDisplay`) use —
+    /// [`VideoSource::KwinNativeDmaBuf`] only supports `Nvenc` encoding (see
+    /// its doc comment), so this is `Some(VideoEncoder::Nvenc)` for the real
+    /// Moonlight streaming path and `None` for the `viewer` debug tool.
+    /// Getting this wrong (e.g. passing `Some(Nvenc)` for what's actually
+    /// going to be a `LocalDisplay` pipeline) doesn't fail quietly — the
+    /// mismatched combination panics in `video_pipeline_description`.
+    ///
+    /// Defaults to `KwinNativeDmaBuf` whenever `encoder` is `Some(Nvenc)`;
+    /// `REDFOG_NATIVE_CAPTURE=0` forces the old `PipeWireNode`
+    /// (GStreamer's own `pipewiresrc`) path instead, as a rollback switch.
+    pub fn video_source(&self, encoder: Option<VideoEncoder>) -> VideoSource {
+        let native_disabled = std::env::var("REDFOG_NATIVE_CAPTURE").as_deref() == Ok("0");
+        if !native_disabled
+            && matches!(encoder, Some(VideoEncoder::Nvenc) | Some(VideoEncoder::Vulkan) | Some(VideoEncoder::NvencDirect))
+        {
             VideoSource::KwinNativeDmaBuf {
                 node_id: self.pipewire_node_id,
                 wayland_socket_path: self.socket_path.clone(),
@@ -427,7 +437,7 @@ impl StreamingEngine {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let input_forwarder = InputForwarder::connect(&initial_session.socket_path)?;
         let client_name = format!("redfog-streaming-engine-{}", std::process::id());
-        let pipeline = make_pipeline(initial_session.video_source(), &client_name, frame_store, on_frame);
+        let pipeline = make_pipeline(initial_session.video_source(None), &client_name, frame_store, on_frame);
         pipeline.set_state(gst::State::Playing)?;
         Ok(Self { pipeline, input_forwarder })
     }
@@ -522,7 +532,7 @@ fn spawn_kwin_native_frame_pusher(pipeline: &gst::Pipeline, node_id: u32, waylan
         .dynamic_cast::<gst_app::AppSrc>()
         .expect("KWIN_NATIVE_APPSRC_NAME is always an appsrc");
 
-    let capture = match PipewireCapture::start(node_id, wayland_socket_path) {
+    let capture = match PipewireCapture::start(node_id, wayland_socket_path, false) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("redfog-core: failed to start native PipewireCapture: {e}");
@@ -801,6 +811,18 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
                 2000 / fps,
             )
         }
+        (VideoSource::PipeWireNode(node_id), VideoSink::Encode { encoder: VideoEncoder::Vulkan, bitrate_kbps }) => {
+            format!(
+                 "pipewiresrc name=pipewiresrc path={node_id} client-name=\"{client_name}\" \
+                             do-timestamp=true keepalive-time={} \
+                 ! vulkanupload \
+                 ! vulkancolorconvert \
+                 ! vulkanh264enc name={ENCODER_ELEMENT_NAME} idr-period=300 bitrate={bitrate_kbps} \
+                 ! video/x-h264,stream-format=byte-stream,alignment=au \
+                 ! appsink name=sink sync=false",
+                2000 / fps,
+            )
+        }
         // `KwinNativeDmaBuf`'s appsrc — see that variant's doc comment for how
         // frames actually reach it (`spawn_kwin_native_frame_pusher`, spawned
         // by `make_encoder_pipeline` below, mirroring `spawn_login_frame_pusher`).
@@ -836,26 +858,42 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
         // `Nvenc` arm above was trying to avoid.
         (VideoSource::KwinNativeDmaBuf { .. }, VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps }) => {
             format!(
-                "appsrc name={KWIN_NATIVE_APPSRC_NAME} format=time is-live=true do-timestamp=false \
-                 ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
-                 ! glupload \
-                 ! glcolorconvert \
-                 ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
-                             rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
-                 ! video/x-h264,stream-format=byte-stream,alignment=au \
-                 ! appsink name=sink sync=false"
+                 "appsrc name={KWIN_NATIVE_APPSRC_NAME} format=time is-live=true do-timestamp=false \
+                  ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
+                  ! glupload \
+                  ! glcolorconvert \
+                  ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
+                              rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
+                  ! video/x-h264,stream-format=byte-stream,alignment=au \
+                  ! appsink name=sink sync=false"
             )
         }
-        // Never implemented: `KwinNativeDmaBuf` only exists to feed `Nvenc`
-        // (see its doc comment) — there's no CPU-side consumer of a raw
-        // DMA-BUF frame without the same `glupload` GL round-trip the `Nvenc`
-        // arm above needs, and neither `LocalDisplay` (the `viewer` debug
+        (VideoSource::KwinNativeDmaBuf { .. }, VideoSink::Encode { encoder: VideoEncoder::Vulkan, bitrate_kbps }) => {
+            format!(
+                 "appsrc name={KWIN_NATIVE_APPSRC_NAME} format=time is-live=true do-timestamp=false \
+                  ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
+                  ! vulkanupload \
+                  ! vulkancolorconvert \
+                  ! vulkanh264enc name={ENCODER_ELEMENT_NAME} idr-period=300 bitrate={bitrate_kbps} \
+                  ! video/x-h264,stream-format=byte-stream,alignment=au \
+                  ! appsink name=sink sync=false"
+            )
+        }
+        // Never implemented: `KwinNativeDmaBuf` only exists to feed hardware encoders
+        // — there's no CPU-side consumer of a raw
+        // DMA-BUF frame without a GPU upload step, and neither `LocalDisplay` (the `viewer` debug
         // tool) nor `Software` (`x264enc`, no GPU dependency by design) has
-        // any reason to pull in a GL context for that. Use `PipeWireNode`
+        // any reason to pull in a GPU context for that. Use `PipeWireNode`
         // (the default) for either of those.
         (VideoSource::KwinNativeDmaBuf { .. }, VideoSink::LocalDisplay)
         | (VideoSource::KwinNativeDmaBuf { .. }, VideoSink::Encode { encoder: VideoEncoder::Software, .. }) => {
-            panic!("VideoSource::KwinNativeDmaBuf only supports VideoSink::Encode{{encoder: VideoEncoder::Nvenc, ..}} — use VideoSource::PipeWireNode for local display or software encoding")
+            panic!("VideoSource::KwinNativeDmaBuf only supports hardware video encoders (Nvenc, Vulkan) — use VideoSource::PipeWireNode for local display or software encoding")
+        }
+        // Never reaches here in practice: `VideoEncoder::NvencDirect` has no
+        // GStreamer pipeline at all — see `make_cuda_direct_encoder_session`,
+        // which callers use instead of `make_encoder_pipeline` for it.
+        (_, VideoSink::Encode { encoder: VideoEncoder::NvencDirect, .. }) => {
+            panic!("VideoEncoder::NvencDirect has no pipeline description — use make_cuda_direct_encoder_session instead of make_encoder_pipeline")
         }
         // `waylanddisplaysrc` — the compositor *is* this element (see
         // `VideoSource::GstWaylandDisplay`'s doc comment). The capsfilter
@@ -901,6 +939,17 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
              ! video/x-h264,stream-format=byte-stream,alignment=au \
              ! appsink name=sink sync=false"
         ),
+        (VideoSource::GstWaylandDisplay { render_node, width, height, fps }, VideoSink::Encode { encoder: VideoEncoder::Vulkan, bitrate_kbps }) => format!(
+            "waylanddisplaysrc name=waylanddisplaysrc render-node=\"{render_node}\" \
+             ! video/x-raw,width={width},height={height},framerate={fps}/1 \
+             ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
+             ! identity name={FPS_CAP_ELEMENT_NAME} \
+             ! vulkanupload \
+             ! vulkancolorconvert \
+             ! vulkanh264enc name={ENCODER_ELEMENT_NAME} idr-period=300 bitrate={bitrate_kbps} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=sink sync=false"
+        ),
         // Login's `appsrc` — see `VideoSource::Login`'s doc comment for how
         // frames actually reach it (a background thread relays them onto a
         // channel; `spawn_login_frame_pusher` drains that channel into this
@@ -942,6 +991,17 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
              ! video/x-raw \
              ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
                          rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=sink sync=false"
+        ),
+        (VideoSource::Login { width, height, .. }, VideoSink::Encode { encoder: VideoEncoder::Vulkan, bitrate_kbps }) => format!(
+            "appsrc name=login-appsrc format=time is-live=true block=false \
+             caps=video/x-raw,format=RGBA,width={width},height={height},framerate=30/1 \
+             ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
+             ! identity name={FPS_CAP_ELEMENT_NAME} \
+             ! vulkanupload \
+             ! vulkancolorconvert \
+             ! vulkanh264enc name={ENCODER_ELEMENT_NAME} idr-period=300 bitrate={bitrate_kbps} \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
              ! appsink name=sink sync=false"
         ),
@@ -1029,6 +1089,16 @@ pub enum VideoEncoder {
     /// it isn't blocked by the unrelated `gbm_create_device` segfault seen
     /// there — see project notes on the NVIDIA GBM issue.
     Nvenc,
+    /// `vulkanh264enc` (Vulkan Video) — hardware encoding via Vulkan API.
+    Vulkan,
+    /// NVENC driven directly through `nvidia-video-codec-sdk`, with no
+    /// GStreamer involved in the video leg at all — DMA-BUF -> CUDA (tiled
+    /// array on Ampere+, or a `vulkan_bridge` detile-to-linear-buffer copy
+    /// on older GPUs) -> NVENC, see `kwin_capture::nvenc_session`'s doc
+    /// comment. Built and validated via `cuda_direct_nvenc.rs`; live
+    /// bitrate changes aren't implemented yet (see
+    /// `CudaDirectEncoderSession::set_bitrate`).
+    NvencDirect,
 }
 
 impl VideoEncoder {
@@ -1036,6 +1106,8 @@ impl VideoEncoder {
         match self {
             VideoEncoder::Software => "software",
             VideoEncoder::Nvenc => "nvenc",
+            VideoEncoder::Vulkan => "vulkan",
+            VideoEncoder::NvencDirect => "nvenc-direct",
         }
     }
 }
@@ -1049,7 +1121,11 @@ impl std::str::FromStr for VideoEncoder {
         match s {
             "software" => Ok(VideoEncoder::Software),
             "nvenc" => Ok(VideoEncoder::Nvenc),
-            other => Err(format!("unknown video encoder {other:?} (expected \"software\" or \"nvenc\")")),
+            "vulkan" => Ok(VideoEncoder::Vulkan),
+            "nvenc-direct" => Ok(VideoEncoder::NvencDirect),
+            other => Err(format!(
+                "unknown video encoder {other:?} (expected \"software\", \"nvenc\", \"vulkan\", or \"nvenc-direct\")"
+            )),
         }
     }
 }
@@ -1248,6 +1324,29 @@ pub fn set_encoder_bitrate(pipeline: &gst::Pipeline, bitrate_kbps: u32) {
         return;
     };
     encoder.set_property("bitrate", bitrate_kbps);
+}
+
+/// [`kwin_capture::nvenc_session::CudaDirectEncoderSession`] re-exported so
+/// callers (`redfog-moonlight`) don't need a direct `kwin-capture`
+/// dependency just for this one type — mirrors how every other public type
+/// here already came from `session-backend`/`kwin-capture` internally.
+pub use kwin_capture::nvenc_session::CudaDirectEncoderSession;
+
+/// [`VideoEncoder::NvencDirect`] counterpart to [`make_encoder_pipeline`] —
+/// same `source`/`bitrate_kbps`/`on_access_unit` shape, but returns a
+/// [`CudaDirectEncoderSession`] instead of a `gst::Pipeline` (there's no
+/// GStreamer pipeline at all on this path). Only `VideoSource::
+/// KwinNativeDmaBuf` is supported — always the case for `NvencDirect`, see
+/// `CompositorSession::video_source`.
+pub fn make_cuda_direct_encoder_session(
+    source: VideoSource,
+    bitrate_kbps: u32,
+    on_access_unit: impl Fn(Vec<u8>, bool) + Send + Sync + 'static,
+) -> CudaDirectEncoderSession {
+    let VideoSource::KwinNativeDmaBuf { node_id, wayland_socket_path, width, height, fps } = source else {
+        panic!("make_cuda_direct_encoder_session only supports VideoSource::KwinNativeDmaBuf");
+    };
+    CudaDirectEncoderSession::spawn(node_id, wayland_socket_path, width, height, fps, bitrate_kbps, on_access_unit)
 }
 
 /// A per-session virtual audio sink: apps in the compositor session play

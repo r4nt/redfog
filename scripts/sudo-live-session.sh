@@ -99,6 +99,7 @@ if [ -z "${REDFOG_LIVE_SCOPED:-}" ]; then
         --setenv="REDFOG_BROKER_PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN-1}" \
         --setenv="GST_TRACERS=${GST_TRACERS:-}" \
         --setenv="GST_DEBUG=${GST_DEBUG:-}" \
+        --setenv="REDFOG_VIDEO_ENCODER=${REDFOG_VIDEO_ENCODER:-}" \
         -- "$SELF" "$@"
 fi
 
@@ -169,11 +170,15 @@ while [ ! -S /tmp/redfog-runtime/broker.sock ]; do
 done
 
 echo "starting redfog-server on default ports (47989/47984/48010/...)..."
+if [ -n "${REDFOG_VIDEO_ENCODER:-}" ]; then
+    echo "REDFOG_VIDEO_ENCODER=$REDFOG_VIDEO_ENCODER (forced, overriding auto-detection)"
+fi
 REDFOG_BROKER_SOCKET=/tmp/redfog-runtime/broker.sock \
 REDFOG_LOGIN_APP="$REPO_DIR/target/release/redfog-login" \
 REDFOG_USER_APP="plasmashell --no-respawn" \
 REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR="$PLUGIN_DIR" \
 REDFOG_DEBUG_GST_DEBUG="$REDFOG_DEBUG_GST_DEBUG" \
+REDFOG_VIDEO_ENCODER="${REDFOG_VIDEO_ENCODER:-}" \
 RUST_LOG="$REDFOG_LIVE_SERVER_RUST_LOG" \
 GST_TRACERS="${GST_TRACERS:-}" \
 GST_DEBUG="${GST_DEBUG:-}" \

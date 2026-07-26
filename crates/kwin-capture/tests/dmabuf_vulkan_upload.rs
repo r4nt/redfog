@@ -1,31 +1,18 @@
-//! Validates the one genuinely new-ground piece needed to wire `PipewireCapture`
-//! into redfog-server's real encoder pipeline: can a DMA-BUF fd captured here be
-//! correctly imported by GStreamer's `glupload` (the element `nvh264enc` actually
-//! needs upstream of it, since `nvh264enc`'s sink pad only accepts
-//! `memory:CUDAMemory`/`memory:GLMemory`/system memory — confirmed via
-//! `gst-inspect-1.0 nvh264enc` — never `memory:DMABuf` directly)?
-//!
-//! Uses `gstreamer_video::VideoInfoDmaDrm` to build correct `format=DMA_DRM,
-//! drm-format=<fourcc>:<modifier>` caps (required by `glupload`'s own sink
-//! template — confirmed via `gst-inspect-1.0 glupload` — a plain `format=BGRx`
-//! caps won't match), and `gstreamer_allocators::DmaBufAllocator` to wrap the fd
-//! as `gst::Memory` without a copy.
+//! Validates that a DMA-BUF fd captured here can be
+//! correctly imported by GStreamer's `vulkanupload` and converted by
+//! `vulkancolorconvert` to NV12 inside Vulkan memory.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use gstreamer::prelude::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dmabuf_gl_upload_test() {
+async fn dmabuf_vulkan_upload_test() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
-    let runtime_dir = std::env::temp_dir().join(format!("redfog-it-dmabuf-gl-{}", uuid::Uuid::new_v4()));
+    let runtime_dir = std::env::temp_dir().join(format!("redfog-it-dmabuf-vk-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::env::set_var("REDFOG_RUNTIME_DIR", &runtime_dir);
     std::env::set_var("REDFOG_ALWAYS_SOFTWARE", "0");
-    // glupload needs a headless GL context — no real display for auto-detection
-    // to find (see redfog-core's doc comment on the Nvenc/PipeWireNode arm).
-    std::env::set_var("GST_GL_WINDOW", "surfaceless");
-    std::env::set_var("GST_GL_PLATFORM", "egl");
 
     redfog_core::ensure_private_dbus_session();
     let _headless_runtime = redfog_core::HeadlessRuntime::start(runtime_dir).unwrap();
@@ -76,12 +63,12 @@ async fn dmabuf_gl_upload_test() {
         .format(gstreamer::Format::Time)
         .is_live(true)
         .build();
-    let glupload = gstreamer::ElementFactory::make("glupload").build().expect("glupload element");
-    let glcolorconvert = gstreamer::ElementFactory::make("glcolorconvert").build().expect("glcolorconvert element");
+    let vulkanupload = gstreamer::ElementFactory::make("vulkanupload").build().expect("vulkanupload element");
+    let vulkancolorconvert = gstreamer::ElementFactory::make("vulkancolorconvert").build().expect("vulkancolorconvert element");
     let sink = gstreamer::ElementFactory::make("fakesink").build().expect("fakesink element");
 
-    pipeline.add_many([appsrc.upcast_ref(), &glupload, &glcolorconvert, &sink]).unwrap();
-    gstreamer::Element::link_many([appsrc.upcast_ref(), &glupload, &glcolorconvert, &sink]).unwrap();
+    pipeline.add_many([appsrc.upcast_ref(), &vulkanupload, &vulkancolorconvert, &sink]).unwrap();
+    gstreamer::Element::link_many([appsrc.upcast_ref(), &vulkanupload, &vulkancolorconvert, &sink]).unwrap();
 
     let gst_format = match frame.format {
         8 => gstreamer_video::VideoFormat::Bgrx,
@@ -94,8 +81,9 @@ async fn dmabuf_gl_upload_test() {
         .expect("valid VideoInfo");
     let drm_info = gstreamer_video::VideoInfoDmaDrm::from_video_info(&video_info, frame.modifier)
         .expect("VideoInfoDmaDrm::from_video_info");
-    let caps = drm_info.to_caps().expect("VideoInfoDmaDrm::to_caps");
-    eprintln!("DMA_DRM caps: {caps}");
+    let mut caps = drm_info.to_caps().expect("VideoInfoDmaDrm::to_caps");
+    caps.get_mut().unwrap().set_features(0, None);
+    eprintln!("DMA_DRM caps without features: {caps}");
     appsrc.set_caps(Some(&caps));
 
     let allocator = gstreamer_allocators::DmaBufAllocator::new();
@@ -139,5 +127,5 @@ async fn dmabuf_gl_upload_test() {
     }
     pipeline.set_state(gstreamer::State::Null).ok();
     assert!(reached_eos, "pipeline did not reach EOS within 5s");
-    eprintln!("glupload successfully imported the DMA-BUF frame.");
+    eprintln!("vulkanupload successfully imported the DMA-BUF frame.");
 }

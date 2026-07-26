@@ -100,6 +100,13 @@ struct RunningSession {
     input_forwarder: Box<dyn InputSink>,
     video_pipeline: gstreamer::Pipeline,
     audio_pipeline: gstreamer::Pipeline,
+    /// `Some` only for `VideoEncoder::NvencDirect` — see `build_pipelines`.
+    /// `video_pipeline` is an empty placeholder in that case; this is the
+    /// real control surface (`request_keyframe`/`set_bitrate`). `Arc`'d so
+    /// the same one-time post-start keyframe-forcing task pattern used for
+    /// `video_pipeline` (a clone handed to a detached `tokio::spawn`) works
+    /// here too.
+    cuda_direct_session: Option<Arc<redfog_core::CudaDirectEncoderSession>>,
     _audio_loopback: AudioLoopback,
     /// The `session_id` this session was registered under with the broker
     /// (`SpawnSession` for Kwin, `SpawnPayload` for GstWaylandDisplay), if
@@ -770,7 +777,13 @@ impl SessionManager {
     /// tried to reconnect), not from rebuilding fresh ones as such.
     /// `rebuild_for_resume` avoids that by never waiting on the old
     /// pipeline's teardown at all.
-    fn build_pipelines(&self, compositor: &SpawnedCompositor, audio_loopback: &AudioLoopback, generation: u64, fps_cap: Option<u32>) -> (gstreamer::Pipeline, gstreamer::Pipeline) {
+    fn build_pipelines(
+        &self,
+        compositor: &SpawnedCompositor,
+        audio_loopback: &AudioLoopback,
+        generation: u64,
+        fps_cap: Option<u32>,
+    ) -> (gstreamer::Pipeline, gstreamer::Pipeline, Option<Arc<redfog_core::CudaDirectEncoderSession>>) {
         // GStreamer's appsink callbacks run on GStreamer's own streaming
         // threads, not tokio worker threads — `tokio::spawn` would panic
         // there ("no reactor running"). Capture a `Handle` (valid from any
@@ -807,11 +820,11 @@ impl SessionManager {
         let video_client_name = format!("redfog-video-gen-{generation}");
         let audio_client_name = format!("redfog-audio-gen-{generation}");
         let video_stats = Arc::new(Mutex::new(EncodedFrameStats::new()));
-        let video_pipeline = redfog_core::make_encoder_pipeline(compositor.video_source(), &video_client_name, video_encoder, fps_cap, bitrate, {
+        let on_video_access_unit = {
             let handle = handle.clone();
             let this = this.clone();
             let video_stats = video_stats.clone();
-            move |data, is_key_frame| {
+            move |data: Vec<u8>, is_key_frame: bool| {
                 tracing::debug!("video encoder produced {} bytes, key_frame={is_key_frame}", data.len());
                 if let Some((fps, kbps)) = video_stats.lock().unwrap().record(data.len()) {
                     tracing::info!("video: {fps:.1} fps, {kbps:.0} kbps (generation={generation})");
@@ -855,7 +868,47 @@ impl SessionManager {
                     }
                 });
             }
-        });
+        };
+
+        // `NvencDirect` only ever applies to a real `KwinNativeDmaBuf`
+        // source (the User/`Backend::Kwin` stage) — `video_source()` always
+        // returns `VideoSource::Login` for the Login stage regardless of
+        // the requested encoder (see `SpawnedCompositor::video_source`'s
+        // `HeadlessLogin` arm), so the *same* server-wide `video_encoder`
+        // config must still fall back to a real GStreamer encoder there.
+        let source = compositor.video_source(Some(video_encoder));
+        let mut cuda_direct_session = None;
+        let video_pipeline = if video_encoder == redfog_core::VideoEncoder::NvencDirect
+            && matches!(source, redfog_core::VideoSource::KwinNativeDmaBuf { .. })
+        {
+            let session = redfog_core::make_cuda_direct_encoder_session(source, bitrate, on_video_access_unit);
+            cuda_direct_session = Some(Arc::new(session));
+            // `NvencDirect` has no GStreamer pipeline at all — this empty
+            // placeholder exists only so the rest of this type's machinery
+            // (Drop's `set_state(Null)`, `start_streaming`'s Playing-
+            // transition, `request_keyframe`/`set_encoder_bitrate`, which are
+            // all now no-ops for a pipeline with no named elements) has a
+            // `gstreamer::Pipeline` to hold — see `cuda_direct_session`
+            // above for the real control surface. `input_sink` never looks
+            // at this either: `NvencDirect` is only ever paired with
+            // `Backend::Kwin`, whose `input_sink` ignores the pipeline
+            // argument entirely (see `SpawnedCompositor::input_sink`).
+            gstreamer::Pipeline::new()
+        } else {
+            // Login (or any other non-`KwinNativeDmaBuf` source) can't use
+            // `NvencDirect` — fall back to regular GStreamer NVENC for it,
+            // same as if the server-wide config had been `Nvenc` all along.
+            let pipeline_encoder =
+                if video_encoder == redfog_core::VideoEncoder::NvencDirect { redfog_core::VideoEncoder::Nvenc } else { video_encoder };
+            redfog_core::make_encoder_pipeline(
+                source,
+                &video_client_name,
+                pipeline_encoder,
+                fps_cap,
+                bitrate,
+                on_video_access_unit,
+            )
+        };
 
         let audio_pipeline = redfog_core::make_audio_pipeline(audio_loopback, &audio_client_name, move |packet| {
             let sender = {
@@ -927,7 +980,7 @@ impl SessionManager {
             });
         });
 
-        (video_pipeline, audio_pipeline)
+        (video_pipeline, audio_pipeline, cuda_direct_session)
     }
 
     /// Rebuilds a backgrounded session's screencast capture and video/audio
@@ -988,7 +1041,7 @@ impl SessionManager {
             self.config.video_encoder,
             self.config.bitrate_kbps,
         );
-        let (video_pipeline, audio_pipeline) = self.build_pipelines(&compositor, &audio_loopback, generation, fps_cap);
+        let (video_pipeline, audio_pipeline, cuda_direct_session) = self.build_pipelines(&compositor, &audio_loopback, generation, fps_cap);
         // Must come *after* `build_pipelines`, not before (this used to be
         // the other way around): `SpawnedCompositor::GstWaylandDisplay`'s
         // `input_sink` now looks up its `waylanddisplaysrc` element inside
@@ -1006,6 +1059,7 @@ impl SessionManager {
             input_forwarder,
             video_pipeline,
             audio_pipeline,
+            cuda_direct_session,
             _audio_loopback: audio_loopback,
             broker_session_id,
             generation,
@@ -1190,6 +1244,7 @@ impl SessionManager {
             // from here on, independent of the moved value.
             let audio_pipeline_for_bg = session.audio_pipeline.clone();
             let video_pipeline_for_keyframe = session.video_pipeline.clone();
+            let cuda_direct_session_for_keyframe = session.cuda_direct_session.clone();
             let bus_watchers_stop = session.bus_watchers_stop.clone();
             let gst_payload_info = if !is_resume {
                 match session.compositor.as_ref() {
@@ -1255,6 +1310,9 @@ impl SessionManager {
                 tokio::time::sleep(Duration::from_millis(700)).await;
                 tracing::info!("start_streaming(generation={generation}): forcing a keyframe to correct any incomplete initial composite");
                 redfog_core::request_keyframe(&video_pipeline_for_keyframe);
+                if let Some(cuda_direct_session) = &cuda_direct_session_for_keyframe {
+                    cuda_direct_session.request_keyframe();
+                }
             });
 
             // Audio: still bounded, but detached — never gates anything
@@ -1917,13 +1975,16 @@ impl RtspHandler for SessionManager {
 
             // Apply it to the active pipeline encoder immediately if it exists
             let shared = self.shared.lock().unwrap();
-            let active_pipeline = match &shared.state {
-                State::Launched { session } => Some(&session.video_pipeline),
-                State::Streaming { session } => Some(&session.video_pipeline),
+            let active_session = match &shared.state {
+                State::Launched { session } => Some(session),
+                State::Streaming { session } => Some(session),
                 _ => None,
             };
-            if let Some(pipeline) = active_pipeline {
-                redfog_core::set_encoder_bitrate(pipeline, bitrate_kbps);
+            if let Some(session) = active_session {
+                redfog_core::set_encoder_bitrate(&session.video_pipeline, bitrate_kbps);
+                if let Some(cuda_direct_session) = &session.cuda_direct_session {
+                    cuda_direct_session.set_bitrate(bitrate_kbps);
+                }
             }
         }
     }
@@ -2186,6 +2247,9 @@ impl ControlEventHandler for SessionManager {
         let shared = self.shared.lock().unwrap();
         if let State::Streaming { session } = &shared.state {
             redfog_core::request_keyframe(&session.video_pipeline);
+            if let Some(cuda_direct_session) = &session.cuda_direct_session {
+                cuda_direct_session.request_keyframe();
+            }
         }
     }
 
@@ -2200,10 +2264,10 @@ impl ControlEventHandler for SessionManager {
     /// cause visible oscillation. Never exceeds `config.bitrate_kbps` — that
     /// stays the ceiling, not just a starting point.
     fn on_loss_stats(&self, last_good_frame: u64) {
-        let video_pipeline = {
+        let (video_pipeline, cuda_direct_session) = {
             let shared = self.shared.lock().unwrap();
             let State::Streaming { session } = &shared.state else { return };
-            session.video_pipeline.clone()
+            (session.video_pipeline.clone(), session.cuda_direct_session.clone())
         };
 
         let next_frame_number = self.video_packetizer.lock().unwrap().clone().lock().unwrap().next_frame_number();
@@ -2222,6 +2286,9 @@ impl ControlEventHandler for SessionManager {
             self.current_bitrate_kbps.store(new_kbps, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!("adaptive bitrate: {current_kbps} -> {new_kbps} kbps (frames_behind={frames_behind})");
             redfog_core::set_encoder_bitrate(&video_pipeline, new_kbps);
+            if let Some(cuda_direct_session) = &cuda_direct_session {
+                cuda_direct_session.set_bitrate(new_kbps);
+            }
         }
     }
 }
