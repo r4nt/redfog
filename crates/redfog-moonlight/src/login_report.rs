@@ -41,8 +41,8 @@ impl LoginReportServer {
             let request: LoginRequest = serde_json::from_str(line.trim_end())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let response = match request {
-                LoginRequest::Authenticate { username, password, session } => {
-                    LoginResponse::Authenticate(self.session_manager.handle_login_report(username, password, session).await)
+                LoginRequest::Authenticate { username, password, session, generation } => {
+                    LoginResponse::Authenticate(self.session_manager.handle_login_report(username, password, session, generation).await)
                 }
                 LoginRequest::CheckUsername { username } => {
                     LoginResponse::CheckUsername { running: self.session_manager.handle_check_username(&username) }

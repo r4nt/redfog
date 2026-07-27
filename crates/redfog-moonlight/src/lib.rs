@@ -10,3 +10,4 @@ pub mod audio;
 pub mod discovery;
 pub mod login_report;
 pub mod session;
+pub mod udp_sender;

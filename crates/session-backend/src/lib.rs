@@ -347,7 +347,7 @@ pub fn spawn_gst_compositor(width: u32, height: u32, fps: u32, label: &str) -> R
 /// arriving on it onto a channel (see `SpawnedCompositor::HeadlessLogin`'s
 /// `frame_rx` doc comment for the rest of the chain — no GStreamer element
 /// gets built here at all).
-pub fn spawn_login_compositor(login_app: &[String], width: u32, height: u32) -> Result<SpawnedCompositor, String> {
+pub fn spawn_login_compositor(login_app: &[String], width: u32, height: u32, generation: u64) -> Result<SpawnedCompositor, String> {
     if login_app.is_empty() {
         return Err("login_app must not be empty".to_string());
     }
@@ -365,6 +365,10 @@ pub fn spawn_login_compositor(login_app: &[String], width: u32, height: u32) -> 
     cmd.env("REDFOG_LOGIN_FRAME_SOCKET", &socket_path);
     cmd.env("REDFOG_LOGIN_WIDTH", width.to_string());
     cmd.env("REDFOG_LOGIN_HEIGHT", height.to_string());
+    // See `LoginRequest::Authenticate`'s doc comment — lets the server
+    // correlate this specific process's report with its own session slot
+    // when multiple Login stages are running concurrently.
+    cmd.env("REDFOG_LOGIN_GENERATION", generation.to_string());
     cmd.stdout(std::process::Stdio::inherit()).stderr(std::process::Stdio::inherit());
     let mut child = cmd.spawn().map_err(|e| format!("failed to spawn {login_app:?}: {e}"))?;
 

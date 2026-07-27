@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use rtsp_types::headers::{CONTENT_TYPE, CSEQ, PUBLIC, SESSION, TRANSPORT};
-use rtsp_types::{Message, Method, ParseError, Request, Response, StatusCode, Version};
+use rtsp_types::{HeaderName, Message, Method, ParseError, Request, Response, StatusCode, Version};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -26,14 +26,38 @@ pub struct AnnouncedParams {
 }
 
 pub trait RtspHandler: Send + Sync {
-    fn on_announce(&self, params: AnnouncedParams);
-    fn on_play(&self);
+    /// `client_ip`: same identity key as `on_play`'s — which client's
+    /// session this `ANNOUNCE`d bitrate applies to.
+    fn on_announce(&self, params: AnnouncedParams, client_ip: std::net::IpAddr);
+    /// `client_ip`: the RTSP TCP connection's peer address — one connection
+    /// per request (see `handle_connection`'s doc comment), so this is
+    /// exactly the client this `PLAY` is for. Used to route that client's
+    /// later video/audio `PING` datagrams to the right session (see
+    /// `crate::udp_sender`) when more than one session can be concurrently
+    /// pending a ping at once.
+    fn on_play(&self, client_ip: std::net::IpAddr);
+    /// Best-effort resolution of `client_ip` to a pending/active session's
+    /// `ping_token` (see `SessionOrigin`'s doc comment in session.rs), for
+    /// the `SETUP` response's `X-SS-Ping-Payload` header — an existing,
+    /// already-supported wire-protocol extension (not a redfog invention)
+    /// for a client to echo an unambiguous per-session token in every
+    /// video/audio `PING` it sends, instead of us having to dispatch those
+    /// by source IP alone (which can't tell two concurrent clients apart
+    /// when they share an address). `None` (header omitted) if no session
+    /// is currently pending for this IP at all — the client falls back to
+    /// a bare `PING`
+    /// with no payload in that case (see moonlight-common-rust's
+    /// `PingSender`), which still works for a single active session.
+    fn ping_token_for(&self, client_ip: std::net::IpAddr) -> Option<[u8; 16]>;
 }
 
 pub struct NoopRtspHandler;
 impl RtspHandler for NoopRtspHandler {
-    fn on_announce(&self, _params: AnnouncedParams) {}
-    fn on_play(&self) {}
+    fn on_announce(&self, _params: AnnouncedParams, _client_ip: std::net::IpAddr) {}
+    fn on_play(&self, _client_ip: std::net::IpAddr) {}
+    fn ping_token_for(&self, _client_ip: std::net::IpAddr) -> Option<[u8; 16]> {
+        None
+    }
 }
 
 /// Real clients send `SETUP` requests with a request-target like
@@ -59,6 +83,14 @@ fn rewrite_request_target(buf: &mut Vec<u8>) -> Option<String> {
     let new_line = format!("{method} * {version}");
     buf.splice(..line_end, new_line.into_bytes());
     Some(target)
+}
+
+/// `rtsp-types` only ships constants for the common RFC 2326 header names —
+/// this one's a wire-protocol extension header, so it has to be constructed
+/// at runtime. Infallible for this literal (no non-ASCII/invalid
+/// characters), hence the `expect`.
+fn x_ss_ping_payload() -> HeaderName {
+    HeaderName::from_static_str("X-SS-Ping-Payload").expect("valid static header name")
 }
 
 pub struct RtspServer {
@@ -92,7 +124,7 @@ impl RtspServer {
             };
             let this = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = this.handle_connection(stream).await {
+                if let Err(e) = this.handle_connection(stream, peer).await {
                     tracing::debug!("rtsp connection from {peer} ended: {e}");
                 }
             });
@@ -104,8 +136,9 @@ impl RtspServer {
     /// it only parses the response once it observes TCP disconnect) use one
     /// TCP connection per RTSP request — HTTP/1.0-style, not a persistent
     /// connection for the whole OPTIONS/DESCRIBE/SETUP*/ANNOUNCE/PLAY
-    /// sequence like RFC 2326 RTSP normally would.
-    async fn handle_connection(&self, mut stream: tokio::net::TcpStream) -> Result<(), String> {
+    /// sequence like RFC 2326 RTSP normally would. `peer` is this exact
+    /// connection's address, forwarded to `on_play` for `PLAY` requests.
+    async fn handle_connection(&self, mut stream: tokio::net::TcpStream, peer: std::net::SocketAddr) -> Result<(), String> {
         let mut buf = Vec::new();
         let mut read_buf = [0u8; 4096];
         let mut original_target = None;
@@ -134,7 +167,7 @@ impl RtspServer {
         tracing::debug!("rtsp: {:?} cseq={:?} target={:?}", request.method(), request.header(&CSEQ), original_target);
 
         let response = self
-            .handle_request(&request, &self.session_id, original_target.as_deref().unwrap_or(""))
+            .handle_request(&request, &self.session_id, original_target.as_deref().unwrap_or(""), peer)
             .await;
         let mut out = Vec::new();
         response
@@ -146,7 +179,7 @@ impl RtspServer {
         Ok(())
     }
 
-    async fn handle_request(&self, request: &Request<Vec<u8>>, session_id: &str, target: &str) -> Response<Vec<u8>> {
+    async fn handle_request(&self, request: &Request<Vec<u8>>, session_id: &str, target: &str, peer: std::net::SocketAddr) -> Response<Vec<u8>> {
         let cseq = request.header(&CSEQ).cloned();
         let mut response = match *request.method() {
             Method::Options => Response::builder(Version::V1_0, StatusCode::Ok)
@@ -167,20 +200,39 @@ impl RtspServer {
                 // Real targets: "streamid=audio/0/0", "streamid=video/0/0",
                 // but "stream=control/13/0" — note "control" drops the "id",
                 // an actual inconsistency in the wire protocol, not a typo.
+                let is_control = target.contains("=control");
                 let port = if target.contains("=audio") {
                     self.audio_port
-                } else if target.contains("=control") {
+                } else if is_control {
                     self.control_port
                 } else {
                     self.video_port
                 };
-                Response::builder(Version::V1_0, StatusCode::Ok)
+                let mut builder = Response::builder(Version::V1_0, StatusCode::Ok)
                     .header(SESSION, session_id.to_string())
-                    .header(TRANSPORT, format!("unicast;server_port={port}-{}", port + 1))
-                    .build(Vec::new())
+                    .header(TRANSPORT, format!("unicast;server_port={port}-{}", port + 1));
+                // Only for audio/video — the control channel doesn't PING at
+                // all (ENet's own `Connect` handshake gives us its address
+                // directly, and it's matched by decrypt-trial, not by echoed
+                // token — see control::ControlServer's doc comment).
+                if !is_control {
+                    if let Some(token) = self.handler.ping_token_for(peer.ip()) {
+                        // `X-SS-Ping-Payload`'s value bytes are used
+                        // directly as the ping payload by the client (see
+                        // moonlight-common-rust's `RtspSetupResponse`
+                        // parsing: `payload_str.as_bytes()`, no decoding) —
+                        // `ping_token` is generated as printable ASCII
+                        // specifically so it survives this text-based
+                        // header/round-trip intact (see `SessionOrigin::
+                        // fresh`'s doc comment).
+                        let value = String::from_utf8(token.to_vec()).expect("ping_token is always printable ASCII");
+                        builder = builder.header(x_ss_ping_payload(), value);
+                    }
+                }
+                builder.build(Vec::new())
             }
             Method::Announce => {
-                self.handler.on_announce(self.parse_announce(request.body()));
+                self.handler.on_announce(self.parse_announce(request.body()), peer.ip());
                 Response::builder(Version::V1_0, StatusCode::Ok).build(Vec::new())
             }
             Method::Play => {
@@ -190,7 +242,8 @@ impl RtspServer {
                 // thread, same reasoning as the `pairing.rs` launch/resume/
                 // cancel call sites.
                 let handler = self.handler.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || handler.on_play()).await {
+                let client_ip = peer.ip();
+                if let Err(e) = tokio::task::spawn_blocking(move || handler.on_play(client_ip)).await {
                     tracing::error!("on_play task panicked: {e}");
                 }
                 Response::builder(Version::V1_0, StatusCode::Ok)
@@ -287,7 +340,7 @@ mod tests {
             .header(CSEQ, "1")
             .empty();
         let response = server()
-            .handle_request(&request.replace_body(Vec::new()), "deadbeef", "*")
+            .handle_request(&request.replace_body(Vec::new()), "deadbeef", "*", "127.0.0.1:12345".parse().unwrap())
             .await;
         assert_eq!(response.status(), StatusCode::Ok);
         assert_eq!(response.header(&CSEQ).map(|v| v.as_str()), Some("1"));
@@ -300,7 +353,7 @@ mod tests {
             .empty();
         // Real clients send "stream=control/N/0" (not "streamid=") for this one — see rtsp.rs comment.
         let response = server()
-            .handle_request(&request.replace_body(Vec::new()), "deadbeef", "stream=control/13/0")
+            .handle_request(&request.replace_body(Vec::new()), "deadbeef", "stream=control/13/0", "127.0.0.1:12345".parse().unwrap())
             .await;
         assert_eq!(response.header(&SESSION).map(|v| v.as_str()), Some("deadbeef"));
         assert_eq!(response.header(&TRANSPORT).map(|v| v.as_str()), Some("unicast;server_port=47999-48000"));

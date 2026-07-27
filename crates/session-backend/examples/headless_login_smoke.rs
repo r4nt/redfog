@@ -67,7 +67,7 @@ fn main() {
 
     gstreamer::init().expect("gstreamer::init");
 
-    let compositor = session_backend::spawn_login_compositor(&[login_bin], 1280, 720).expect("spawn_login_compositor should succeed");
+    let compositor = session_backend::spawn_login_compositor(&[login_bin], 1280, 720, 0).expect("spawn_login_compositor should succeed");
     let mut input = compositor.input_sink(None).expect("input_sink");
 
     let frame_store: Arc<Mutex<Option<redfog_core::Frame>>> = Arc::new(Mutex::new(None));

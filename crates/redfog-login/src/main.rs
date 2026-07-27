@@ -95,7 +95,14 @@ fn authenticate(username: &str, password: &str, session: &str) -> Result<(), Str
         }
         return Ok(());
     };
-    let request = LoginRequest::Authenticate { username: username.to_string(), password: password.to_string(), session: session.to_string() };
+    // Set by `session_backend::spawn_login_compositor` to this Login stage's
+    // own `RunningSession::generation` — see `LoginRequest::Authenticate`'s
+    // doc comment for why the server needs this to disambiguate concurrent
+    // logins. `0` when unset (standalone/no-broker use, or a stand-in login
+    // app in tests that doesn't set it) — harmless: with no concurrent
+    // logins there's nothing to disambiguate.
+    let generation: u64 = std::env::var("REDFOG_LOGIN_GENERATION").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let request = LoginRequest::Authenticate { username: username.to_string(), password: password.to_string(), session: session.to_string(), generation };
     match send_login_request(&socket_path, &request)? {
         LoginResponse::Authenticate(result) => result,
         other => Err(format!("unexpected response to Authenticate: {other:?}")),

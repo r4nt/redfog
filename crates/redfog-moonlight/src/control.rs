@@ -23,10 +23,10 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use tokio_enet::{Event, Host, HostConfig};
+use tokio_enet::{Event, Host, HostConfig, PeerId};
 
 use crate::crypto;
 
@@ -42,9 +42,13 @@ pub enum InputEvent {
     ScrollHorizontal { amount: i16 },
 }
 
+/// `rikey` identifies which session a message came from — matched by
+/// actually decrypting with it (see `ControlServer::serve`'s doc comment),
+/// not by source address. `SessionManager` scans its sessions for whichever
+/// one's own `origin.rikey` equals this to find which one to act on.
 pub trait ControlEventHandler: Send + Sync {
-    fn on_input(&self, event: InputEvent);
-    fn on_request_idr_frame(&self);
+    fn on_input(&self, rikey: [u8; 16], event: InputEvent);
+    fn on_request_idr_frame(&self, rikey: [u8; 16]);
     /// `LossStats` (0x0201) — sent regularly by every real client (not a
     /// Sunshine/Foundation extension, base protocol), carrying the frame
     /// index of the last frame it fully received. Real Sunshine already
@@ -52,47 +56,119 @@ pub trait ControlEventHandler: Send + Sync {
     /// `redfog_core::set_encoder_bitrate`'s doc comment for why bitrate
     /// specifically (unlike resolution/fps) needs no client cooperation
     /// beyond this existing report.
-    fn on_loss_stats(&self, last_good_frame: u64);
+    fn on_loss_stats(&self, rikey: [u8; 16], last_good_frame: u64);
 }
 
 pub struct NoopControlEventHandler;
 impl ControlEventHandler for NoopControlEventHandler {
-    fn on_input(&self, _event: InputEvent) {}
-    fn on_request_idr_frame(&self) {}
-    fn on_loss_stats(&self, _last_good_frame: u64) {}
+    fn on_input(&self, _rikey: [u8; 16], _event: InputEvent) {}
+    fn on_request_idr_frame(&self, _rikey: [u8; 16]) {}
+    fn on_loss_stats(&self, _rikey: [u8; 16], _last_good_frame: u64) {}
+}
+
+/// `epoch` is bumped on every `register()` call for a `rikey` (whether it's
+/// a fresh registration or a re-registration of the same value) —
+/// `ControlServer::serve`'s loop compares each currently-matched peer's
+/// remembered epoch against the live one and disconnects it the moment
+/// they diverge. This is what actually disconnects a stale ENet peer on a
+/// genuine retake or session end — scoped per rikey rather than a single
+/// global sweep, so one session's takeover never touches another's
+/// still-live connection.
+///
+/// Registered rikeys (not addresses): matching works by actually
+/// decrypting an incoming message with each candidate key and seeing which
+/// one authenticates (GCM's tag either verifies or it doesn't) — see
+/// `ControlServer::serve`'s own doc comment for why this replaced
+/// address-based matching (can't tell two concurrent clients sharing a
+/// source address apart) and is, unlike that, genuinely cryptographic: an
+/// attacker without the right rikey cannot produce a message that
+/// authenticates, regardless of where it's sent from.
+#[derive(Default)]
+struct RegistryState {
+    registrations: HashMap<[u8; 16], u64>,
+}
+
+/// Shared between `SessionManager` (writes, via `register`/`forget` — see
+/// `on_play`/`launch`/`take_active_session`) and `ControlServer::serve`
+/// (reads, via `snapshot`) — the control-channel analogue of
+/// `MultiClientUdpSender`: one ENet host bound once at server startup,
+/// concurrent sessions distinguished by their own registration rather than
+/// a single shared key.
+pub struct ControlRegistry {
+    state: Mutex<RegistryState>,
+    next_epoch: AtomicU64,
+}
+
+impl Default for ControlRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ControlRegistry {
+    pub fn new() -> Self {
+        Self { state: Mutex::new(RegistryState::default()), next_epoch: AtomicU64::new(0) }
+    }
+
+    /// Registers (or re-registers, for a retake — see `RegistryState`'s doc
+    /// comment) `rikey` as a currently-valid control-channel key. Idempotent
+    /// to call repeatedly with the same value (each call still bumps the
+    /// epoch and thus still triggers a reconnect-sweep of the previously-
+    /// matched peer, if any — harmless, just a peer re-matching itself on
+    /// the next loop tick).
+    pub fn register(&self, rikey: [u8; 16]) {
+        let epoch = self.next_epoch.fetch_add(1, Ordering::AcqRel);
+        self.state.lock().unwrap().registrations.insert(rikey, epoch);
+    }
+
+    /// Removes `rikey`'s registration entirely — its ENet peer (if matched)
+    /// gets disconnected on the `serve` loop's next tick, same as any other
+    /// now-stale registration.
+    pub fn forget(&self, rikey: [u8; 16]) {
+        self.state.lock().unwrap().registrations.remove(&rikey);
+    }
+
+    fn snapshot(&self) -> HashMap<[u8; 16], u64> {
+        self.state.lock().unwrap().registrations.clone()
+    }
 }
 
 pub struct ControlServer {
     pub port: u16,
-    /// The client's `rikey` (from `/launch`), used to decrypt incoming control
-    /// messages. A shared cell rather than a fixed value: it's only known
-    /// once `/launch` happens (and changes across relaunches), while this
-    /// server binds once at startup.
-    pub key: Arc<std::sync::Mutex<Option<[u8; 16]>>>,
+    /// Bound once at server startup (not per-launch, not per-session) —
+    /// same reasoning as `SessionManager::video_sender`/`audio_sender`: one
+    /// shared ENet host for the whole server's lifetime, with concurrent
+    /// sessions distinguished by their own registered rikey rather than a
+    /// single shared key.
+    pub registry: Arc<ControlRegistry>,
     pub handler: Arc<dyn ControlEventHandler>,
-    /// Bumped by `SessionManager::set_rikey` whenever a new client takes over
-    /// an existing session (reconnect after a closed window, or a plain
-    /// relaunch). Each connected peer is tagged (see `serve`) with whatever
-    /// generation was current at its own `Connect` event; any peer whose tag
-    /// falls behind the latest generation gets disconnected.
-    ///
-    /// This has to be generation-based rather than "disconnect whoever's
-    /// connected right now when notified" — confirmed live: a blanket sweep
-    /// run right after the *new* client's own peer connected disconnected
-    /// that brand-new peer too (it doesn't know it's new), silently killing
-    /// every reconnect's control channel before it could even request a
-    /// keyframe. Tagging by generation means a peer is only ever a
-    /// disconnect target once *another*, later reconnect makes it stale —
-    /// never the one that triggered the sweep it's caught in.
-    ///
-    /// Solves a separate, real problem: a stale peer that never sent ENet's
-    /// own disconnect (e.g. a closed browser tab, confirmed live) keeps
-    /// sending messages encrypted with the old rikey after `key` moves on to
-    /// the new client's, and those fail GCM authentication forever.
-    pub rikey_generation: Arc<AtomicU64>,
 }
 
+/// How long an ENet peer is allowed to sit connected without ever sending a
+/// message that authenticates against some registered rikey before it's
+/// given up on and disconnected. Real clients always connect the control
+/// channel only after RTSP `PLAY` (whose handling registers the rikey this
+/// peer needs to match — see `SessionManager::on_play`), but that
+/// registration happens on a different task than this loop, so there's an
+/// inherent, normally brief race — this timeout only guards against it
+/// never resolving at all (an abandoned/bogus connection, or one that only
+/// ever sends unencrypted messages — see `is_encrypted_message`'s doc
+/// comment for why those can't be used to match at all).
+const PENDING_MATCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl ControlServer {
+    /// Matches each new ENet peer to a session by *decrypting* its first
+    /// matchable message against every currently-registered rikey and
+    /// seeing which one authenticates (GCM's 16-byte tag either verifies or
+    /// it doesn't — there's no meaningful chance of a false match). This
+    /// replaced an earlier version that matched by the peer's source
+    /// address instead: confirmed live that plain IP can't tell two
+    /// concurrent clients apart when they share one (same NAT, or literally
+    /// the same machine) — decrypt-based matching sidesteps that entirely,
+    /// and is genuinely cryptographic besides (see `RegistryState`'s doc
+    /// comment). Once a peer matches, its rikey is cached (`peer_rikey`) so
+    /// only its *first* message ever needs the O(sessions) trial — every
+    /// later message decrypts directly against the one already-known key.
     pub async fn serve(self, bind_addr: IpAddr) -> Result<(), String> {
         let config = HostConfig {
             address: Some(std::net::SocketAddr::new(bind_addr, self.port)),
@@ -107,45 +183,73 @@ impl ControlServer {
             ..Default::default()
         };
         let mut host = Host::new(config).map_err(|e| format!("failed to create enet host on port {}: {e}", self.port))?;
-        // Which `rikey_generation` was current when each peer connected —
-        // see the field's doc comment for why this can't just be "whoever's
-        // connected right now".
-        let mut peer_generations: HashMap<tokio_enet::PeerId, u64> = HashMap::new();
-        let mut last_seen_generation = self.rikey_generation.load(Ordering::Acquire);
+        // Peers matched to a rikey, and the epoch they were matched under
+        // (see `RegistryState`'s doc comment for why epoch, not rikey
+        // alone, is what decides staleness).
+        let mut peer_rikey: HashMap<PeerId, ([u8; 16], u64)> = HashMap::new();
+        // Connected but not yet matched to any rikey, with when they
+        // connected — see `PENDING_MATCH_TIMEOUT`.
+        let mut pending: HashMap<PeerId, Instant> = HashMap::new();
 
         loop {
-            let current_generation = self.rikey_generation.load(Ordering::Acquire);
-            if current_generation != last_seen_generation {
-                let stale: Vec<_> = peer_generations
-                    .iter()
-                    .filter(|(_, &gen)| gen < current_generation)
-                    .map(|(&id, _)| id)
-                    .collect();
-                for peer_id in &stale {
-                    host.disconnect_now(*peer_id, 0);
-                    peer_generations.remove(peer_id);
-                }
-                if !stale.is_empty() {
-                    tracing::info!("control channel: disconnected {} stale peer(s) for session takeover", stale.len());
-                }
-                last_seen_generation = current_generation;
+            let regs = self.registry.snapshot();
+
+            // Disconnect any peer whose matched rikey has since been
+            // superseded (a retake re-registered it, bumping its epoch) or
+            // removed entirely (the session ended).
+            let stale: Vec<PeerId> = peer_rikey.iter().filter(|(_, &(rikey, epoch))| regs.get(&rikey) != Some(&epoch)).map(|(&id, _)| id).collect();
+            for peer_id in &stale {
+                host.disconnect_now(*peer_id, 0);
+                peer_rikey.remove(peer_id);
             }
+            if !stale.is_empty() {
+                tracing::info!("control channel: disconnected {} stale peer(s) for session takeover", stale.len());
+            }
+
+            // Give up on any peer that's been connected too long without
+            // ever sending a message we could match (see
+            // `PENDING_MATCH_TIMEOUT`'s doc comment).
+            pending.retain(|&peer_id, &mut connected_at| {
+                if connected_at.elapsed() > PENDING_MATCH_TIMEOUT {
+                    tracing::warn!("control channel: peer {peer_id:?} never matched a session within {PENDING_MATCH_TIMEOUT:?}, disconnecting");
+                    host.disconnect_now(peer_id, 0);
+                    false
+                } else {
+                    true
+                }
+            });
+
             match host.service(Duration::from_millis(100)).await {
                 Ok(Some(Event::Connect { peer_id, .. })) => {
                     tracing::info!("control channel: peer {peer_id:?} connected");
-                    // Read fresh, not `last_seen_generation`/`current_generation`
-                    // above — this event may be processed after a *later*
-                    // `set_rikey` than the one this iteration observed, and
-                    // under-tagging would make this peer an immediate
-                    // disconnect target on the very next check.
-                    peer_generations.insert(peer_id, self.rikey_generation.load(Ordering::Acquire));
+                    pending.insert(peer_id, Instant::now());
                 }
                 Ok(Some(Event::Disconnect { peer_id, .. })) => {
                     tracing::info!("control channel: peer {peer_id:?} disconnected");
-                    peer_generations.remove(&peer_id);
+                    peer_rikey.remove(&peer_id);
+                    pending.remove(&peer_id);
                 }
-                Ok(Some(Event::Receive { packet, .. })) => {
-                    self.handle_message(packet.data());
+                Ok(Some(Event::Receive { peer_id, packet, .. })) => {
+                    if let Some(&(rikey, _)) = peer_rikey.get(&peer_id) {
+                        self.handle_message(rikey, packet.data());
+                    } else if is_encrypted_message(packet.data()) {
+                        match regs.iter().find(|(rikey, _)| ControlMessage::parse(packet.data(), rikey).is_ok()) {
+                            Some((&rikey, &epoch)) => {
+                                tracing::info!("control channel: peer {peer_id:?} matched");
+                                peer_rikey.insert(peer_id, (rikey, epoch));
+                                pending.remove(&peer_id);
+                                self.handle_message(rikey, packet.data());
+                            }
+                            None => tracing::debug!("control channel: peer {peer_id:?} sent an encrypted message that didn't authenticate against any registered session"),
+                        }
+                    } else {
+                        // Unencrypted messages (base-protocol keepalives
+                        // etc.) don't even read the key they're "decrypted"
+                        // with — see `is_encrypted_message`'s doc comment —
+                        // so there's nothing here to match on. Wait for a
+                        // later, actually-encrypted message instead.
+                        tracing::trace!("control channel: ignoring unencrypted message from unmatched peer {peer_id:?}");
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => tracing::warn!("control channel enet error: {e}"),
@@ -153,22 +257,30 @@ impl ControlServer {
         }
     }
 
-    fn handle_message(&self, buffer: &[u8]) {
-        let Some(key) = *self.key.lock().unwrap() else {
-            tracing::trace!("dropping control message: no session's rikey is set yet");
-            return;
-        };
-        match ControlMessage::parse(buffer, &key) {
+    fn handle_message(&self, rikey: [u8; 16], buffer: &[u8]) {
+        match ControlMessage::parse(buffer, &rikey) {
             Ok(ControlMessage::InputData(payload)) => match decode_input_event(&payload) {
-                Some(event) => self.handler.on_input(event),
+                Some(event) => self.handler.on_input(rikey, event),
                 None => tracing::trace!("unhandled/unknown input event"),
             },
-            Ok(ControlMessage::RequestIdrFrame) => self.handler.on_request_idr_frame(),
-            Ok(ControlMessage::LossStats { last_good_frame }) => self.handler.on_loss_stats(last_good_frame),
+            Ok(ControlMessage::RequestIdrFrame) => self.handler.on_request_idr_frame(rikey),
+            Ok(ControlMessage::LossStats { last_good_frame }) => self.handler.on_loss_stats(rikey, last_good_frame),
             Ok(ControlMessage::Other) => {} // Ping/FrameStats/etc — ignored in v1.
             Err(e) => tracing::debug!("bad control message: {e}"),
         }
     }
+}
+
+/// Whether `buffer`'s top-level message type is `Encrypted` (0x0001) — the
+/// only kind that actually reads the key it's parsed with (see
+/// `ControlMessage::parse`: any other type ignores the `key` argument
+/// entirely). Used to decide whether an unmatched peer's message is even
+/// usable for decrypt-based session matching (see `ControlServer::serve`'s
+/// doc comment) — trying every registered key against an unencrypted
+/// message would "succeed" identically for all of them (nothing to
+/// authenticate), which would match to an arbitrary, likely wrong, session.
+fn is_encrypted_message(buffer: &[u8]) -> bool {
+    buffer.len() >= 4 && u16::from_le_bytes([buffer[0], buffer[1]]) == CONTROL_MSG_ENCRYPTED
 }
 
 const CONTROL_MSG_ENCRYPTED: u16 = 0x0001;

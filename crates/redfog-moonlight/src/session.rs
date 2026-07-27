@@ -4,23 +4,26 @@
 //! (login succeeded), we spawn the User compositor and repoint the video/
 //! audio/input pipelines at it — same two-session dance, different trigger.
 //!
-//! One *live-streamed* session at a time — there's only one RTSP/video/
-//! audio/control port set, so only one session can ever be actively
-//! attached to it. But multiple users' sessions can exist at once: every
-//! `/launch` always shows a fresh Login screen (never silently reconnects to
-//! whatever was previously attached), and whatever *was* attached — if it
-//! was a real User session, not just the Login screen itself — gets
-//! backgrounded rather than killed (see `background_sessions` and
-//! `background_or_discard_active_session`). Logging in again as the same
-//! user resumes that same backgrounded session instead of starting a fresh
-//! one; logging in as a different user backgrounds the first and starts (or
-//! resumes) the second. Only an explicit "Log Out" on the login screen
-//! actually terminates a session.
+//! Multiple physical clients can be concurrently attached and streaming —
+//! `Shared::clients` holds one independent slot per `client_ip` (the
+//! connecting peer's address, from `/launch`'s HTTP request — see
+//! `LaunchHandler::launch`'s doc comment), each running its own instance of
+//! this exact Login->User dance. Concurrency is scoped to *this*, though:
+//! `background_sessions` (see below) is still global, keyed by username —
+//! logging in as the same user (from any client) resumes that same
+//! backgrounded session instead of starting a fresh one; logging in as a
+//! different user (or from a different client_ip) just adds another
+//! concurrently-active slot. Only an explicit "Log Out" on the login screen
+//! actually terminates a session. See `CONCURRENT_SESSIONS.md` for the full
+//! design writeup, including the deliberate restriction this does NOT lift:
+//! mixing `Backend::Kwin`+`VideoEncoder::NvencDirect` and
+//! `Backend::GstWaylandDisplay` concurrently is unverified and not
+//! recommended, even though nothing here enforces it.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -29,8 +32,8 @@ pub use session_backend::Backend;
 use session_backend::SpawnedCompositor;
 
 use crate::audio::{AudioPacketizer, AudioSender};
-use crate::control::{ControlEventHandler, InputEvent};
-use crate::pairing::{LaunchHandler, RemoteInputKey};
+use crate::control::{ControlEventHandler, ControlRegistry, InputEvent};
+use crate::pairing::{ClientKey, LaunchHandler, RemoteInputKey};
 use crate::rtsp::{AnnouncedParams, RtspHandler};
 use crate::video::{VideoPacketizer, VideoSender};
 
@@ -78,6 +81,96 @@ pub struct SessionConfig {
 // the ownership model of each variant and why `SpawnedCompositor::terminate`/
 // `try_wait`/`video_source`/`input_sink` are as simple as they are.
 
+/// Everything about a session that must (a) stay bit-for-bit identical
+/// across a Login -> User handoff — the same wire-level RTSP session's
+/// crypto key, RTP sequence/timestamp continuity, and adaptive-bitrate
+/// state, just a different compositor underneath — and (b) be freshly
+/// (re-)established only for a genuinely new `/launch`, never a handoff or
+/// resume within the same launch. Built once per `/launch` (`SessionOrigin::
+/// fresh`, in `SessionManager::launch`) and threaded into every
+/// `spawn_session` call for that launch's lifetime, including
+/// `handoff_to_user`'s — which reads it back out of the old Login
+/// `RunningSession` (`.origin.clone()`) rather than constructing a fresh
+/// one, and also overwrites a *resumed* background session's stale origin
+/// with it (a resume is still a brand new wire-level RTSP session from the
+/// client's perspective, even though the compositor underneath is old).
+#[derive(Clone)]
+struct SessionOrigin {
+    /// The `Shared::clients` key this session lives under — carried forward
+    /// across a Login -> User handoff same as everything else here, so the
+    /// encoder callbacks' per-frame gating check (see `build_pipelines`)
+    /// looks the right slot up regardless of which stage built them.
+    client_key: ClientKey,
+    /// The `/launch` HTTP peer's address — NOT the identity key for
+    /// anything (see `ClientKey`'s doc comment for why plain IP can't tell
+    /// two clients sharing an address apart), but still needed to
+    /// best-effort-resolve which `ClientKey` slot an incoming RTSP
+    /// connection belongs to (see `resolve_client_key_by_ip`), since RTSP
+    /// itself carries no cert or client-echoed token at all.
+    client_ip: IpAddr,
+    /// Random per-launch token, sent to the client as `X-SS-Ping-Payload`
+    /// in the RTSP `SETUP` response (see `rtsp.rs`) and echoed back in
+    /// every video/audio `PING` it sends thereafter — the identity key for
+    /// `video_sender`/`audio_sender`'s learned-address bookkeeping (see
+    /// `crate::udp_sender`'s doc comment). Deliberately NOT `client_ip` or
+    /// `RunningSession::generation`: unlike either of those, this is
+    /// unambiguous even when two concurrent clients share a source address
+    /// — an existing, already-supported wire-protocol mechanism for this,
+    /// not a redfog invention (see moonlight-common-rust's
+    /// `PingSenderConfig`). Always
+    /// printable ASCII (see `SessionOrigin::fresh`), not fully arbitrary
+    /// bytes: it round-trips through an RTSP header (`X-SS-Ping-Payload`)
+    /// as a plain UTF-8 string on the wire (moonlight-common-rust reads it
+    /// back via a bare `payload_str.as_bytes()`, no decoding step), and
+    /// arbitrary bytes risk corrupting that text-based framing (embedded
+    /// CR/LF, invalid UTF-8, ...).
+    ping_token: [u8; 16],
+    /// This launch's client-generated remote-input key — decrypts the ENet
+    /// control channel (see `control::ControlRegistry`, matched by trying
+    /// every registered rikey rather than by address) and encrypts audio
+    /// (see `AudioPacketizer::packetize_encrypted`).
+    rikey: [u8; 16],
+    rikey_key_id: u32,
+    video_packetizer: Arc<Mutex<VideoPacketizer>>,
+    audio_packetizer: Arc<Mutex<AudioPacketizer>>,
+    stream_start: Instant,
+    /// Server-side adaptive bitrate ceiling/current — see
+    /// `redfog_core::set_encoder_bitrate`'s doc comment.
+    target_bitrate_kbps: u32,
+    current_bitrate_kbps: u32,
+}
+
+impl SessionOrigin {
+    /// Constructs brand-new continuity state for a genuinely new `/launch`
+    /// — never call this for a handoff or resume within the same launch
+    /// (see this type's own doc comment for why).
+    fn fresh(client_key: ClientKey, client_ip: IpAddr, rikey: [u8; 16], rikey_key_id: u32, default_bitrate_kbps: u32) -> Self {
+        Self {
+            client_key,
+            client_ip,
+            ping_token: random_ping_token(),
+            rikey,
+            rikey_key_id,
+            video_packetizer: Arc::new(Mutex::new(VideoPacketizer::new())),
+            audio_packetizer: Arc::new(Mutex::new(AudioPacketizer::new())),
+            stream_start: Instant::now(),
+            target_bitrate_kbps: default_bitrate_kbps,
+            current_bitrate_kbps: default_bitrate_kbps,
+        }
+    }
+}
+
+/// See `SessionOrigin::ping_token`'s doc comment for why this is restricted
+/// to printable ASCII rather than `rand::random::<[u8; 16]>()`.
+fn random_ping_token() -> [u8; 16] {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut token = [0u8; 16];
+    for byte in &mut token {
+        *byte = CHARSET[rand::random::<usize>() % CHARSET.len()];
+    }
+    token
+}
+
 struct RunningSession {
     kind: SessionType,
     width: u32,
@@ -119,12 +212,25 @@ struct RunningSession {
     /// the broker's `IsSessionAlive` with instead.
     broker_session_id: Option<String>,
     /// Identifies which "generation" of encoder callback this session's
-    /// `video_pipeline`/`audio_pipeline` were built with — see
-    /// `Shared::active_generation`'s doc comment for what this actually
-    /// guards against. Assigned once, at `spawn_session` time, and never
-    /// changes across a resume (resume reuses this same pipeline/session,
-    /// not a fresh one — see `handoff_to_user`).
+    /// `video_pipeline`/`audio_pipeline` were built with — every encoder
+    /// callback checks its own captured `generation` against whatever's
+    /// currently in `Shared::clients` for `origin.client_ip` before sending
+    /// anything, so a pipeline whose session is no longer the active one for
+    /// that client — including one that's supposed to be dead but whose
+    /// GStreamer-level teardown never actually completed — simply stops,
+    /// regardless of whether its own teardown ever finishes. Assigned once,
+    /// at `spawn_session` time, and never changes across a resume (resume
+    /// reuses this same pipeline/session, not a fresh one — see
+    /// `handoff_to_user`).
     generation: u64,
+    /// Continuity/identity state — see `SessionOrigin`'s own doc comment.
+    origin: SessionOrigin,
+    /// The User stage's resolved backend/payload, if any (see
+    /// `SelectedSession`'s doc comment) — `None` for the Login stage.
+    /// Stored here (not read from a global by `spawn_gst_payload_in_
+    /// background`) so a *different* client's concurrently-in-flight login
+    /// can never race this session's own resolved config.
+    selected_session: Option<SelectedSession>,
     /// Signals the bus-watcher threads `start_streaming` spawns for this
     /// session's *original* `video_pipeline`/`audio_pipeline` to stop.
     /// Confirmed live to matter: those threads run `bus.timed_pop_filtered`
@@ -184,13 +290,13 @@ impl Drop for RunningSession {
     }
 }
 
-enum State {
-    Idle,
-    /// Claimed by an in-flight `/launch` call that's still spawning the
-    /// compositor (a slow step: KWin startup, D-Bus activation, etc.) — a
-    /// placeholder so a second, concurrent `/launch` (real clients retry
-    /// `/launch` on their own if the first attempt is slow) can't also see
-    /// `Idle` and race into `spawn_session()` at the same time. Without
+enum ClientState {
+    /// Claimed by an in-flight `/launch` call (from this same `client_ip`)
+    /// that's still spawning the compositor (a slow step: KWin startup,
+    /// D-Bus activation, etc.) — a placeholder so a second, concurrent
+    /// `/launch` from the *same* client (real clients retry `/launch` on
+    /// their own if the first attempt is slow) can't also see this slot
+    /// absent and race into `spawn_session()` at the same time. Without
     /// this, two racing spawns fight over the same KWin Wayland socket name
     /// and both die almost immediately — confirmed live: 9 leaked
     /// kwin_wayland/redfog-login process pairs from one retry storm.
@@ -201,134 +307,128 @@ enum State {
     Streaming { session: RunningSession },
 }
 
-struct Shared {
-    state: State,
-    video_sender: Option<Arc<VideoSender>>,
-    audio_sender: Option<Arc<AudioSender>>,
-    /// The background tasks spawned alongside `video_sender`/`audio_sender`
-    /// to log whether a client ever PINGs them (see `on_play`) — tracked
-    /// here specifically so a superseding session can `.abort()` them.
-    /// Without this, confirmed live: each task holds its own `Arc<Video/
-    /// AudioSender>` clone for as long as its 30s `wait_for_client` timeout
-    /// runs, `take_active_session` clearing `video_sender`/`audio_sender`
+impl ClientState {
+    fn session(&self) -> Option<&RunningSession> {
+        match self {
+            ClientState::Launched { session } | ClientState::Streaming { session } => Some(session),
+            ClientState::Spawning => None,
+        }
+    }
+
+    fn session_mut(&mut self) -> Option<&mut RunningSession> {
+        match self {
+            ClientState::Launched { session } | ClientState::Streaming { session } => Some(session),
+            ClientState::Spawning => None,
+        }
+    }
+
+    fn into_session(self) -> Option<RunningSession> {
+        match self {
+            ClientState::Launched { session } | ClientState::Streaming { session } => Some(session),
+            ClientState::Spawning => None,
+        }
+    }
+}
+
+/// One physical client's (`client_ip`'s) whole Login->User lifecycle slot —
+/// see `SessionOrigin`'s doc comment and this module's own doc comment for
+/// how these coexist across concurrent clients. Absent from
+/// `Shared::clients` == idle (nothing attached for that client).
+struct ClientSlot {
+    state: ClientState,
+    /// The background tasks spawned alongside `SessionManager::video_sender`/
+    /// `audio_sender` to log whether this client ever PINGs them (see
+    /// `on_play`) — tracked here specifically so a superseding launch from
+    /// the *same* client can `.abort()` them. Without this, confirmed live:
+    /// each task holds its own `Arc<Video/AudioSender>` clone for as long as
+    /// its 30s `wait_for_client` timeout runs, draining the learned address
     /// notwithstanding — so a client that reconnects within that window
-    /// (exactly what "every /launch always shows a fresh Login" now makes
-    /// routine, not a rare edge case) hits the *same* fixed video/audio UDP
+    /// (routine, not a rare edge case) hits the *same* fixed video/audio UDP
     /// port still bound by the old, merely-abandoned task, fails to bind
     /// with "Address already in use", and — because `on_play` just logs
-    /// that error and returns — never reaches `start_streaming` at all:
-    /// `shared.state` stays at `Launched` forever, so every input event is
-    /// silently dropped (`on_input` only acts on `State::Streaming`) and no
-    /// video/audio ever flows, even though a real Login process is
-    /// visibly running. This is what "no login screen" actually was.
+    /// that error and returns — never reaches `start_streaming` at all: this
+    /// slot stays at `Launched` forever, so every input event is silently
+    /// dropped (`on_input` only acts on `ClientState::Streaming`) and no
+    /// video/audio ever flows, even though a real Login process is visibly
+    /// running. This is what "no login screen" actually was.
     video_wait_task: Option<tokio::task::JoinHandle<()>>,
     audio_wait_task: Option<tokio::task::JoinHandle<()>>,
-    /// Which `RunningSession::generation` is currently allowed to send
-    /// through `video_sender`/`audio_sender` — the single fix for a real,
-    /// confirmed-live cross-session corruption bug: `video_sender`/
-    /// `audio_sender` (and the packetizers) are process-global, looked up
-    /// fresh on every encoded frame specifically so a *resumed* session's
-    /// callback (built long before, at its original `spawn_session` call)
-    /// keeps working without rebuilding the pipeline. But that same "look
-    /// it up fresh" design means ANY pipeline whose callback is still
-    /// firing — including one from a session that's supposed to be long
-    /// gone — will just as happily grab whatever's *currently* in
-    /// `video_sender` and inject its own frames into it. Confirmed live via
-    /// `gdb`'s `thread apply all bt` on a stuck production server: two
-    /// full `x264enc` thread pools (one per still-alive, never-actually-
-    /// torn-down pipeline from the known KWin resume hang) were still
-    /// running well after their sessions should have been long dead —
-    /// `set_state(Null)` can return `Async`/never actually complete against
-    /// a wedged PipeWire/KWin negotiation, so a stuck pipeline's encoder
-    /// callback can in practice keep firing forever, `Drop` impl or no.
-    /// Every encoder/audio callback now checks its own captured
-    /// `generation` against this field *before* touching `video_sender`/
-    /// `audio_sender` at all — a zombie pipeline's callback simply returns
-    /// once a newer session has taken over, regardless of whether its own
-    /// GStreamer-level teardown ever actually finishes.
-    active_generation: Option<u64>,
+}
+
+impl ClientSlot {
+    fn spawning() -> Self {
+        Self { state: ClientState::Spawning, video_wait_task: None, audio_wait_task: None }
+    }
+}
+
+struct Shared {
+    /// One entry per currently-attached physical client (see `ClientKey`'s
+    /// doc comment for why this is the key, not plain IP) — see this
+    /// module's own doc comment. Absence of an entry is that client's
+    /// "Idle".
+    clients: HashMap<ClientKey, ClientSlot>,
 }
 
 pub struct SessionManager {
     config: SessionConfig,
     shared: Mutex<Shared>,
-    /// Signaled whenever `shared.state` transitions away from `Spawning` —
-    /// lets a concurrent `/launch` (real clients retry on their own if the
-    /// first attempt is slow — KWin startup, D-Bus activation) wait for that
-    /// spawn to finish and reconnect to it, instead of getting a hard error
-    /// for a request that would otherwise have succeeded.
+    /// Bound once at server startup (not per-launch, not per-session) — see
+    /// `crate::udp_sender`'s doc comment for why: one shared socket for the
+    /// whole server's lifetime, with concurrent sessions distinguished by
+    /// learned per-client destination address rather than by port.
+    video_sender: Arc<VideoSender>,
+    audio_sender: Arc<AudioSender>,
+    /// Shared with `control::ControlServer` — one ENet host for the whole
+    /// server's lifetime, concurrent sessions distinguished by their own
+    /// registered rikey (see `control::ControlRegistry`'s doc comment)
+    /// rather than a single shared key.
+    control_registry: Arc<ControlRegistry>,
+    /// Signaled whenever some `Shared::clients` entry transitions away from
+    /// `ClientState::Spawning` — lets a concurrent `/launch` from the same
+    /// client (real clients retry on their own if the first attempt is slow
+    /// — KWin startup, D-Bus activation) wait for that spawn to finish and
+    /// reconnect to it, instead of getting a hard error for a request that
+    /// would otherwise have succeeded.
     spawn_done: Condvar,
     self_ref: OnceLock<Weak<SessionManager>>,
-    /// Shared with `control::ControlServer` — see its doc comment for why
-    /// this is a cell rather than passed in at construction.
-    rikey_cell: Arc<Mutex<Option<[u8; 16]>>>,
-    /// `rikeyid` — kept alongside `rikey_cell` (not folded into it, to avoid
-    /// touching `control::ControlServer`'s existing `Arc<Mutex<Option<[u8;
-    /// 16]>>>`-typed reader) purely for audio's AES-CBC IV derivation (see
-    /// `AudioPacketizer::packetize_encrypted`). Always set in lockstep with
-    /// `rikey_cell` — every write site touches both.
-    rikey_key_id: Arc<Mutex<Option<u32>>>,
-    /// Bumped whenever `rikey_cell` changes for a reconnect/takeover (see
-    /// `set_rikey`) — see `control::ControlServer::rikey_generation`'s doc
-    /// comment for the full reasoning (a plain "disconnect everyone
-    /// connected right now" flag caught the new client's own brand-new peer
-    /// too, confirmed live).
-    rikey_generation: Arc<AtomicU64>,
-    /// RTP sequence numbers, frame indices, and the timestamp clock's epoch
-    /// must stay continuous across a Login->User handoff — it's the same
-    /// wire-level RTSP/video session from the client's perspective, just a
-    /// different compositor underneath. Recreating these per-`spawn_session`
-    /// call (as originally written) reset sequence numbers/frame indices back
-    /// near zero on every handoff; real clients' RTP jitter buffers/frame
-    /// trackers treat a sudden drop like that as stale/duplicate data and
-    /// silently stop accepting new frames — confirmed live: video froze on
-    /// the last login-screen frame forever after handoff, while input (a
-    /// separate control-channel path) kept working fine. `reset_stream_state`
-    /// is the only thing allowed to replace these, and only for a genuinely
-    /// new `/launch`, not a handoff within the same session.
-    video_packetizer: Mutex<Arc<Mutex<VideoPacketizer>>>,
-    audio_packetizer: Mutex<Arc<Mutex<AudioPacketizer>>>,
-    stream_start: Mutex<std::time::Instant>,
-    /// Server-side adaptive bitrate's current target — starts at (and
-    /// recovers back up toward) `config.bitrate_kbps` as a ceiling, stepped
-    /// down when `on_loss_stats` sees the client falling behind. Reset
-    /// alongside the packetizers on a genuinely new `/launch` for the same
-    /// reason they are: a fresh RTSP session shouldn't inherit a previous,
-    /// unrelated connection's degraded state.
-    current_bitrate_kbps: AtomicU32,
-    target_bitrate_kbps: AtomicU32,
     /// Unique per-attempt id passed to the broker's `SpawnSession` — avoids
     /// systemd unit name collisions across successive launch/cancel cycles
     /// within the same `redfog-server` process lifetime.
     next_broker_session_id: AtomicU64,
-    /// Source of `RunningSession::generation` values — see
-    /// `Shared::active_generation`'s doc comment.
+    /// Source of `RunningSession::generation` values — see that field's own
+    /// doc comment.
     next_generation: AtomicU64,
-    /// Set by `handle_login_report` once `redfog-login`'s reported
-    /// credentials pass the broker's `Authenticate` check — the real
-    /// account `spawn_user_compositor` spawns the User stage as, replacing
-    /// the `"user"` placeholder used before this was wired up (and still
-    /// the fallback when nothing ever reports in, e.g. `redfog-test-ux`'s
-    /// stand-in login stage in tests).
-    authenticated_username: Mutex<Option<String>>,
-    /// Set alongside `authenticated_username` — the fully-resolved User
-    /// stage the login screen chose (the Login stage already rendered by
-    /// the time this is known, so it always uses `config.backend`/
-    /// `config.login_app` regardless — see `spawn_login_compositor`).
-    /// `None` (falls back to `config.backend`/`config.user_app`) when
-    /// nothing ever reports in, same reasoning as `authenticated_username`.
-    selected_session: Mutex<Option<SelectedSession>>,
-    /// User sessions that aren't the one currently attached to the live
+    /// What `handle_login_report` resolved for a given Login-stage
+    /// `RunningSession::generation`, once `redfog-login`'s reported
+    /// credentials pass the broker's `Authenticate` check — read (and
+    /// removed) by `handoff_to_user` for that same generation once the
+    /// Login stage exits. Keyed by generation (reported by `redfog-login`
+    /// itself via `REDFOG_LOGIN_GENERATION` — see `LoginRequest::
+    /// Authenticate`'s doc comment), not a bare global cell: with
+    /// concurrent sessions, multiple `redfog-login` processes can be
+    /// connected to `LoginReportServer` at once, and nothing else
+    /// identifies which one a given report is for.
+    pending_logins: Mutex<HashMap<u64, PendingLoginResult>>,
+    /// User sessions that aren't the one currently attached to a live
     /// RTSP/video/audio stream, but are still alive — a disconnect (a fresh
     /// `/launch` replacing the active session, an explicit `/cancel`, or a
     /// closed client) backgrounds a `SessionType::User` session into here
-    /// instead of killing it (see `background_or_discard_active_session`),
-    /// and a later login as the same username resumes it (see
-    /// `handoff_to_user`) rather than starting a new one. Keyed by username
-    /// — at most one background/active session per user at a time. Never
-    /// holds a `SessionType::Login` entry: the Login stage is stateless UI
-    /// with nothing worth preserving, so it's always discarded outright.
+    /// instead of killing it (see `background_or_discard`), and a later
+    /// login as the same username (from any client) resumes it (see
+    /// `handoff_to_user`) rather than starting a new one. Keyed by username,
+    /// deliberately global (not per-client_ip) — at most one background/
+    /// active session per user at a time, regardless of which physical
+    /// client is attached to it. Never holds a `SessionType::Login` entry:
+    /// the Login stage is stateless UI with nothing worth preserving, so
+    /// it's always discarded outright.
     background_sessions: Mutex<HashMap<String, RunningSession>>,
+}
+
+/// What `handle_login_report` resolved for one Login-stage generation — see
+/// `SessionManager::pending_logins`'s doc comment.
+struct PendingLoginResult {
+    username: String,
+    selected: Option<SelectedSession>,
 }
 
 /// The User stage's backend/payload as resolved by `handle_login_report` —
@@ -383,36 +483,34 @@ impl EncodedFrameStats {
 }
 
 impl SessionManager {
-    pub fn new(config: SessionConfig) -> Arc<Self> {
-        let bitrate_kbps = config.bitrate_kbps;
+    /// Async (unlike everything else that just constructs and hands back an
+    /// `Arc` synchronously): binding `video_sender`/`audio_sender` needs a
+    /// running tokio runtime (see `crate::udp_sender::MultiClientUdpSender::
+    /// bind`) and can fail (the port already in use), so this can too.
+    pub async fn new(config: SessionConfig) -> Result<Arc<Self>, String> {
+        let video_sender = Arc::new(VideoSender::bind(config.bind_addr, config.video_port).await?);
+        let audio_sender = Arc::new(AudioSender::bind(config.bind_addr, config.audio_port).await?);
         let this = Arc::new(Self {
             config,
-            shared: Mutex::new(Shared {
-                state: State::Idle,
-                video_sender: None,
-                audio_sender: None,
-                video_wait_task: None,
-                audio_wait_task: None,
-                active_generation: None,
-            }),
+            video_sender,
+            audio_sender,
+            control_registry: Arc::new(ControlRegistry::new()),
+            shared: Mutex::new(Shared { clients: HashMap::new() }),
             spawn_done: Condvar::new(),
             self_ref: OnceLock::new(),
-            rikey_cell: Arc::new(Mutex::new(None)),
-            rikey_key_id: Arc::new(Mutex::new(None)),
-            rikey_generation: Arc::new(AtomicU64::new(0)),
-            video_packetizer: Mutex::new(Arc::new(Mutex::new(VideoPacketizer::new()))),
-            audio_packetizer: Mutex::new(Arc::new(Mutex::new(AudioPacketizer::new()))),
-            stream_start: Mutex::new(std::time::Instant::now()),
-            current_bitrate_kbps: AtomicU32::new(bitrate_kbps),
-            target_bitrate_kbps: AtomicU32::new(bitrate_kbps),
             next_broker_session_id: AtomicU64::new(0),
             next_generation: AtomicU64::new(0),
-            authenticated_username: Mutex::new(None),
-            selected_session: Mutex::new(None),
+            pending_logins: Mutex::new(HashMap::new()),
             background_sessions: Mutex::new(HashMap::new()),
         });
         let _ = this.self_ref.set(Arc::downgrade(&this));
-        this
+        Ok(this)
+    }
+
+    /// Shared with `control::ControlServer` — see `SessionManager::
+    /// control_registry`'s field doc comment.
+    pub fn control_registry(&self) -> Arc<ControlRegistry> {
+        self.control_registry.clone()
     }
 
     /// Validates credentials reported by `redfog-login` (see
@@ -430,7 +528,7 @@ impl SessionManager {
     /// is still resolved and remembered either way, though
     /// `"user-configured"` has no user to read a config for in that case
     /// and is rejected.
-    pub async fn handle_login_report(&self, username: String, password: String, session_name: String) -> Result<(), String> {
+    pub async fn handle_login_report(&self, username: String, password: String, session_name: String, generation: u64) -> Result<(), String> {
         if let Some(broker_socket_path) = &self.config.broker_socket_path {
             use redfog_broker_protocol::{read_response, write_request, BrokerRequest, BrokerResponse};
             use tokio::io::BufReader;
@@ -498,8 +596,7 @@ impl SessionManager {
             }
         };
 
-        *self.authenticated_username.lock().unwrap() = Some(username);
-        *self.selected_session.lock().unwrap() = Some(selected);
+        self.pending_logins.lock().unwrap().insert(generation, PendingLoginResult { username, selected: Some(selected) });
         Ok(())
     }
 
@@ -549,34 +646,33 @@ impl SessionManager {
         // Virtually always found here: every `/launch` (including the one
         // that spawned the very login screen sending this request)
         // backgrounds whatever was previously attached before spawning
-        // Login (see `launch()`). `shared.state` is still checked as a
+        // Login (see `launch()`). `shared.clients` is still checked as a
         // fallback for the standalone/no-broker edge case where nothing
-        // else has run yet.
+        // else has run yet — scanned by username (not a fixed client_ip):
+        // this request doesn't carry one, and the session being logged out
+        // may be attached to a *different* physical client than whichever
+        // one is asking (e.g. logging out a stale session from a fresh
+        // login screen elsewhere).
         let from_background = self.background_sessions.lock().unwrap().remove(&username);
         let from_active = if from_background.is_some() {
             None
         } else {
             let mut shared = self.shared.lock().unwrap();
-            match std::mem::replace(&mut shared.state, State::Idle) {
-                State::Streaming { session } | State::Launched { session } if matches!(&session.kind, SessionType::User(u) if *u == username) => {
-                    shared.video_sender = None;
-                    shared.audio_sender = None;
-                    // See `Shared::video_wait_task`'s doc comment — these
-                    // hold their own sender clones independent of the two
-                    // lines above and must be aborted too, or the port
-                    // stays bound for up to another 30s.
-                    if let Some(task) = shared.video_wait_task.take() {
-                        task.abort();
+            let target_key = shared
+                .clients
+                .iter()
+                .find_map(|(key, slot)| slot.state.session().filter(|s| matches!(&s.kind, SessionType::User(u) if *u == username)).map(|_| key.clone()));
+            match target_key {
+                Some(key) => {
+                    let taken = take_active_session(&mut shared, &key);
+                    if let Some(session) = &taken {
+                        self.video_sender.drain_pending(session.origin.ping_token);
+                        self.audio_sender.drain_pending(session.origin.ping_token);
+                        self.control_registry.forget(session.origin.rikey);
                     }
-                    if let Some(task) = shared.audio_wait_task.take() {
-                        task.abort();
-                    }
-                    Some(session)
+                    taken
                 }
-                other => {
-                    shared.state = other;
-                    None
-                }
+                None => None,
             }
         };
 
@@ -630,36 +726,6 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Shared cell for `control::ControlServer` to read the current
-    /// session's `rikey` from.
-    pub fn rikey_cell(&self) -> Arc<Mutex<Option<[u8; 16]>>> {
-        self.rikey_cell.clone()
-    }
-
-    /// Shared with `control::ControlServer` — see the field's doc comment.
-    pub fn rikey_generation(&self) -> Arc<AtomicU64> {
-        self.rikey_generation.clone()
-    }
-
-    /// Sets the active `rikey` for a reconnect/takeover and bumps the
-    /// generation counter so `control::ControlServer` disconnects peers left
-    /// over from before this point — see `rikey_generation`'s doc comment.
-    fn set_rikey(&self, key: [u8; 16], key_id: u32) {
-        *self.rikey_cell.lock().unwrap() = Some(key);
-        *self.rikey_key_id.lock().unwrap() = Some(key_id);
-        self.rikey_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-
-    /// Start a fresh RTP sequence/frame-index/timestamp epoch for a genuinely
-    /// new `/launch` (a new RTSP session from the client's perspective) — NOT
-    /// called on a Login->User handoff, which must keep the existing state.
-    fn reset_stream_state(&self) {
-        *self.video_packetizer.lock().unwrap() = Arc::new(Mutex::new(VideoPacketizer::new()));
-        *self.audio_packetizer.lock().unwrap() = Arc::new(Mutex::new(AudioPacketizer::new()));
-        *self.stream_start.lock().unwrap() = std::time::Instant::now();
-        self.current_bitrate_kbps.store(self.target_bitrate_kbps.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
-    }
-
     /// An owned `Arc<Self>` for moving into spawned tasks — trait methods
     /// here take plain `&self` (so `SessionManager` stays usable as a
     /// trait object across `LaunchHandler`/`RtspHandler`/`ControlEventHandler`
@@ -673,8 +739,8 @@ impl SessionManager {
     /// goes through the broker, since it doesn't need to run as any
     /// particular target user (see design.md's "Authentication: a real
     /// graphical login screen").
-    fn spawn_login_compositor(&self, width: u32, height: u32) -> Result<SpawnedCompositor, String> {
-        session_backend::spawn_login_compositor(&self.config.login_app, width, height)
+    fn spawn_login_compositor(&self, width: u32, height: u32, generation: u64) -> Result<SpawnedCompositor, String> {
+        session_backend::spawn_login_compositor(&self.config.login_app, width, height, generation)
     }
 
     /// Acquires the User compositor — via the broker if configured
@@ -695,23 +761,27 @@ impl SessionManager {
     /// since `spawn_gst_payload_in_background` reads the username back out
     /// of `RunningSession.kind` — a real, unrelated account, if one happens
     /// to exist on the target system, or a `SpawnPayload` failure otherwise.
-    async fn spawn_user_compositor(&self, width: u32, height: u32, fps: u32) -> Result<(SpawnedCompositor, String, Option<String>), String> {
-        // `handle_login_report` sets this once `redfog-login`'s credentials
-        // have already passed the broker's real, password-checked
-        // `Authenticate` — re-sending an empty password through that same
-        // check below would just fail against real PAM, so a real username
-        // here means skip straight to `SpawnSession`. `None` (nothing ever
-        // reported in — standalone use without a broker, or
-        // `redfog-test-ux`'s stand-in login stage in tests) falls back to
-        // the placeholder "user" and the old Authenticate-with-empty-
-        // password call, which is exactly what `REDFOG_BROKER_FAKE_AUTH`
-        // validates.
-        let reported_username = self.authenticated_username.lock().unwrap().clone();
-        let username = reported_username.clone().unwrap_or_else(|| "user".to_string());
+    /// `reported`: what `handle_login_report` resolved for this login's own
+    /// generation, if anything (see `SessionManager::pending_logins`'s doc
+    /// comment) — passed in by the caller (`handoff_to_user`) rather than
+    /// read from a global here, so a *different* client's concurrently
+    /// in-flight login attempt can never race this one's own resolution.
+    /// `None` (standalone use without a broker, or `redfog-test-ux`'s
+    /// stand-in login stage in tests) falls back to the placeholder "user"
+    /// and the old Authenticate-with-empty-password call, which is exactly
+    /// what `REDFOG_BROKER_FAKE_AUTH` validates.
+    async fn spawn_user_compositor(
+        &self,
+        width: u32,
+        height: u32,
+        fps: u32,
+        reported: &Option<PendingLoginResult>,
+    ) -> Result<(SpawnedCompositor, String, Option<String>), String> {
+        let username = reported.as_ref().map(|r| r.username.clone()).unwrap_or_else(|| "user".to_string());
         // Chosen on the login screen itself — falls back to the server's
         // own startup default (config.backend/config.user_app) when
         // nothing was ever reported in, same reasoning as `username` above.
-        let selected = self.selected_session.lock().unwrap().clone();
+        let selected = reported.as_ref().and_then(|r| r.selected.clone());
         let backend = selected.as_ref().map(|s| s.backend).unwrap_or(self.config.backend);
         let user_app = selected.as_ref().map(|s| s.user_app.clone()).unwrap_or_else(|| self.config.user_app.clone());
 
@@ -736,7 +806,7 @@ impl SessionManager {
             session_id.clone(),
             &username,
             "",
-            reported_username.is_some(),
+            reported.is_some(),
             &user_app,
             width,
             height,
@@ -784,6 +854,8 @@ impl SessionManager {
         audio_loopback: &AudioLoopback,
         generation: u64,
         fps_cap: Option<u32>,
+        client_key: ClientKey,
+        initial_bitrate_kbps: u32,
     ) -> (gstreamer::Pipeline, gstreamer::Pipeline, Option<Arc<redfog_core::CudaDirectEncoderSession>>) {
         // GStreamer's appsink callbacks run on GStreamer's own streaming
         // threads, not tokio worker threads — `tokio::spawn` would panic
@@ -791,31 +863,12 @@ impl SessionManager {
         // thread) instead, since we're called from within an async context.
         let handle = tokio::runtime::Handle::current();
 
-        // NOTE: senders don't exist yet at this point — this runs from
-        // `/launch`, before RTSP `PLAY` creates them (see `on_play`). Look
-        // the *current* sender up fresh on every frame via `self`, rather
-        // than capturing today's (always-`None`) value once here.
-        let bitrate = self.target_bitrate_kbps.load(std::sync::atomic::Ordering::Relaxed);
         let video_encoder = if matches!(kind, SessionType::Login) {
             redfog_core::VideoEncoder::Software
         } else {
             self.config.video_encoder
         };
         let this = self.arc_self();
-        // `video_packetizer`/`audio_packetizer`/`stream_start` are looked up
-        // fresh from `this` inside each closure below, NOT captured once
-        // here — within a single `/launch` (including a same-session
-        // Login->User handoff) these never change mid-flight, so that's
-        // behaviorally identical to a snapshot for the common case (see the
-        // doc comment on these fields for why a handoff must NOT reset
-        // them). But a *resumed* background session's pipeline is rebuilt
-        // fresh (see this method's own doc comment) well after the
-        // `/launch` that's resuming it already reset them — looking them up
-        // fresh here means the rebuilt pipeline picks up that reset
-        // automatically, instead of an unrelated, stale epoch. Real
-        // clients' depayloaders treat a resumed session as a brand new RTSP
-        // session and expect exactly that: a fresh sequence/frame-index/
-        // timestamp epoch.
         // Distinct per generation: `pipewiresrc`/`pipewiresink` share one
         // underlying PipeWire core/thread-loop across every element in the
         // process with the same client identity, so reusing one name across
@@ -829,33 +882,40 @@ impl SessionManager {
             let handle = handle.clone();
             let this = this.clone();
             let video_stats = video_stats.clone();
+            let client_key = client_key.clone();
             move |data: Vec<u8>, is_key_frame: bool| {
                 tracing::debug!("video encoder produced {} bytes, key_frame={is_key_frame}", data.len());
                 if let Some((fps, kbps)) = video_stats.lock().unwrap().record(data.len()) {
                     tracing::info!("video: {fps:.1} fps, {kbps:.0} kbps (generation={generation})");
                 }
-                let sender = {
+                // `origin` (packetizer/stream_start/etc) is looked up fresh
+                // from `shared` on every frame, not captured once at build
+                // time — a *resumed* background session's pipeline is
+                // rebuilt fresh (see this method's caller) well after the
+                // `/launch` that's resuming it already replaced its origin,
+                // and this is what makes the rebuilt pipeline pick that up.
+                // The `generation` check alongside it is `RunningSession::
+                // generation`'s doc comment's whole point: a pipeline whose
+                // session is no longer the active one for this client —
+                // including one that's supposed to be dead but whose
+                // GStreamer-level teardown never actually completed — must
+                // not send at all, not just skip after the fact.
+                let origin = {
                     let shared = this.shared.lock().unwrap();
-                    // See `Shared::active_generation`'s doc comment: a
-                    // pipeline whose session is no longer the active one —
-                    // including one that's supposed to be dead but whose
-                    // GStreamer-level teardown never actually completed —
-                    // must not touch `video_sender` at all, not just skip
-                    // sending after cloning it.
-                    if shared.active_generation != Some(generation) {
+                    let Some(session) = shared.clients.get(&client_key).and_then(|slot| slot.state.session()) else { return };
+                    if session.generation != generation {
                         return;
                     }
-                    let Some(sender) = shared.video_sender.clone() else { return };
-                    sender
+                    session.origin.clone()
                 };
-                let video_packetizer = this.video_packetizer.lock().unwrap().clone();
+                let sender = this.video_sender.clone();
                 // RTP timestamps use a 90kHz clock (standard for video) —
                 // derived from wall-clock time since streaming started
                 // rather than a fixed per-frame increment, since frames
                 // aren't encoded at a perfectly even interval.
-                let stream_start = *this.stream_start.lock().unwrap();
-                let rtp_timestamp = (stream_start.elapsed().as_secs_f64() * 90_000.0) as u32;
-                let shards = video_packetizer.lock().unwrap().packetize(&data, is_key_frame, rtp_timestamp);
+                let rtp_timestamp = (origin.stream_start.elapsed().as_secs_f64() * 90_000.0) as u32;
+                let shards = origin.video_packetizer.lock().unwrap().packetize(&data, is_key_frame, rtp_timestamp);
+                let ping_token = origin.ping_token;
                 handle.spawn(async move {
                     // Bounded, not a bare `.await` — a task holding this
                     // `sender` clone forever (if `send_shards` itself never
@@ -866,7 +926,7 @@ impl SessionManager {
                     // be `start_streaming`'s own unbounded blocking call —
                     // see its doc comment), but a real, separate hardening:
                     // nothing here should ever be able to hang forever.
-                    match tokio::time::timeout(Duration::from_secs(2), sender.send_shards(&shards)).await {
+                    match tokio::time::timeout(Duration::from_secs(2), sender.send_shards(ping_token, &shards)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => tracing::warn!("video send failed: {e}"),
                         Err(_) => tracing::warn!("video send timed out after 2s — dropping this frame rather than holding its sender open forever"),
@@ -886,7 +946,7 @@ impl SessionManager {
         let video_pipeline = if video_encoder == redfog_core::VideoEncoder::NvencDirect
             && matches!(source, redfog_core::VideoSource::KwinNativeDmaBuf { .. })
         {
-            let session = redfog_core::make_cuda_direct_encoder_session(source, bitrate, on_video_access_unit);
+            let session = redfog_core::make_cuda_direct_encoder_session(source, initial_bitrate_kbps, on_video_access_unit);
             cuda_direct_session = Some(Arc::new(session));
             // `NvencDirect` has no GStreamer pipeline at all — this empty
             // placeholder exists only so the rest of this type's machinery
@@ -910,40 +970,22 @@ impl SessionManager {
                 &video_client_name,
                 pipeline_encoder,
                 fps_cap,
-                bitrate,
+                initial_bitrate_kbps,
                 on_video_access_unit,
             )
         };
 
         let audio_pipeline = redfog_core::make_audio_pipeline(audio_loopback, &audio_client_name, move |packet| {
-            let sender = {
+            let origin = {
                 let shared = this.shared.lock().unwrap();
-                if shared.active_generation != Some(generation) {
+                let Some(session) = shared.clients.get(&client_key).and_then(|slot| slot.state.session()) else { return };
+                if session.generation != generation {
                     return;
                 }
-                let Some(sender) = shared.audio_sender.clone() else { return };
-                sender
+                session.origin.clone()
             };
-            // Audio is unconditionally AES-128-CBC-encrypted in the base
-            // protocol (see `crypto::cbc_encrypt`'s doc comment) — `rikey`
-            // is set synchronously during `/launch`, before this pipeline is
-            // ever built, so `None` here would mean a real ordering bug
-            // rather than an expected race; drop the packet rather than
-            // sending it unencrypted (the client would just fail to decrypt
-            // it anyway).
-            let (key, key_id) = {
-                let key = *this.rikey_cell.lock().unwrap();
-                let key_id = *this.rikey_key_id.lock().unwrap();
-                match (key, key_id) {
-                    (Some(key), Some(key_id)) => (key, key_id),
-                    _ => {
-                        tracing::warn!("dropping audio packet: rikey not yet known");
-                        return;
-                    }
-                }
-            };
-            let audio_packetizer = this.audio_packetizer.lock().unwrap().clone();
-            let stream_start = *this.stream_start.lock().unwrap();
+            let sender = this.audio_sender.clone();
+            let (key, key_id) = (origin.rikey, origin.rikey_key_id);
             // NOT a 48kHz sample-rate clock, despite that being the
             // textbook RTP/Opus answer (and what this line used to do) —
             // Moonlight's audio wire format is a genuine protocol deviation
@@ -956,8 +998,8 @@ impl SessionManager {
             // run ~48x ahead of real time, which it then had to "catch up"
             // to — confirmed live: audio played in silent-then-rushed-
             // garbled-burst cycles until this was fixed.
-            let rtp_timestamp = stream_start.elapsed().as_millis() as u32;
-            let opus_packet = audio_packetizer.lock().unwrap().packetize_encrypted(&packet, rtp_timestamp, &key, key_id);
+            let rtp_timestamp = origin.stream_start.elapsed().as_millis() as u32;
+            let opus_packet = origin.audio_packetizer.lock().unwrap().packetize_encrypted(&packet, rtp_timestamp, &key, key_id);
             // `block_on`, deliberately NOT `handle.spawn` (unlike the video
             // callback above): spawned tasks have no ordering guarantee
             // relative to each other once handed to tokio's scheduler, so
@@ -976,8 +1018,9 @@ impl SessionManager {
             // per pipeline, so blocking this thread on the send (bounded,
             // same as video's spawn-based timeout) is enough to guarantee
             // that ordering all the way onto the wire.
+            let ping_token = origin.ping_token;
             handle.block_on(async move {
-                match tokio::time::timeout(Duration::from_secs(2), sender.send_packet(&opus_packet)).await {
+                match tokio::time::timeout(Duration::from_secs(2), sender.send_packet(ping_token, &opus_packet)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => tracing::warn!("audio send failed: {e}"),
                     Err(_) => tracing::warn!("audio send timed out after 2s — dropping this packet rather than holding its sender open forever"),
@@ -1010,6 +1053,12 @@ impl SessionManager {
         Ok(background)
     }
 
+    /// `generation` is minted by the caller (`launch()` for Login,
+    /// `handoff_to_user()` for User), not here — Login needs it *before*
+    /// this is even called, to pass to `spawn_login_compositor` as
+    /// `REDFOG_LOGIN_GENERATION` (see `LoginRequest::Authenticate`'s doc
+    /// comment). `origin` carries this launch's continuity state — see
+    /// `SessionOrigin`'s doc comment for who constructs it and when.
     fn spawn_session(
         &self,
         kind: SessionType,
@@ -1018,6 +1067,9 @@ impl SessionManager {
         fps: u32,
         compositor: SpawnedCompositor,
         broker_session_id: Option<String>,
+        generation: u64,
+        origin: SessionOrigin,
+        selected_session: Option<SelectedSession>,
     ) -> Result<RunningSession, String> {
         // Not derived from compositor.socket_name(): for Backend::Kwin that
         // happens to already be unique per stage ("redfog-login-0" /
@@ -1033,10 +1085,6 @@ impl SessionManager {
         };
         let audio_loopback = AudioLoopback::spawn(&audio_session_name)
             .map_err(|e| format!("failed to spawn audio loopback for {audio_session_name}: {e}"))?;
-        // See `Shared::active_generation`'s doc comment — minted once per
-        // spawn, never regenerated across a resume (resume reuses this
-        // same pipeline, not a fresh `spawn_session` call).
-        let generation = self.next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // `fps == 0` (shouldn't happen from a real client — parse_mode's
         // fallback is 60 — but defensively) means uncapped, same as never
         // having requested a cap at all.
@@ -1046,7 +1094,8 @@ impl SessionManager {
             self.config.video_encoder,
             self.config.bitrate_kbps,
         );
-        let (video_pipeline, audio_pipeline, cuda_direct_session) = self.build_pipelines(&kind, &compositor, &audio_loopback, generation, fps_cap);
+        let (video_pipeline, audio_pipeline, cuda_direct_session) =
+            self.build_pipelines(&kind, &compositor, &audio_loopback, generation, fps_cap, origin.client_key.clone(), origin.target_bitrate_kbps);
         // Must come *after* `build_pipelines`, not before (this used to be
         // the other way around): `SpawnedCompositor::GstWaylandDisplay`'s
         // `input_sink` now looks up its `waylanddisplaysrc` element inside
@@ -1068,6 +1117,8 @@ impl SessionManager {
             _audio_loopback: audio_loopback,
             broker_session_id,
             generation,
+            origin,
+            selected_session,
             bus_watchers_stop: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -1095,15 +1146,24 @@ impl SessionManager {
     /// its own lock once done, exactly like `watch_login_exit` already
     /// does, rather than holding any owned/borrowed session state across an
     /// await itself.
-    fn spawn_gst_payload_in_background(&self, kind: SessionType, runtime_dir: String, socket_path: PathBuf, socket_name: String, broker_session_id: Option<String>) {
+    fn spawn_gst_payload_in_background(
+        &self,
+        kind: SessionType,
+        runtime_dir: String,
+        socket_path: PathBuf,
+        socket_name: String,
+        broker_session_id: Option<String>,
+        selected: Option<SelectedSession>,
+        client_key: ClientKey,
+    ) {
         let this = self.arc_self();
         tokio::spawn(async move {
             // Login always uses config.login_app / the default nested
             // config — there's no selection to honor yet at that stage
             // (see spawn_login_compositor's doc comment). The User stage
-            // uses whatever handle_login_report resolved, presets and
-            // "Custom" alike — see SelectedSession's doc comment.
-            let selected = this.selected_session.lock().unwrap().clone();
+            // uses whatever handle_login_report resolved for this session
+            // (see `RunningSession::selected_session`'s doc comment), presets
+            // and "Custom" alike — see SelectedSession's doc comment.
             let (nested_config, username) = match &kind {
                 SessionType::Login => (session_backend::NestedSessionConfig { command: this.config.login_app.clone(), ..Default::default() }, None),
                 SessionType::User(username) => {
@@ -1139,7 +1199,7 @@ impl SessionManager {
             };
 
             let mut shared = this.shared.lock().unwrap();
-            if let State::Streaming { session } = &mut shared.state {
+            if let Some(ClientState::Streaming { session }) = shared.clients.get_mut(&client_key).map(|slot| &mut slot.state) {
                 if session.kind == kind {
                     if let Some(SpawnedCompositor::GstWaylandDisplay { payload_process, .. }) = session.compositor.as_mut() {
                         *payload_process = spawned_child;
@@ -1198,10 +1258,17 @@ impl SessionManager {
     /// `Send`-ness). Erasing the type here, at the definition, is what
     /// actually breaks the cycle: callers just see a concrete, already-boxed
     /// type instead of an opaque one needing recursive inference.
-    fn start_streaming(&self, session: RunningSession, is_resume: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn start_streaming(
+        &self,
+        session: RunningSession,
+        is_resume: bool,
+        video_wait_task: Option<tokio::task::JoinHandle<()>>,
+        audio_wait_task: Option<tokio::task::JoinHandle<()>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             use gstreamer::prelude::*;
             let generation = session.generation;
+            let client_key = session.origin.client_key.clone();
             let start_streaming_start = std::time::Instant::now();
             tracing::info!("start_streaming(generation={generation}, is_resume={is_resume}, kind={:?}): starting", session.kind);
             // Bounded — confirmed via a dedicated integration test (not
@@ -1253,9 +1320,14 @@ impl SessionManager {
             let bus_watchers_stop = session.bus_watchers_stop.clone();
             let gst_payload_info = if !is_resume {
                 match session.compositor.as_ref() {
-                    Some(SpawnedCompositor::GstWaylandDisplay { runtime_dir, socket_path, socket_name, .. }) => {
-                        Some((session.kind.clone(), runtime_dir.clone(), socket_path.clone(), socket_name.clone(), session.broker_session_id.clone()))
-                    }
+                    Some(SpawnedCompositor::GstWaylandDisplay { runtime_dir, socket_path, socket_name, .. }) => Some((
+                        session.kind.clone(),
+                        runtime_dir.clone(),
+                        socket_path.clone(),
+                        socket_name.clone(),
+                        session.broker_session_id.clone(),
+                        session.selected_session.clone(),
+                    )),
                     _ => None,
                 }
             } else {
@@ -1284,8 +1356,7 @@ impl SessionManager {
             // ever) it actually becomes ready.
             {
                 let mut shared = self.shared.lock().unwrap();
-                shared.active_generation = Some(generation);
-                shared.state = State::Streaming { session };
+                shared.clients.insert(client_key.clone(), ClientSlot { state: ClientState::Streaming { session }, video_wait_task, audio_wait_task });
             }
             tracing::info!(
                 "start_streaming(generation={generation}): marked active after {:?} (video-gated only; audio continues in the background)",
@@ -1338,8 +1409,8 @@ impl SessionManager {
                 }
             });
 
-            if let Some((kind, runtime_dir, socket_path, socket_name, broker_session_id)) = gst_payload_info {
-                self.spawn_gst_payload_in_background(kind, runtime_dir, socket_path, socket_name, broker_session_id);
+            if let Some((kind, runtime_dir, socket_path, socket_name, broker_session_id, selected_session)) = gst_payload_info {
+                self.spawn_gst_payload_in_background(kind, runtime_dir, socket_path, socket_name, broker_session_id, selected_session, client_key.clone());
             }
             if let Some(pipelines) = bus_pipelines {
                 for (name, pipeline) in pipelines {
@@ -1380,7 +1451,7 @@ impl SessionManager {
             }
             if is_login {
                 let this = self.arc_self();
-                tokio::spawn(async move { this.watch_login_exit().await });
+                tokio::spawn(async move { this.watch_login_exit(client_key).await });
             } else if let Some(username) = username {
                 let this = self.arc_self();
                 tokio::spawn(async move { this.watch_user_session_exit(username).await });
@@ -1388,13 +1459,17 @@ impl SessionManager {
         })
     }
 
-    async fn watch_login_exit(self: Arc<Self>) {
+    /// `client_key` identifies which client's slot to watch — safe to fix
+    /// at spawn time here (unlike `watch_user_session_exit`'s username): a
+    /// Login session is never backgrounded/resumed, so it can only ever end
+    /// under the same client_key it started under.
+    async fn watch_login_exit(self: Arc<Self>, client_key: ClientKey) {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let status = {
                 let mut shared = self.shared.lock().unwrap();
-                match &mut shared.state {
-                    State::Streaming { session } if matches!(session.kind, SessionType::Login) => {
+                match shared.clients.get_mut(&client_key).map(|slot| &mut slot.state) {
+                    Some(ClientState::Streaming { session }) if matches!(session.kind, SessionType::Login) => {
                         session.compositor.as_mut().expect("compositor present until torn down").try_wait().ok().flatten()
                     }
                     _ => return, // no longer the login session (already handed off, or idle)
@@ -1408,12 +1483,12 @@ impl SessionManager {
             // after a crash previously masked the real failure entirely.
             if status.success() {
                 tracing::info!("login session exited, handing off to user session");
-                if let Err(e) = self.handoff_to_user().await {
+                if let Err(e) = self.handoff_to_user(client_key.clone()).await {
                     tracing::error!("failed to hand off to user session: {e}");
                 }
             } else {
                 tracing::error!("login compositor exited unexpectedly ({status}); resetting session instead of handing off");
-                let _ = self.cancel();
+                let _ = self.cancel(client_key);
             }
             return;
         }
@@ -1445,7 +1520,14 @@ impl SessionManager {
     /// (logged out via `handle_log_out`, or found dead here).
     async fn watch_user_session_exit(self: Arc<Self>, username: String) {
         enum Location {
-            Active,
+            /// Which `ClientKey` it's currently attached under —
+            /// deliberately re-discovered every tick (not fixed at spawn
+            /// time, unlike `watch_login_exit`'s): a resume can reattach
+            /// this same username's session under a *different* client_key
+            /// than the one that first started it (a different physical
+            /// client resuming the same account), and this watcher has to
+            /// keep tracking it wherever it currently lives.
+            Active(ClientKey),
             Backgrounded,
         }
         loop {
@@ -1453,16 +1535,18 @@ impl SessionManager {
 
             let active_check = {
                 let mut shared = self.shared.lock().unwrap();
-                match &mut shared.state {
-                    State::Streaming { session } if matches!(&session.kind, SessionType::User(u) if *u == username) => {
-                        let exited = session.compositor.as_mut().expect("compositor present until torn down").try_wait().ok().flatten().is_some();
-                        Some((session.broker_session_id.clone(), exited))
-                    }
-                    _ => None,
-                }
+                let target_key = shared
+                    .clients
+                    .iter()
+                    .find_map(|(key, slot)| slot.state.session().filter(|s| matches!(&s.kind, SessionType::User(u) if *u == username)).map(|_| key.clone()));
+                target_key.and_then(|key| {
+                    let ClientState::Streaming { session } = &mut shared.clients.get_mut(&key)?.state else { return None };
+                    let exited = session.compositor.as_mut().expect("compositor present until torn down").try_wait().ok().flatten().is_some();
+                    Some((key, session.broker_session_id.clone(), exited))
+                })
             };
-            let located = if let Some((broker_session_id, exited_locally)) = active_check {
-                Some((Location::Active, broker_session_id, exited_locally))
+            let located = if let Some((key, broker_session_id, exited_locally)) = active_check {
+                Some((Location::Active(key), broker_session_id, exited_locally))
             } else {
                 let mut background = self.background_sessions.lock().unwrap();
                 background.get_mut(&username).map(|session| {
@@ -1491,12 +1575,15 @@ impl SessionManager {
             if dead {
                 tracing::info!("session for user {username} ended (logged out, or crashed)");
                 match location {
-                    Location::Active => {
+                    Location::Active(key) => {
                         let taken = {
                             let mut shared = self.shared.lock().unwrap();
-                            take_active_session(&mut shared)
+                            take_active_session(&mut shared, &key)
                         };
                         if let Some(session) = taken {
+                            self.video_sender.drain_pending(session.origin.ping_token);
+                            self.audio_sender.drain_pending(session.origin.ping_token);
+                            self.control_registry.forget(session.origin.rikey);
                             // Detached — see `background_or_discard`'s doc
                             // comment on its own `Login` branch for why a
                             // `discard_running_session` call must never run
@@ -1539,20 +1626,30 @@ impl SessionManager {
         }
     }
 
-    async fn handoff_to_user(&self) -> Result<(), String> {
+    async fn handoff_to_user(&self, client_key: ClientKey) -> Result<(), String> {
         let handoff_start = std::time::Instant::now();
-        tracing::info!("handoff_to_user: starting");
+        tracing::info!("handoff_to_user({client_key:?}): starting");
         let old_login = {
             let mut shared = self.shared.lock().unwrap();
-            match std::mem::replace(&mut shared.state, State::Idle) {
-                State::Streaming { session } => session,
+            let Some(mut slot) = shared.clients.remove(&client_key) else {
+                return Err("handoff requested but this client has no session".to_string());
+            };
+            match slot.state {
+                ClientState::Streaming { session } => session,
                 other => {
-                    shared.state = other;
+                    slot.state = other;
+                    shared.clients.insert(client_key, slot);
                     return Err("handoff requested but no login session is streaming".to_string());
                 }
             }
         };
         let (width, height, fps) = (old_login.width, old_login.height, old_login.fps);
+        // Carried forward wholesale — see `SessionOrigin`'s doc comment:
+        // this is the same wire-level RTSP session (crypto key, RTP
+        // continuity, adaptive bitrate) regardless of whether the User
+        // stage ends up fresh or resumed from background.
+        let origin = old_login.origin.clone();
+        let login_generation = old_login.generation;
 
         // Detached, not awaited — the old Login's pipelines/compositor are
         // independent objects the *new* session never touches, so there's
@@ -1573,27 +1670,32 @@ impl SessionManager {
         std::thread::spawn(move || discard_running_session(old_login));
 
         // `handle_login_report` already resolved which username this is
-        // before Login even exited (see `authenticated_username`'s doc
-        // comment) — if that user already has a backgrounded session (see
-        // `background_or_discard_active_session`), resume it instead of
-        // starting a fresh one: the desktop they left behind (and anything
-        // still running in it) is exactly where they left it.
+        // before Login even exited, keyed by this same login's own
+        // generation (see `pending_logins`'s doc comment) — if that user
+        // already has a backgrounded session (see `background_or_discard`),
+        // resume it instead of starting a fresh one: the desktop they left
+        // behind (and anything still running in it) is exactly where they
+        // left it.
         //
         // For all backends, resuming a backgrounded session is a clean no-op
         // (see `rebuild_for_resume`'s doc comment). The GStreamer pipelines
         // are kept in the Playing state while backgrounded, so the PipeWire
         // stream remains hot and active, avoiding both the damage-source stall
         // on resume and the need to recreate/reconnect the capture session.
-        let username = self.authenticated_username.lock().unwrap().clone().unwrap_or_else(|| "user".to_string());
-        // Bound to a plain local first, not matched on directly — the
-        // `.lock().unwrap()` guard would otherwise stay alive for the whole
-        // `match` expression (a temporary's scope is the entire enclosing
-        // statement), including the `None` arm's `.await` below, which
-        // isn't `Send`.
+        let reported = self.pending_logins.lock().unwrap().remove(&login_generation);
+        let username = reported.as_ref().map(|r| r.username.clone()).unwrap_or_else(|| "user".to_string());
         let existing_background = self.background_sessions.lock().unwrap().remove(&username);
         let (user_session, is_resume) = match existing_background {
-            Some(background) => {
+            Some(mut background) => {
                 tracing::info!("resuming existing session for user {username}");
+                // This resume is still a brand-new wire-level RTSP session
+                // from the client's perspective (a fresh `/launch`, fresh
+                // RTP epoch) even though the compositor underneath is old —
+                // and possibly from a *different* physical client than
+                // whoever originally started it. Overwrite its stale origin
+                // with this login's, same as the fresh-spawn branch below.
+                background.origin = origin;
+                background.selected_session = reported.and_then(|r| r.selected);
                 let rebuild_start = std::time::Instant::now();
                 let background = self.rebuild_for_resume(background).await?;
                 tracing::info!("handoff_to_user: rebuilt pipelines for resume after {:?}", rebuild_start.elapsed());
@@ -1608,21 +1710,25 @@ impl SessionManager {
             None => {
                 tracing::info!("handoff_to_user: no backgrounded session for {username}, spawning a fresh user compositor");
                 let spawn_start = std::time::Instant::now();
-                let (compositor, username, broker_session_id) = self.spawn_user_compositor(width, height, fps).await?;
-                tracing::info!("handoff_to_user: spawn_user_compositor for {username} finished after {:?}", spawn_start.elapsed());
-                (self.spawn_session(SessionType::User(username), width, height, fps, compositor, broker_session_id)?, false)
+                let (compositor, resolved_username, broker_session_id) = self.spawn_user_compositor(width, height, fps, &reported).await?;
+                tracing::info!("handoff_to_user: spawn_user_compositor for {resolved_username} finished after {:?}", spawn_start.elapsed());
+                let generation = self.next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let selected = reported.and_then(|r| r.selected);
+                (
+                    self.spawn_session(SessionType::User(resolved_username), width, height, fps, compositor, broker_session_id, generation, origin, selected)?,
+                    false,
+                )
             }
         };
         tracing::info!("handoff_to_user: calling start_streaming (is_resume={is_resume}) after {:?} total so far", handoff_start.elapsed());
-        self.start_streaming(user_session, is_resume).await;
+        self.start_streaming(user_session, is_resume, None, None).await;
         tracing::info!("handoff_to_user: done after {:?} total", handoff_start.elapsed());
         Ok(())
     }
 }
 
 impl LaunchHandler for SessionManager {
-    fn launch(&self, width: u32, height: u32, fps: u32, rikey: RemoteInputKey) -> Result<(), String> {
-        let was_idle;
+    fn launch(&self, width: u32, height: u32, fps: u32, rikey: RemoteInputKey, client_key: ClientKey, client_ip: IpAddr) -> Result<(), String> {
         let taken;
         {
             let mut shared = self.shared.lock().unwrap();
@@ -1630,18 +1736,19 @@ impl LaunchHandler for SessionManager {
             // is slow (KWin startup, D-Bus activation) — wait for that
             // in-flight spawn to finish rather than erroring a request that
             // would otherwise have succeeded once the first one lands. Only
-            // waited on when we actually raced one (state was already
-            // `Spawning` when this call arrived) — this is specifically the
-            // "my own retry" case, not a new connection arriving after some
-            // earlier, unrelated spawn already finished (see below).
-            let raced_a_spawn_in_flight = matches!(shared.state, State::Spawning);
+            // waited on when we actually raced one from this *same*
+            // client_key (this slot was already `Spawning` when this call
+            // arrived) — this is specifically the "my own retry" case, not
+            // a new connection arriving after some earlier, unrelated spawn
+            // already finished (see below).
+            let raced_a_spawn_in_flight = matches!(shared.clients.get(&client_key).map(|s| &s.state), Some(ClientState::Spawning));
             if raced_a_spawn_in_flight {
                 let (guard, timeout_result) = self
                     .spawn_done
-                    .wait_timeout_while(shared, Duration::from_secs(15), |s| matches!(s.state, State::Spawning))
+                    .wait_timeout_while(shared, Duration::from_secs(15), |s| matches!(s.clients.get(&client_key).map(|c| &c.state), Some(ClientState::Spawning)))
                     .unwrap();
                 shared = guard;
-                if timeout_result.timed_out() && matches!(shared.state, State::Spawning) {
+                if timeout_result.timed_out() && matches!(shared.clients.get(&client_key).map(|c| &c.state), Some(ClientState::Spawning)) {
                     return Err("timed out waiting for a concurrent launch to finish spawning".to_string());
                 }
                 // Whatever that in-flight spawn produced is treated as
@@ -1650,112 +1757,111 @@ impl LaunchHandler for SessionManager {
                 // independent connection — so it does not get its own
                 // fresh Login screen the way a genuinely separate `/launch`
                 // does below.
-                if matches!(shared.state, State::Launched { .. } | State::Streaming { .. }) {
+                if let Some(session) = shared.clients.get_mut(&client_key).and_then(|slot| slot.state.session_mut()) {
+                    session.origin.rikey = rikey.key;
+                    session.origin.rikey_key_id = rikey.key_id as u32;
+                    let session_rikey = session.origin.rikey;
                     drop(shared);
-                    self.set_rikey(rikey.key, rikey.key_id as u32);
+                    self.control_registry.register(session_rikey);
                     return Ok(());
                 }
-                // The in-flight spawn failed (back to `Idle`) — fall
+                // The in-flight spawn failed (back to absent) — fall
                 // through and spawn fresh below, same as if this call had
                 // never raced it at all.
             }
 
-            // Every other `/launch` always shows a fresh Login screen —
-            // never silently reconnects to whatever was previously
-            // attached. Picking which user (if any) to resume is now the
-            // login screen's own job (Login/Resume/Log Out), not something
-            // decided implicitly by which client happens to reconnect.
-            // Whatever *was* attached gets backgrounded (if it was a real
-            // User session) or discarded (Login, or nothing at all) first.
-            was_idle = matches!(shared.state, State::Idle);
-            taken = take_active_session(&mut shared);
+            // Every other `/launch` from this client always shows a fresh
+            // Login screen — never silently reconnects to whatever was
+            // previously attached. Picking which user (if any) to resume is
+            // now the login screen's own job (Login/Resume/Log Out), not
+            // something decided implicitly by which client happens to
+            // reconnect. Whatever *was* attached under this client_key gets
+            // backgrounded (if it was a real User session) or discarded
+            // (Login, or nothing at all) first — a *different* client_key's
+            // own slot is entirely untouched, which is the whole point of
+            // keying `Shared::clients` this way.
+            taken = take_active_session(&mut shared, &client_key);
             // Claim `Spawning` before releasing the lock — see
-            // `State::Spawning`'s doc comment for why this has to happen
-            // atomically with the check above rather than after
+            // `ClientState::Spawning`'s doc comment for why this has to
+            // happen atomically with the check above rather than after
             // `spawn_session()` returns.
-            shared.state = State::Spawning;
+            shared.clients.insert(client_key.clone(), ClientSlot::spawning());
         }
         // Backgrounded/discarded *after* releasing the lock above — see
         // `take_active_session`'s doc comment for why this can never
         // happen while still holding it.
         if let Some(session) = taken {
+            self.video_sender.drain_pending(session.origin.ping_token);
+            self.audio_sender.drain_pending(session.origin.ping_token);
+            self.control_registry.forget(session.origin.rikey);
             background_or_discard(session, &self.background_sessions);
         }
-        // A genuinely new RTSP session (not a handoff) — start fresh RTP
-        // sequence numbers/frame indices/timestamps. See the doc comment on
-        // `SessionManager`'s packetizer fields for why this must NOT also
-        // happen inside `handoff_to_user`.
-        self.reset_stream_state();
+        // A genuinely new RTSP session (not a handoff) — fresh RTP sequence
+        // numbers/frame indices/timestamps/adaptive-bitrate state. See
+        // `SessionOrigin`'s doc comment for why this must NOT also happen
+        // inside `handoff_to_user`.
+        let generation = self.next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let origin = SessionOrigin::fresh(client_key.clone(), client_ip, rikey.key, rikey.key_id as u32, self.config.bitrate_kbps);
         // A panic during spawn (e.g. a bad GStreamer pipeline description —
         // this has actually happened) must not skip the state reset below:
         // without `catch_unwind` here, `Spawning` would be stuck forever and
-        // every future `/launch` would just time out waiting on a condvar
-        // nothing will ever notify.
+        // every future `/launch` from this client would just time out
+        // waiting on a condvar nothing will ever notify.
         let spawn_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let compositor = self.spawn_login_compositor(width, height)?;
-            self.spawn_session(SessionType::Login, width, height, fps, compositor, None)
+            let compositor = self.spawn_login_compositor(width, height, generation)?;
+            self.spawn_session(SessionType::Login, width, height, fps, compositor, None, generation, origin, None)
         }));
         let session = match spawn_result {
             Ok(Ok(session)) => session,
             Ok(Err(e)) => {
-                let mut shared = self.shared.lock().unwrap();
-                shared.state = State::Idle;
-                drop(shared);
+                self.shared.lock().unwrap().clients.remove(&client_key);
                 self.spawn_done.notify_all();
                 return Err(e);
             }
             Err(panic) => {
-                let mut shared = self.shared.lock().unwrap();
-                shared.state = State::Idle;
-                drop(shared);
+                self.shared.lock().unwrap().clients.remove(&client_key);
                 self.spawn_done.notify_all();
                 std::panic::resume_unwind(panic);
             }
         };
-        // Plain `rikey_cell` set when nothing was actually attached before
-        // this call (`was_idle`) — there's no stale peer to disconnect in
-        // that case, and the client's own brand-new ENet peer often
-        // connects within the same short window right after `/launch`
-        // returns; flagging a disconnect sweep here caught that new peer
-        // too and killed it immediately after connecting — confirmed live:
-        // broke every single launch, not just reconnects. Otherwise
-        // (something *was* attached and just got backgrounded/discarded
-        // above) there may be a real stale peer left over from whoever was
-        // connected before — bump the generation to clear it, same as the
-        // reconnect-takeover case always did.
-        if was_idle {
-            *self.rikey_cell.lock().unwrap() = Some(rikey.key);
-            *self.rikey_key_id.lock().unwrap() = Some(rikey.key_id as u32);
-        } else {
-            self.set_rikey(rikey.key, rikey.key_id as u32);
-        }
+        // Registered unconditionally (no "was this client idle before"
+        // distinction needed, unlike the old single-slot global sweep this
+        // replaced): registration is scoped to this rikey and bumps its own
+        // epoch, so it can only ever disconnect a *stale* peer previously
+        // matched to this same rikey — never a different, unrelated
+        // client's brand-new peer, which is exactly the failure mode the
+        // old global generation sweep had to work around.
+        self.control_registry.register(rikey.key);
         let mut shared = self.shared.lock().unwrap();
-        shared.state = State::Launched { session };
+        shared.clients.insert(client_key, ClientSlot { state: ClientState::Launched { session }, video_wait_task: None, audio_wait_task: None });
         drop(shared);
         self.spawn_done.notify_all();
         Ok(())
     }
 
-    fn resume(&self) -> Result<(), String> {
+    fn resume(&self, _client_key: ClientKey) -> Result<(), String> {
         Err("resume not yet implemented".to_string())
     }
 
-    fn cancel(&self) -> Result<(), String> {
+    fn cancel(&self, client_key: ClientKey) -> Result<(), String> {
         let taken = {
             let mut shared = self.shared.lock().unwrap();
-            take_active_session(&mut shared)
+            take_active_session(&mut shared, &client_key)
         };
         if let Some(session) = taken {
+            self.video_sender.drain_pending(session.origin.ping_token);
+            self.audio_sender.drain_pending(session.origin.ping_token);
+            self.control_registry.forget(session.origin.rikey);
             background_or_discard(session, &self.background_sessions);
         }
         Ok(())
     }
 }
 
-/// Extracts whatever's currently attached out of `shared.state` (resetting
-/// it to `Idle`) and clears the video/audio senders — the only things safe
-/// to do while still holding `shared`'s lock. Deliberately does NOT touch
-/// the extracted session's pipelines/compositor itself: those calls can
+/// Extracts whatever's currently attached under `client_key` out of
+/// `shared.clients` (removing that slot entirely) — the only thing safe to
+/// do while still holding `shared`'s lock. Deliberately does NOT touch the
+/// extracted session's pipelines/compositor itself: those calls can
 /// genuinely block — confirmed live, a hung KWin/PipeWire negotiation can
 /// wedge a GStreamer `set_state` call indefinitely, not just fail to
 /// deliver frames — and this lock must never be held through a call that
@@ -1775,56 +1881,74 @@ impl LaunchHandler for SessionManager {
 /// still holding, so no client ever saw a Login screen again short of
 /// restarting the process. Callers must drop the lock before acting on the
 /// returned session.
-/// Retries a UDP sender bind for up to ~2s before giving up — see the doc
-/// comment at its call site in `on_play` for why a bare one-shot attempt
-/// isn't enough even with `take_active_session`'s `.abort()` calls.
-async fn bind_with_retry<T, F, Fut>(mut bind: F) -> Result<T, String>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, String>>,
-{
-    let mut last_err = String::new();
-    for attempt in 0..20 {
-        match bind().await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                last_err = e;
-                if attempt < 19 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
+///
+/// Caller is responsible for also forgetting the extracted session's
+/// `origin.ping_token`/`origin.rikey` from `SessionManager::video_sender`/
+/// `audio_sender`/`control_registry` (`.drain_pending(ping_token)`/
+/// `.forget(rikey)` on each) — this function only has access to `Shared`,
+/// not those (which live directly on `SessionManager`, bound once at
+/// startup).
+fn take_active_session(shared: &mut Shared, client_key: &ClientKey) -> Option<RunningSession> {
+    let mut slot = shared.clients.remove(client_key)?;
+    // Sender state isn't the only thing holding a session's resources
+    // alive — see `ClientSlot::video_wait_task`'s doc comment: each sender's
+    // `wait_for_client` background task holds its own clone for up to a 30s
+    // timeout, independent of whatever the caller does with the sender's
+    // learned-address bookkeeping. Aborting them here (not just waiting
+    // them out) is what actually lets a new session start listening for its
+    // own client's ping immediately.
+    if let Some(task) = slot.video_wait_task.take() {
+        task.abort();
     }
-    Err(last_err)
+    if let Some(task) = slot.audio_wait_task.take() {
+        task.abort();
+    }
+    slot.state.into_session()
 }
 
-fn take_active_session(shared: &mut Shared) -> Option<RunningSession> {
-    let taken = if let State::Launched { session } | State::Streaming { session } = std::mem::replace(&mut shared.state, State::Idle) {
-        Some(session)
-    } else {
-        None
-    };
-    // `state` isn't the only thing holding a session's resources alive:
-    // these two `Arc`s (each wrapping a bound UDP socket) live here
-    // separately and `state` being reset above does nothing to them.
-    // Confirmed live: leaving them set kept the old sockets open, so
-    // every session after the first got "Address already in use" on
-    // ports 47998/48000 and streamed nothing.
-    shared.video_sender = None;
-    shared.audio_sender = None;
-    // Nor are these two references the *only* thing keeping a sender's
-    // socket alive — see `Shared::video_wait_task`'s doc comment: each
-    // sender's `wait_for_client` background task holds its own clone for
-    // up to a 30s timeout, entirely independent of the two lines above.
-    // Aborting them here (not just waiting them out) is what actually
-    // frees the port immediately for whatever session replaces this one.
-    if let Some(task) = shared.video_wait_task.take() {
-        task.abort();
-    }
-    if let Some(task) = shared.audio_wait_task.take() {
-        task.abort();
-    }
-    taken
+/// Best-effort resolution of "which `ClientKey` slot does this source IP
+/// belong to" — needed wherever a plain RTSP connection (which carries no
+/// certificate or client-echoed token at all — see `ClientKey`'s doc
+/// comment) has to be matched back to a session created via `/launch`.
+/// Prefers a not-yet-`Streaming` (`Launched`) slot over a `Streaming` one (a
+/// fresh `PLAY` is far more common than a retake), and the most recently
+/// created (highest `generation`) match within either bucket — the newest
+/// launch from a given IP is the one most likely to have its own RTSP
+/// handshake following shortly after.
+///
+/// This is an inherent "IP + timing, best effort" correlation (see
+/// `CONCURRENT_SESSIONS.md`) — there is no stronger signal available once a
+/// connection carries no cert or token, so
+/// this can still misattribute a connection to the wrong client if two
+/// *different* clients sharing an IP race each other within the same
+/// narrow window between one's `/launch` and its own RTSP handshake. It's
+/// what gets a connection matched to *a* plausible session at all;
+/// `ping_token`/rikey-trial matching (see `crate::udp_sender`/
+/// `control::ControlRegistry`) is what keeps that session's own data
+/// correctly separated from any other, concurrent one for the rest of its
+/// life, regardless of this initial guess's accuracy.
+fn resolve_client_key_by_ip(shared: &Shared, ip: IpAddr) -> Option<ClientKey> {
+    shared
+        .clients
+        .iter()
+        .filter_map(|(key, slot)| {
+            slot.state
+                .session()
+                .filter(|s| s.origin.client_ip == ip)
+                .map(|s| (key, s.generation, matches!(slot.state, ClientState::Launched { .. })))
+        })
+        .max_by_key(|(_, generation, is_launched)| (*is_launched, *generation))
+        .map(|(key, ..)| key.clone())
+}
+
+/// Resolution for the control channel — unlike RTSP's, this one is exact,
+/// not best-effort: `control::ControlServer` only ever calls
+/// `ControlEventHandler` methods with a `rikey` it already matched via
+/// successful GCM decryption (see its own doc comment), so there is exactly
+/// one session (with overwhelming probability — rikeys are 128 random bits
+/// generated fresh per launch) whose `origin.rikey` equals it.
+fn resolve_client_key_by_rikey(shared: &Shared, rikey: [u8; 16]) -> Option<ClientKey> {
+    shared.clients.iter().find(|(_, slot)| slot.state.session().is_some_and(|s| s.origin.rikey == rikey)).map(|(key, _)| key.clone())
 }
 
 /// What to do with a session `take_active_session` just extracted — split
@@ -1972,20 +2096,18 @@ fn discard_running_session(mut session: RunningSession) {
 }
 
 impl RtspHandler for SessionManager {
-    fn on_announce(&self, params: AnnouncedParams) {
+    fn on_announce(&self, params: AnnouncedParams, client_ip: IpAddr) {
         if let Some(bitrate_kbps) = params.bitrate_kbps {
             tracing::info!("RTSP ANNOUNCE: client requested bitrate {} kbps", bitrate_kbps);
-            self.target_bitrate_kbps.store(bitrate_kbps, std::sync::atomic::Ordering::Relaxed);
-            self.current_bitrate_kbps.store(bitrate_kbps, std::sync::atomic::Ordering::Relaxed);
-
-            // Apply it to the active pipeline encoder immediately if it exists
-            let shared = self.shared.lock().unwrap();
-            let active_session = match &shared.state {
-                State::Launched { session } => Some(session),
-                State::Streaming { session } => Some(session),
-                _ => None,
-            };
-            if let Some(session) = active_session {
+            // Apply it to this client's active pipeline encoder immediately
+            // if it exists. `client_ip` is all RTSP carries — see
+            // `resolve_client_key_by_ip`'s doc comment for the resulting
+            // best-effort resolution.
+            let mut shared = self.shared.lock().unwrap();
+            let Some(client_key) = resolve_client_key_by_ip(&shared, client_ip) else { return };
+            if let Some(session) = shared.clients.get_mut(&client_key).and_then(|slot| slot.state.session_mut()) {
+                session.origin.target_bitrate_kbps = bitrate_kbps;
+                session.origin.current_bitrate_kbps = bitrate_kbps;
                 redfog_core::set_encoder_bitrate(&session.video_pipeline, bitrate_kbps);
                 if let Some(cuda_direct_session) = &session.cuda_direct_session {
                     cuda_direct_session.set_bitrate(bitrate_kbps);
@@ -1994,26 +2116,39 @@ impl RtspHandler for SessionManager {
         }
     }
 
-    fn on_play(&self) {
-        let bind_addr = self.config.bind_addr;
-        let video_port = self.config.video_port;
-        let audio_port = self.config.audio_port;
-
+    fn on_play(&self, client_ip: std::net::IpAddr) {
         enum PlayKind {
-            /// First PLAY for this launch — pipelines aren't running yet,
-            /// senders need binding.
+            /// First PLAY for this launch — pipelines aren't running yet.
             Fresh(RunningSession),
             /// A new client's PLAY while a previous one was already
             /// `Streaming` — e.g. a window/tab was closed without a clean
             /// disconnect and a new window took over via `/launch`'s
             /// reconnect path. The compositor and pipelines are already
             /// running and must stay untouched; only the senders' learned
-            /// client address needs to move to the new client.
+            /// client address (for this session's `ping_token`) needs to
+            /// move to the new client.
             Retake(RunningSession),
         }
 
-        let kind = {
+        // Extracted (not left in place) while this processes, mirroring
+        // `ClientState::Spawning`'s own absent-means-idle convention —
+        // deliberately NOT replaced with a `Spawning` placeholder here: a
+        // concurrent `/launch` from this same client racing this PLAY would
+        // otherwise see `Spawning` and wait up to 15s on a condvar this
+        // function never signals, even though PLAY handling itself
+        // normally resolves in well under a second. `old_video_wait`/
+        // `old_audio_wait` carry forward whatever wait-task handles this
+        // slot already had (a previous PLAY's), so they can still be
+        // aborted below rather than orphaned.
+        let (kind, old_video_wait, old_audio_wait) = {
             let mut shared = self.shared.lock().unwrap();
+            // `client_ip` is all RTSP carries — see
+            // `resolve_client_key_by_ip`'s doc comment for the resulting
+            // best-effort resolution.
+            let Some(client_key) = resolve_client_key_by_ip(&shared, client_ip) else {
+                tracing::warn!("PLAY received but no session is pending for {client_ip}");
+                return;
+            };
             // PLAY can race ahead of `/launch` finishing the (slow: KWin +
             // D-Bus + PipeWire) compositor spawn — confirmed live against
             // moonlight-web, which opens its RTSP connection and sends PLAY
@@ -2022,117 +2157,74 @@ impl RtspHandler for SessionManager {
             // pattern `launch()` uses for a concurrent `/launch`.
             let (guard, timeout_result) = self
                 .spawn_done
-                .wait_timeout_while(shared, Duration::from_secs(15), |s| matches!(s.state, State::Spawning))
+                .wait_timeout_while(shared, Duration::from_secs(15), |s| matches!(s.clients.get(&client_key).map(|c| &c.state), Some(ClientState::Spawning)))
                 .unwrap();
             shared = guard;
-            if timeout_result.timed_out() && matches!(shared.state, State::Spawning) {
+            if timeout_result.timed_out() && matches!(shared.clients.get(&client_key).map(|c| &c.state), Some(ClientState::Spawning)) {
                 tracing::warn!("PLAY received but launch is still spawning after 15s, giving up");
                 return;
             }
-            match std::mem::replace(&mut shared.state, State::Idle) {
-                State::Launched { session } => Some(PlayKind::Fresh(session)),
-                State::Streaming { session } => Some(PlayKind::Retake(session)),
-                other => {
-                    shared.state = other;
-                    None
+            match shared.clients.remove(&client_key) {
+                Some(mut slot) => {
+                    let video_wait = slot.video_wait_task.take();
+                    let audio_wait = slot.audio_wait_task.take();
+                    let kind = match slot.state {
+                        ClientState::Launched { session } => Some(PlayKind::Fresh(session)),
+                        ClientState::Streaming { session } => Some(PlayKind::Retake(session)),
+                        ClientState::Spawning => None,
+                    };
+                    (kind, video_wait, audio_wait)
                 }
+                None => (None, None, None),
             }
         };
         let Some(kind) = kind else {
-            tracing::warn!("PLAY received but no session is in Launched/Streaming state");
+            tracing::warn!("PLAY received but no session is in Launched/Streaming state for {client_ip}");
             return;
         };
 
         let this = self.arc_self();
         tokio::spawn(async move {
-            let (session, video_sender, audio_sender, is_retake) = match kind {
-                PlayKind::Fresh(session) => {
-                    // Retried, not a bare one-shot attempt: `take_active_session`
-                    // aborts the previous session's `wait_for_client` tasks (see
-                    // `Shared::video_wait_task`'s doc comment) specifically so
-                    // this doesn't have to wait out their old 30s budget, but
-                    // `JoinHandle::abort` only *schedules* cancellation — there's
-                    // an inherent, if normally brief, race before the OS actually
-                    // releases the old socket. Confirmed live: a bare first
-                    // attempt still failed often enough to matter (a reconnect
-                    // landing within that window), and unlike a transient error
-                    // anywhere else in this function, this one is NOT recoverable
-                    // by the client retrying — it needs a fresh `/launch` and
-                    // Login process, not just resending PLAY.
-                    let video_sender = match bind_with_retry(|| VideoSender::bind(bind_addr, video_port)).await {
-                        Ok(s) => Arc::new(s),
-                        Err(e) => {
-                            tracing::error!("failed to bind video sender: {e}");
-                            return;
-                        }
-                    };
-                    let audio_sender = match bind_with_retry(|| AudioSender::bind(bind_addr, audio_port)).await {
-                        Ok(s) => Arc::new(s),
-                        Err(e) => {
-                            tracing::error!("failed to bind audio sender: {e}");
-                            return;
-                        }
-                    };
-                    {
-                        let mut shared = this.shared.lock().unwrap();
-                        shared.video_sender = Some(video_sender.clone());
-                        shared.audio_sender = Some(audio_sender.clone());
-                    }
-                    (session, video_sender, audio_sender, false)
-                }
+            let (session, is_retake) = match kind {
+                PlayKind::Fresh(session) => (session, false),
                 PlayKind::Retake(session) => {
-                    // Reuse the existing, already-bound senders — `PLAY` can
-                    // arrive from the new client on its own new RTSP TCP
-                    // connection before the old one's UDP sockets would ever
-                    // be rebound anyway, and re-binding the same ports here
-                    // would just fail with "Address already in use".
-                    let existing = {
-                        let shared = this.shared.lock().unwrap();
-                        (shared.video_sender.clone(), shared.audio_sender.clone())
-                    };
-                    let (Some(video_sender), Some(audio_sender)) = existing else {
-                        tracing::error!("retaking a Streaming session but its senders are missing — dropping to Idle");
-                        let mut shared = this.shared.lock().unwrap();
-                        shared.state = State::Idle;
-                        return;
-                    };
                     // The previous client's own stale `PING`(s) may already
-                    // be sitting in these sockets' receive buffers (UDP has
-                    // no teardown to stop them, and nothing's read from
-                    // these sockets since) — without this, `wait_for_client`
+                    // be sitting in the shared sockets' receive buffers (UDP
+                    // has no teardown to stop them, and nothing's read for
+                    // this token since) — without this, `wait_for_client`
                     // below picks one of those up instead of the new
                     // client's, permanently misrouting the stream to the
                     // old, now-gone address. Confirmed live.
-                    video_sender.drain_pending();
-                    audio_sender.drain_pending();
-                    (session, video_sender, audio_sender, true)
+                    this.video_sender.drain_pending(session.origin.ping_token);
+                    this.audio_sender.drain_pending(session.origin.ping_token);
+                    (session, true)
                 }
             };
+            let client_key = session.origin.client_key.clone();
+            let ping_token = session.origin.ping_token;
 
             // `wait_for_client` loops forever if no PING ever arrives (a
             // session that gets abandoned before the client pings). Without
-            // a timeout, that keeps this task's `Arc<VideoSender>` (and its
-            // bound UDP socket) alive indefinitely — confirmed live: a stale
-            // session left port 47998 bound, so every later session's own
-            // bind failed with "Address already in use" and streamed
-            // nothing at all. For a retake, the sender keeps sending to the
-            // old (now-gone) client address until this overwrites it with
-            // the new one — harmless, just wasted bandwidth in the meantime.
+            // a timeout, that leaves this token's entry in the shared
+            // senders' bookkeeping alive indefinitely. For a retake, the
+            // sender keeps sending to the old (now-gone) client address
+            // until this overwrites it with the new one — harmless, just
+            // wasted bandwidth in the meantime.
             //
             // The 30s timeout alone isn't tight enough on its own, though —
             // confirmed live: a client that disconnects and reconnects
             // within that window (routine now that every `/launch` always
-            // shows a fresh Login — see `Shared::video_wait_task`'s doc
-            // comment for the full story) hits the exact same "Address
-            // already in use" failure this comment already describes,
-            // *while this task is still well within its own 30s budget*.
-            // Storing the handles in `shared` and having
-            // `take_active_session` `.abort()` them the moment a session
-            // stops being attached is what actually closes that gap.
+            // shows a fresh Login — see `ClientSlot::video_wait_task`'s doc
+            // comment for the full story) hits the exact same misrouting
+            // this comment already describes, *while this task is still
+            // well within its own 30s budget*. Storing the handles in
+            // `shared` and having `take_active_session` `.abort()` them the
+            // moment a session stops being attached is what actually closes
+            // that gap.
             let video_wait_task = tokio::spawn({
-                let video_sender = video_sender.clone();
+                let video_sender = this.video_sender.clone();
                 async move {
-                    match tokio::time::timeout(Duration::from_secs(30), video_sender.wait_for_client()).await {
+                    match tokio::time::timeout(Duration::from_secs(30), video_sender.wait_for_client(ping_token)).await {
                         Ok(Ok(addr)) => tracing::info!("video client announced itself at {addr}"),
                         Ok(Err(e)) => tracing::warn!("video wait_for_client failed: {e}"),
                         Err(_) => tracing::warn!("no video client PING received within 30s, giving up"),
@@ -2140,26 +2232,23 @@ impl RtspHandler for SessionManager {
                 }
             });
             let audio_wait_task = tokio::spawn({
-                let audio_sender = audio_sender.clone();
+                let audio_sender = this.audio_sender.clone();
                 async move {
-                    match tokio::time::timeout(Duration::from_secs(30), audio_sender.wait_for_client()).await {
+                    match tokio::time::timeout(Duration::from_secs(30), audio_sender.wait_for_client(ping_token)).await {
                         Ok(Ok(addr)) => tracing::info!("audio client announced itself at {addr}"),
                         Ok(Err(e)) => tracing::warn!("audio wait_for_client failed: {e}"),
                         Err(_) => tracing::warn!("no audio client PING received within 30s, giving up"),
                     }
                 }
             });
-            {
-                let mut shared = this.shared.lock().unwrap();
-                // Defensive, not the expected case: a genuinely overlapping
-                // PLAY (e.g. a retake racing a fresh one) could otherwise
-                // orphan the previous handle here without ever aborting it.
-                if let Some(old) = shared.video_wait_task.replace(video_wait_task) {
-                    old.abort();
-                }
-                if let Some(old) = shared.audio_wait_task.replace(audio_wait_task) {
-                    old.abort();
-                }
+            // Defensive, not the expected case: a genuinely overlapping
+            // PLAY (e.g. a retake racing a fresh one) could otherwise
+            // orphan the previous handle here without ever aborting it.
+            if let Some(old) = old_video_wait {
+                old.abort();
+            }
+            if let Some(old) = old_audio_wait {
+                old.abort();
             }
 
             if is_retake {
@@ -2167,28 +2256,31 @@ impl RtspHandler for SessionManager {
                 // this is a login session) is already running — just put the
                 // session back, don't redo any of `start_streaming`'s setup.
                 let mut shared = this.shared.lock().unwrap();
-                // Already the active generation in practice (a retake is
-                // the same session, not a new one) — set again anyway,
-                // defensively, matching this block's own reasoning above.
-                shared.active_generation = Some(session.generation);
-                shared.state = State::Streaming { session };
+                shared.clients.insert(
+                    client_key,
+                    ClientSlot { state: ClientState::Streaming { session }, video_wait_task: Some(video_wait_task), audio_wait_task: Some(audio_wait_task) },
+                );
             } else {
                 // Always the Login stage's very first PLAY here (see
                 // `PlayKind::Fresh`'s doc comment) — Login is never
                 // backgrounded/resumed, so this is never a resume.
-                this.start_streaming(session, false).await;
+                this.start_streaming(session, false, Some(video_wait_task), Some(audio_wait_task)).await;
             }
         });
+    }
+
+    fn ping_token_for(&self, client_ip: IpAddr) -> Option<[u8; 16]> {
+        let shared = self.shared.lock().unwrap();
+        let client_key = resolve_client_key_by_ip(&shared, client_ip)?;
+        Some(shared.clients.get(&client_key)?.state.session()?.origin.ping_token)
     }
 }
 
 impl ControlEventHandler for SessionManager {
-    fn on_input(&self, event: InputEvent) {
+    fn on_input(&self, rikey: [u8; 16], event: InputEvent) {
         let mut shared = self.shared.lock().unwrap();
-        let session = match &mut shared.state {
-            State::Streaming { session } => session,
-            _ => return,
-        };
+        let Some(client_key) = resolve_client_key_by_rikey(&shared, rikey) else { return };
+        let Some(ClientState::Streaming { session }) = shared.clients.get_mut(&client_key).map(|slot| &mut slot.state) else { return };
         let fwd = &mut session.input_forwarder;
         match event {
             InputEvent::KeyDown { keycode } => {
@@ -2248,9 +2340,10 @@ impl ControlEventHandler for SessionManager {
         fwd.flush();
     }
 
-    fn on_request_idr_frame(&self) {
+    fn on_request_idr_frame(&self, rikey: [u8; 16]) {
         let shared = self.shared.lock().unwrap();
-        if let State::Streaming { session } = &shared.state {
+        let Some(client_key) = resolve_client_key_by_rikey(&shared, rikey) else { return };
+        if let Some(ClientState::Streaming { session }) = shared.clients.get(&client_key).map(|slot| &slot.state) {
             redfog_core::request_keyframe(&session.video_pipeline);
             if let Some(cuda_direct_session) = &session.cuda_direct_session {
                 cuda_direct_session.request_keyframe();
@@ -2268,18 +2361,23 @@ impl ControlEventHandler for SessionManager {
     /// caught back up, dead zone in between so single-frame jitter doesn't
     /// cause visible oscillation. Never exceeds `config.bitrate_kbps` — that
     /// stays the ceiling, not just a starting point.
-    fn on_loss_stats(&self, last_good_frame: u64) {
-        let (video_pipeline, cuda_direct_session) = {
+    fn on_loss_stats(&self, rikey: [u8; 16], last_good_frame: u64) {
+        let (client_key, video_pipeline, cuda_direct_session, video_packetizer, target_kbps, current_kbps) = {
             let shared = self.shared.lock().unwrap();
-            let State::Streaming { session } = &shared.state else { return };
-            (session.video_pipeline.clone(), session.cuda_direct_session.clone())
+            let Some(client_key) = resolve_client_key_by_rikey(&shared, rikey) else { return };
+            let Some(ClientState::Streaming { session }) = shared.clients.get(&client_key).map(|slot| &slot.state) else { return };
+            (
+                client_key,
+                session.video_pipeline.clone(),
+                session.cuda_direct_session.clone(),
+                session.origin.video_packetizer.clone(),
+                session.origin.target_bitrate_kbps,
+                session.origin.current_bitrate_kbps,
+            )
         };
 
-        let next_frame_number = self.video_packetizer.lock().unwrap().clone().lock().unwrap().next_frame_number();
+        let next_frame_number = video_packetizer.lock().unwrap().next_frame_number();
         let frames_behind = (next_frame_number as u64).saturating_sub(last_good_frame);
-
-        let target_kbps = self.target_bitrate_kbps.load(std::sync::atomic::Ordering::Relaxed);
-        let current_kbps = self.current_bitrate_kbps.load(std::sync::atomic::Ordering::Relaxed);
         let new_kbps = adapt_bitrate_kbps(current_kbps, target_kbps, frames_behind);
         // Every report, not just ones that actually change anything —
         // otherwise there's no way to see this loop is even running (e.g.
@@ -2288,7 +2386,12 @@ impl ControlEventHandler for SessionManager {
         tracing::debug!("loss stats: last_good_frame={last_good_frame} next_frame_number={next_frame_number} frames_behind={frames_behind} current_bitrate={current_kbps}kbps");
 
         if new_kbps != current_kbps {
-            self.current_bitrate_kbps.store(new_kbps, std::sync::atomic::Ordering::Relaxed);
+            {
+                let mut shared = self.shared.lock().unwrap();
+                if let Some(session) = shared.clients.get_mut(&client_key).and_then(|slot| slot.state.session_mut()) {
+                    session.origin.current_bitrate_kbps = new_kbps;
+                }
+            }
             tracing::debug!("adaptive bitrate: {current_kbps} -> {new_kbps} kbps (frames_behind={frames_behind})");
             redfog_core::set_encoder_bitrate(&video_pipeline, new_kbps);
             if let Some(cuda_direct_session) = &cuda_direct_session {

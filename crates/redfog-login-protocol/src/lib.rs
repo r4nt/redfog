@@ -31,7 +31,19 @@ pub enum LoginRequest {
     /// from the target user's own `~/.config/redfog/session.toml` instead
     /// (read via the broker's `ReadUserSessionConfig`, gated behind this
     /// same `Authenticate` having already succeeded).
-    Authenticate { username: String, password: String, session: String },
+    ///
+    /// `generation` is the reporting Login-stage compositor's own
+    /// `RunningSession::generation` (passed in via `REDFOG_LOGIN_GENERATION`
+    /// -- see `session_backend::spawn_login_compositor`), not a wire-protocol
+    /// concept of its own. With concurrent sessions, multiple `redfog-login`
+    /// processes (one per concurrently-logging-in client) can be connected
+    /// to the same `LoginReportServer` socket at once -- without this,
+    /// `SessionManager::handle_login_report` would have no way to tell whose
+    /// login attempt a given report belongs to, and would resolve every
+    /// concurrent handoff (`spawn_user_compositor`) against whichever
+    /// report happened to land last, regardless of which client it was
+    /// actually for.
+    Authenticate { username: String, password: String, session: String, generation: u64 },
     /// Whether `username` already has a running (possibly backgrounded)
     /// session — lets the login screen show "Resume" instead of "Log In",
     /// and enable/disable its "Log Out" control, before any password is

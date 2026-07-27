@@ -46,24 +46,59 @@ pub struct RemoteInputKey {
     pub key_id: i64,
 }
 
+/// Identity key for "which physical client is this," used to key
+/// `SessionManager`'s per-client session slots. `Cert` (the paired TLS
+/// client certificate's fingerprint, from an HTTPS request — see
+/// `PairingServer::serve_https`) is preferred whenever available: it's
+/// stable per *device*, survives IP changes, and — critically — correctly
+/// tells apart two different paired clients that happen to share a source
+/// address (same NAT, or literally the same machine running two client
+/// instances). `Ip` is the fallback for a plain-HTTP request (no TLS
+/// session to pull a certificate from at all) — strictly weaker: it cannot
+/// distinguish two different clients sharing an address, only reconnects/
+/// relaunches from what's presumably the same one. Real clients pair over
+/// HTTPS and are expected to call `/launch`/`/resume`/`/cancel` over HTTPS
+/// too, so `Cert` is the common case in practice, not just a nice-to-have.
+///
+/// Doesn't reach every layer, though — RTSP, the video/audio UDP sockets,
+/// and the ENet control channel are all plain, unauthenticated transports
+/// in the real protocol (confirmed against moonlight-common-rust's own
+/// client code, not just docs) and carry no certificate or client-echoed
+/// token at all. Correlating an RTSP connection back to a specific launch
+/// is therefore still IP+timing-based no matter what `ClientKey` variant
+/// was used to create the slot — see `crate::session::resolve_client_key_by_ip`.
+/// Video/audio/control themselves don't need IP at all once a session is
+/// resolved, though — see `crate::udp_sender`'s and `control::ControlRegistry`'s
+/// own doc comments for how those are kept correctly separated regardless of
+/// `ClientKey` collisions downstream.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ClientKey {
+    Cert(String),
+    Ip(std::net::IpAddr),
+}
+
 /// Hook for `/launch`, `/resume`, `/cancel` to drive the actual session state
-/// machine. Wired up properly once the session module (task 11) exists;
-/// until then a no-op implementation is used.
+/// machine. `client_key` identifies which physical client this request is
+/// for — see `ClientKey`'s own doc comment. `launch` additionally takes the
+/// raw `client_ip` (even when `client_key` is `Cert(..)`): a fresh session
+/// still needs it to best-effort-resolve which slot an incoming RTSP
+/// connection belongs to later (see `crate::session::resolve_client_key_by_ip`),
+/// since RTSP itself carries no certificate at all.
 pub trait LaunchHandler: Send + Sync {
-    fn launch(&self, width: u32, height: u32, fps: u32, rikey: RemoteInputKey) -> Result<(), String>;
-    fn resume(&self) -> Result<(), String>;
-    fn cancel(&self) -> Result<(), String>;
+    fn launch(&self, width: u32, height: u32, fps: u32, rikey: RemoteInputKey, client_key: ClientKey, client_ip: std::net::IpAddr) -> Result<(), String>;
+    fn resume(&self, client_key: ClientKey) -> Result<(), String>;
+    fn cancel(&self, client_key: ClientKey) -> Result<(), String>;
 }
 
 pub struct NoopLaunchHandler;
 impl LaunchHandler for NoopLaunchHandler {
-    fn launch(&self, _width: u32, _height: u32, _fps: u32, _rikey: RemoteInputKey) -> Result<(), String> {
+    fn launch(&self, _width: u32, _height: u32, _fps: u32, _rikey: RemoteInputKey, _client_key: ClientKey, _client_ip: std::net::IpAddr) -> Result<(), String> {
         Ok(())
     }
-    fn resume(&self) -> Result<(), String> {
+    fn resume(&self, _client_key: ClientKey) -> Result<(), String> {
         Ok(())
     }
-    fn cancel(&self) -> Result<(), String> {
+    fn cancel(&self, _client_key: ClientKey) -> Result<(), String> {
         Ok(())
     }
 }
@@ -191,14 +226,19 @@ impl PairingServer {
             q
         });
 
+        // See `ClientKey`'s doc comment: cert fingerprint whenever this
+        // request came in over HTTPS with a client cert presented (the real
+        // clients' normal path), IP as a fallback otherwise.
+        let client_key = client_cert_fingerprint.clone().map(ClientKey::Cert).unwrap_or(ClientKey::Ip(peer.ip()));
+
         match path.as_str() {
             "/serverinfo" => self.server_info(&params, https, client_cert_fingerprint.as_deref()),
             "/applist" => self.app_list(),
             "/pair" => self.pair(&params).await,
             "/unpair" => self.unpair(&params),
-            "/launch" => self.launch(&params, local_addr.ip()).await,
-            "/resume" => self.resume(&params, local_addr.ip()).await,
-            "/cancel" => self.cancel(&params).await,
+            "/launch" => self.launch(&params, local_addr.ip(), client_key, peer.ip()).await,
+            "/resume" => self.resume(&params, local_addr.ip(), client_key).await,
+            "/cancel" => self.cancel(&params, client_key).await,
             "/pin" => self.pin_page(&params),
             "/submit-pin" => self.submit_pin_query(&params, req.into_body()).await,
             "/pending-pairs" => self.pending_pairs(),
@@ -426,7 +466,7 @@ impl PairingServer {
     // pool and even trivial requests like `/serverinfo` stop being served at
     // all — confirmed live. `spawn_blocking` runs it on tokio's separate,
     // much larger blocking-thread pool instead.
-    async fn launch(&self, params: &HashMap<String, String>, local_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
+    async fn launch(&self, params: &HashMap<String, String>, local_ip: std::net::IpAddr, client_key: ClientKey, client_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
         tracing::info!("HTTP /launch query parameters: {:?}", params);
         let (width, height, fps) = Self::parse_mode(params);
 
@@ -435,7 +475,7 @@ impl PairingServer {
         };
 
         let handler = self.launch_handler.clone();
-        let result = tokio::task::spawn_blocking(move || handler.launch(width, height, fps, rikey))
+        let result = tokio::task::spawn_blocking(move || handler.launch(width, height, fps, rikey, client_key, client_ip))
             .await
             .unwrap_or_else(|e| Err(format!("launch task panicked: {e}")));
 
@@ -455,9 +495,9 @@ impl PairingServer {
         }
     }
 
-    async fn resume(&self, _params: &HashMap<String, String>, local_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
+    async fn resume(&self, _params: &HashMap<String, String>, local_ip: std::net::IpAddr, client_key: ClientKey) -> Response<Full<Bytes>> {
         let handler = self.launch_handler.clone();
-        let result = tokio::task::spawn_blocking(move || handler.resume())
+        let result = tokio::task::spawn_blocking(move || handler.resume(client_key))
             .await
             .unwrap_or_else(|e| Err(format!("resume task panicked: {e}")));
 
@@ -474,9 +514,9 @@ impl PairingServer {
         }
     }
 
-    async fn cancel(&self, _params: &HashMap<String, String>) -> Response<Full<Bytes>> {
+    async fn cancel(&self, _params: &HashMap<String, String>, client_key: ClientKey) -> Response<Full<Bytes>> {
         let handler = self.launch_handler.clone();
-        let result = tokio::task::spawn_blocking(move || handler.cancel())
+        let result = tokio::task::spawn_blocking(move || handler.cancel(client_key))
             .await
             .unwrap_or_else(|e| Err(format!("cancel task panicked: {e}")));
 

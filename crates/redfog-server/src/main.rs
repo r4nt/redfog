@@ -183,7 +183,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         log_mouse_events,
         backend,
         session_presets,
-    });
+    })
+    .await?;
 
     let pairing_server = Arc::new(PairingServer {
         clients: clients.clone(),
@@ -209,9 +210,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let control_server = ControlServer {
         port: control_port,
-        key: session_manager.rikey_cell(),
+        registry: session_manager.control_registry(),
         handler: session_manager.clone(),
-        rikey_generation: session_manager.rikey_generation(),
     };
 
     let login_report_server = Arc::new(LoginReportServer {

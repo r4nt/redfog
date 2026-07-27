@@ -399,7 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Mode::Handoff | Mode::Broker => {
             eprintln!("viewer: spawning Login compositor...");
-            (SessionType::Login, session_backend::spawn_login_compositor(&args.login_app, args.width as u32, args.height as u32)?)
+            (SessionType::Login, session_backend::spawn_login_compositor(&args.login_app, args.width as u32, args.height as u32, 0)?)
         }
     };
 

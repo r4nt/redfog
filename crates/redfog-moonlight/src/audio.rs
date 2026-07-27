@@ -11,10 +11,9 @@
 //! Layout derived from reading a known-working implementation's wire code
 //! (not vendored), see the plan doc for context.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
 
-use tokio::net::UdpSocket;
+use crate::udp_sender::MultiClientUdpSender;
 
 const RTP_HEADER_SIZE: usize = 12;
 const AUDIO_PAYLOAD_TYPE: u8 = 97;
@@ -66,57 +65,31 @@ impl AudioPacketizer {
 }
 
 /// Same "wait for the client's `PING`" pattern as `VideoSender` — see there
-/// for why the address isn't known upfront.
+/// for why the address isn't known upfront, and for why this wraps one
+/// shared, once-bound socket rather than binding its own per launch.
 pub struct AudioSender {
-    socket: Arc<UdpSocket>,
-    client_addr: std::sync::Mutex<Option<SocketAddr>>,
+    inner: MultiClientUdpSender,
 }
 
 impl AudioSender {
-    pub async fn bind(bind_addr: std::net::IpAddr, port: u16) -> Result<Self, String> {
-        let socket = UdpSocket::bind((bind_addr, port))
-            .await
-            .map_err(|e| format!("failed to bind audio udp {}:{}: {e}", bind_addr, port))?;
-        Ok(Self {
-            socket: Arc::new(socket),
-            client_addr: std::sync::Mutex::new(None),
-        })
+    pub async fn bind(bind_addr: IpAddr, port: u16) -> Result<Self, String> {
+        Ok(Self { inner: MultiClientUdpSender::bind(bind_addr, port, "audio").await? })
     }
 
     /// See `VideoSender::drain_pending`'s doc comment — same reasoning,
     /// same bug, same fix.
-    pub fn drain_pending(&self) {
-        let mut buf = [0u8; 1024];
-        while self.socket.try_recv_from(&mut buf).is_ok() {}
+    pub fn drain_pending(&self, ping_token: [u8; 16]) {
+        self.inner.forget(ping_token);
     }
 
-    pub async fn wait_for_client(&self) -> Result<SocketAddr, String> {
-        let mut buf = [0u8; 1024];
-        loop {
-            let (len, addr) = self
-                .socket
-                .recv_from(&mut buf)
-                .await
-                .map_err(|e| format!("audio udp recv failed: {e}"))?;
-            if &buf[..len] == b"PING" {
-                *self.client_addr.lock().unwrap() = Some(addr);
-                return Ok(addr);
-            }
-            tracing::trace!("ignoring unexpected {len}-byte datagram on audio port before PING");
-        }
+    /// See `VideoSender::wait_for_client`'s doc comment for why this is
+    /// keyed by `ping_token`.
+    pub async fn wait_for_client(&self, ping_token: [u8; 16]) -> Result<SocketAddr, String> {
+        self.inner.wait_for_client(ping_token).await
     }
 
-    pub async fn send_packet(&self, packet: &[u8]) -> Result<(), String> {
-        let addr = self
-            .client_addr
-            .lock()
-            .unwrap()
-            .ok_or("audio client address not yet known (wait_for_client not called/completed)")?;
-        self.socket
-            .send_to(packet, addr)
-            .await
-            .map_err(|e| format!("audio send failed: {e}"))?;
-        Ok(())
+    pub async fn send_packet(&self, ping_token: [u8; 16], packet: &[u8]) -> Result<(), String> {
+        self.inner.send_to(ping_token, packet).await
     }
 }
 

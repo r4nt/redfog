@@ -14,10 +14,9 @@
 //! Layout derived from reading a known-working implementation's wire code
 //! (not vendored), see the plan doc for context.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
 
-use tokio::net::UdpSocket;
+use crate::udp_sender::MultiClientUdpSender;
 
 const NV_VIDEO_PACKET_SIZE: usize = 16;
 const RTP_HEADER_SIZE: usize = 12;
@@ -190,71 +189,50 @@ fn copy_header_and_data(dst: &mut [u8], frame_header: &[u8; VIDEO_FRAME_HEADER_S
     }
 }
 
-/// Sends already-packetized shards to the client over UDP. The client's
+/// Sends already-packetized shards to a client over UDP. The client's
 /// address isn't known upfront (there's no connection setup on this
 /// unreliable-UDP stream) — it announces itself with a `PING` datagram after
 /// `PLAY`, same NAT-punch pattern real Sunshine/moonshine use, and we learn
-/// its address from that.
+/// its address from that. One shared socket for the whole server (bound
+/// once, not per-launch) — see `udp_sender`'s doc comment for why: multiple
+/// concurrent sessions are multiplexed onto it by learned per-`ping_token`
+/// destination address, not by each getting its own port.
 pub struct VideoSender {
-    socket: Arc<UdpSocket>,
-    client_addr: std::sync::Mutex<Option<SocketAddr>>,
+    inner: MultiClientUdpSender,
 }
 
 impl VideoSender {
-    pub async fn bind(bind_addr: std::net::IpAddr, port: u16) -> Result<Self, String> {
-        let socket = UdpSocket::bind((bind_addr, port))
-            .await
-            .map_err(|e| format!("failed to bind video udp {}:{}: {e}", bind_addr, port))?;
-        Ok(Self {
-            socket: Arc::new(socket),
-            client_addr: std::sync::Mutex::new(None),
-        })
+    pub async fn bind(bind_addr: IpAddr, port: u16) -> Result<Self, String> {
+        Ok(Self { inner: MultiClientUdpSender::bind(bind_addr, port, "video").await? })
     }
 
-    /// Discards any datagrams already sitting in the socket's receive buffer
-    /// — call before `wait_for_client` when reusing an existing sender for a
+    /// Forgets any previously-learned address for `ping_token` — call when
+    /// this client's session ends, or before `wait_for_client` on a
     /// reconnect/takeover. Without this, a stale `PING` the *previous*
-    /// client already sent (UDP has no connection teardown to stop it, and
+    /// session already sent (UDP has no connection teardown to stop it, and
     /// nothing was reading from this socket between sessions to consume it)
-    /// gets picked up as if it were the new client's, permanently misrouting
-    /// the stream to the old, now-gone address — confirmed live: a fresh
-    /// reference-client connection received the *old* client's address here
-    /// and got zero video/audio frames for the entire session.
-    pub fn drain_pending(&self) {
-        let mut buf = [0u8; 1024];
-        while self.socket.try_recv_from(&mut buf).is_ok() {}
+    /// gets picked up as if it belonged to the new one, permanently
+    /// misrouting the stream to a now-stale destination — confirmed live: a
+    /// fresh reference-client connection received the *old* session's
+    /// address here and got zero video/audio frames for the entire session.
+    pub fn drain_pending(&self, ping_token: [u8; 16]) {
+        self.inner.forget(ping_token);
     }
 
-    /// Blocks until the client's `PING` datagram arrives, recording its
-    /// address for subsequent sends. Call once after `PLAY`, before frames
-    /// start flowing.
-    pub async fn wait_for_client(&self) -> Result<SocketAddr, String> {
-        let mut buf = [0u8; 1024];
-        loop {
-            let (len, addr) = self
-                .socket
-                .recv_from(&mut buf)
-                .await
-                .map_err(|e| format!("video udp recv failed: {e}"))?;
-            if &buf[..len] == b"PING" {
-                *self.client_addr.lock().unwrap() = Some(addr);
-                return Ok(addr);
-            }
-            tracing::trace!("ignoring unexpected {len}-byte datagram on video port before PING");
-        }
+    /// Blocks until `ping_token`'s `PING` datagram arrives (or returns
+    /// immediately if already learned), recording its address for
+    /// subsequent sends. Call once after `PLAY`, before frames start
+    /// flowing. Keyed by `ping_token`, not `client_ip`/`RunningSession::
+    /// generation` — see `crate::udp_sender`'s doc comment for why: it's
+    /// stable across a Login -> User handoff, and unambiguous even when two
+    /// concurrent clients share a source address.
+    pub async fn wait_for_client(&self, ping_token: [u8; 16]) -> Result<SocketAddr, String> {
+        self.inner.wait_for_client(ping_token).await
     }
 
-    pub async fn send_shards(&self, shards: &[Vec<u8>]) -> Result<(), String> {
-        let addr = self
-            .client_addr
-            .lock()
-            .unwrap()
-            .ok_or("video client address not yet known (wait_for_client not called/completed)")?;
+    pub async fn send_shards(&self, ping_token: [u8; 16], shards: &[Vec<u8>]) -> Result<(), String> {
         for shard in shards {
-            self.socket
-                .send_to(shard, addr)
-                .await
-                .map_err(|e| format!("video send failed: {e}"))?;
+            self.inner.send_to(ping_token, shard).await?;
         }
         Ok(())
     }
