@@ -779,6 +779,7 @@ impl SessionManager {
     /// pipeline's teardown at all.
     fn build_pipelines(
         &self,
+        kind: &SessionType,
         compositor: &SpawnedCompositor,
         audio_loopback: &AudioLoopback,
         generation: u64,
@@ -795,7 +796,11 @@ impl SessionManager {
         // the *current* sender up fresh on every frame via `self`, rather
         // than capturing today's (always-`None`) value once here.
         let bitrate = self.target_bitrate_kbps.load(std::sync::atomic::Ordering::Relaxed);
-        let video_encoder = self.config.video_encoder;
+        let video_encoder = if matches!(kind, SessionType::Login) {
+            redfog_core::VideoEncoder::Software
+        } else {
+            self.config.video_encoder
+        };
         let this = self.arc_self();
         // `video_packetizer`/`audio_packetizer`/`stream_start` are looked up
         // fresh from `this` inside each closure below, NOT captured once
@@ -1041,7 +1046,7 @@ impl SessionManager {
             self.config.video_encoder,
             self.config.bitrate_kbps,
         );
-        let (video_pipeline, audio_pipeline, cuda_direct_session) = self.build_pipelines(&compositor, &audio_loopback, generation, fps_cap);
+        let (video_pipeline, audio_pipeline, cuda_direct_session) = self.build_pipelines(&kind, &compositor, &audio_loopback, generation, fps_cap);
         // Must come *after* `build_pipelines`, not before (this used to be
         // the other way around): `SpawnedCompositor::GstWaylandDisplay`'s
         // `input_sink` now looks up its `waylanddisplaysrc` element inside

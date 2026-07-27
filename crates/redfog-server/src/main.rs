@@ -70,8 +70,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `GST_DEBUG` alone since this needs to apply regardless of what the
     // invoking script's own environment happens to set. Remove once that
     // investigation concludes.
+    //
+    // Empty (not just unset) is treated as "no override", same reasoning as
+    // `REDFOG_VIDEO_ENCODER` below: `scripts/sudo-live-session.sh`'s
+    // systemd-run --setenv hop forwards this as present-but-empty when the
+    // caller didn't set it. `debug_set_threshold_from_string`'s `reset: true`
+    // would otherwise unconditionally reset GStreamer's debug thresholds to
+    // defaults on every run, silently discarding whatever plain `GST_DEBUG`
+    // (read natively by `gstreamer::init()` just above) had already set.
     if let Ok(spec) = std::env::var("REDFOG_DEBUG_GST_DEBUG") {
-        gstreamer::debug_set_threshold_from_string(&spec, true);
+        if !spec.is_empty() {
+            gstreamer::debug_set_threshold_from_string(&spec, true);
+        }
     }
 
     let _headless_runtime = redfog_core::HeadlessRuntime::start(redfog_core::default_runtime_dir())
