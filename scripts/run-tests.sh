@@ -35,6 +35,22 @@ cargo build --workspace
 
 FAILED=0
 
+# Each spawn in connection_integration.rs (ServerProcess/BrokerProcess, plus
+# redfog-broker's own REDFOG_BROKER_FAKE_SPAWN kwin_wayland child) registers
+# PR_SET_PDEATHSIG(SIGKILL) on itself, so the kernel kills the whole tree the
+# moment its direct parent dies -- for any reason, not just a clean unwind
+# (Drop only fires on that). That covers a hang followed by an external
+# kill -9 on this script, Ctrl-C, or a genuine crash, without needing a
+# wrapping systemd scope (which this script previously used here, and which
+# doesn't work without a working `systemd --user` instance -- not available
+# without either an active logind session or `loginctl enable-linger`,
+# neither of which this should require just to run tests). See
+# connection_integration.rs's `die_with_parent` for the actual mechanism.
+#
+# One test (`log_out_actually_kills_the_real_compositor_process`) still uses
+# a real `systemd-run --user --scope` itself (that's what it's testing) --
+# it bootstraps and skips itself gracefully via
+# `ensure_user_systemd_for_fake_pam_spawn`, independent of this script.
 run_suite() {
     local name="$1"
     shift

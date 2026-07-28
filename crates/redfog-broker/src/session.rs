@@ -22,6 +22,35 @@ use tokio::process::Child;
 
 const UNIT_DIR: &str = "/run/systemd/system";
 
+/// Registers `PR_SET_PDEATHSIG(SIGKILL)` on the about-to-exec child so the
+/// kernel kills it the moment this broker process dies for any reason (not
+/// just a clean shutdown that gets to call `terminate()`) — closes the same
+/// class of leaked-`kwin_wayland`-after-the-broker-died gap that integration
+/// tests hit when the test binary itself gets killed externally. Only
+/// covers a direct child of *this* process; `spawn_fake`'s `kwin_wayland` is
+/// exactly that, but the `Scoped` variants' `dbus-run-session` -> forked
+/// `kwin_wayland` hop isn't (`dbus-run-session` doesn't propagate this to
+/// its own children) — that class is already handled by `terminate()`'s
+/// scope-kill instead.
+fn die_with_parent(cmd: &mut tokio::process::Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            let parent_before = libc::getppid();
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Close the race where the parent already exited between
+            // fork() and this prctl() call — we'd already be reparented
+            // and would never receive the signal for a parent that's
+            // already gone.
+            if libc::getppid() != parent_before {
+                libc::raise(libc::SIGKILL);
+            }
+            Ok(())
+        });
+    }
+}
+
 enum ActiveSession {
     /// Persistent, templated `.socket`/`.service` unit files — see
     /// `spawn_via_systemd`.
@@ -187,23 +216,21 @@ impl SessionManager {
                 }
             }
         }
-        let child = cmd
-            // Deliberately *not* its own process group, unlike
-            // `spawn_via_pam`/`spawn_payload`: this is the test-only,
-            // sudo-free path, and the integration test's own `BrokerProcess`
-            // Drop impl kills its whole tree (broker -> this direct child)
-            // by the *broker's* process group — giving this child its own
-            // group would silently escape that sweep (confirmed: doing this
-            // once left real, orphaned `kwin_wayland`/`redfog-test-ux` pairs
-            // running after a test run finished). `terminate()`'s own
-            // `DirectChild` case still works fine with a plain single-PID
-            // `child.kill()` regardless, since this path has no
-            // `dbus-run-session`-style wrapper forking a separate child in
-            // the first place.
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("failed to spawn {kwin_path}: {e}"))?;
+        // Deliberately *not* its own process group, unlike
+        // `spawn_via_pam`/`spawn_payload`: this is the test-only,
+        // sudo-free path, and the integration test's own `BrokerProcess`
+        // Drop impl kills its whole tree (broker -> this direct child)
+        // by the *broker's* process group — giving this child its own
+        // group would silently escape that sweep (confirmed: doing this
+        // once left real, orphaned `kwin_wayland`/`redfog-test-ux` pairs
+        // running after a test run finished). `terminate()`'s own
+        // `DirectChild` case still works fine with a plain single-PID
+        // `child.kill()` regardless, since this path has no
+        // `dbus-run-session`-style wrapper forking a separate child in
+        // the first place.
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        die_with_parent(&mut cmd);
+        let child = cmd.spawn().map_err(|e| format!("failed to spawn {kwin_path}: {e}"))?;
 
         let socket_path_buf = PathBuf::from(&wayland_socket_path);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);

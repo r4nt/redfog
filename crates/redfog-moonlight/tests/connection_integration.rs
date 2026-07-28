@@ -67,6 +67,99 @@ fn pick_free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+/// Registers `PR_SET_PDEATHSIG(SIGKILL)` in the about-to-exec child so the
+/// kernel kills it the moment *this* process (its direct parent — the test
+/// binary itself) dies for any reason, not just on a clean unwind: a hang
+/// followed by an external `kill -9`, a genuine crash, or `SIGKILL` on this
+/// test process never runs `ServerProcess`/`BrokerProcess`'s Drop impls (Drop
+/// only fires on unwind), which is how these tests have leaked kwin_wayland/
+/// pipewire/redfog-broker instances in the background before. Only closes
+/// this one parent->child hop — see `redfog-broker`'s own use of this same
+/// mechanism on its direct `kwin_wayland` child in `SessionManager::
+/// spawn_fake` for the next hop down.
+fn die_with_parent(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            let parent_before = libc::getppid();
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Close the race where the parent already exited between
+            // fork() and this prctl() call: we'd have already been
+            // reparented (to the nearest subreaper, usually PID 1) and
+            // would never receive the signal for a parent that's already
+            // gone.
+            if libc::getppid() != parent_before {
+                libc::raise(libc::SIGKILL);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Bootstraps a working `systemd --user` instance for `SessionManager::
+/// spawn_fake_pam`'s `systemd-run --user --scope` call, without requiring
+/// `loginctl enable-linger` (a persistent, reboot-surviving setting — not
+/// something to force on just to run tests) or an active logind session
+/// (this dev box's Chrome-Remote-Desktop-based login has neither). Returns
+/// `None` (callers should skip the test, not fail it) if there's no
+/// passwordless sudo available to bootstrap it — e.g. CI/Docker runners
+/// typically do have one, but that's a deployment choice, not something to
+/// assume.
+///
+/// `user@<uid>.service` is a plain template unit on the *system* systemd
+/// instance; starting it directly (root-only, but fully reversible via
+/// `systemctl stop` right after — unlike lingering, it leaves no persistent
+/// config behind) does the same cgroup-delegation/`XDG_RUNTIME_DIR` setup
+/// logind would do on a real login. `DBUS_SESSION_BUS_ADDRESS` is the one
+/// extra piece logind also sets that a bare `systemctl start` doesn't —
+/// confirmed live: `systemd-run --user --scope` fails with "Process
+/// org.freedesktop.systemd1 exited with status 1" without it, even once the
+/// bus socket already exists at `$XDG_RUNTIME_DIR/bus`.
+fn ensure_user_systemd_for_fake_pam_spawn() -> Option<Vec<(String, String)>> {
+    let uid = nix::unistd::Uid::current().as_raw();
+    let runtime_dir = format!("/run/user/{uid}");
+    let bus_address = format!("unix:path={runtime_dir}/bus");
+    let env = vec![("XDG_RUNTIME_DIR".to_string(), runtime_dir.clone()), ("DBUS_SESSION_BUS_ADDRESS".to_string(), bus_address.clone())];
+
+    // Already working (real login, or lingering already on) — don't touch
+    // anything.
+    let already_working = Command::new("systemd-run")
+        .args(["--user", "--scope", "--collect", "--quiet", "--unit=redfog-it-user-systemd-probe", "--", "true"])
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus_address)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if already_working {
+        return Some(env);
+    }
+
+    let unit = format!("user@{uid}.service");
+    let started = Command::new("sudo").args(["-n", "systemctl", "start", &unit]).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+    if !started {
+        eprintln!(
+            "SKIP: no passwordless sudo to start {unit} — this test needs a working `systemd --user` \
+             instance (see `ensure_user_systemd_for_fake_pam_spawn`'s doc comment for why plain lingering \
+             isn't required, but *some* form of root access to bootstrap it still is)"
+        );
+        return None;
+    }
+
+    let bus_path = PathBuf::from(format!("{runtime_dir}/bus"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !bus_path.exists() {
+        if std::time::Instant::now() > deadline {
+            eprintln!("SKIP: {unit} started but {runtime_dir}/bus never appeared");
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Some(env)
+}
+
 fn workspace_binary(name: &str) -> PathBuf {
     // CARGO_MANIFEST_DIR is crates/redfog-moonlight; the workspace target
     // dir is two levels up. Neither redfog-server nor redfog-test-ux can be
@@ -271,6 +364,7 @@ impl TestServer {
             // Own process group so BrokerProcess's Drop can kill the whole
             // tree (broker -> fake-spawned kwin_wayland) with one signal.
             .process_group(0);
+        die_with_parent(&mut broker_cmd);
         // Wrapped in its Drop-safe struct immediately — a bare `Child`'s
         // Drop impl does NOT kill the process, so if anything below this
         // point panics before `TestServer` itself is constructed, an
@@ -331,6 +425,7 @@ impl TestServer {
             // sudo), so it's cleaned up by BrokerProcess's Drop, not this
             // process group.
             .process_group(0);
+        die_with_parent(&mut cmd);
 
         // Wrapped immediately, same reasoning as `broker` above.
         let mut process = ServerProcess { child: cmd.spawn().expect("spawn redfog-server"), runtime_dir };
@@ -1829,11 +1924,16 @@ fn find_broker_grandchild_kwin_wayland_pid(broker_pid: u32) -> Option<u32> {
 /// needed, unlike `real_pam_spawn_login_after_log_out_recovers_from_a_resume_hang`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_out_actually_kills_the_real_compositor_process() {
+    let Some(user_systemd_env) = ensure_user_systemd_for_fake_pam_spawn() else {
+        return;
+    };
     tokio::time::timeout(Duration::from_secs(60), async {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
-        let server = TestServer::spawn_with_broker_env(vec![("REDFOG_BROKER_FAKE_PAM_SPAWN".to_string(), "1".to_string())]);
+        let mut broker_env = vec![("REDFOG_BROKER_FAKE_PAM_SPAWN".to_string(), "1".to_string())];
+        broker_env.extend(user_systemd_env);
+        let server = TestServer::spawn_with_broker_env(broker_env);
         let broker_pid = server._broker.child.id();
 
         let client_identity = ServerIdentity::generate().expect("generate client identity");
@@ -2259,6 +2359,7 @@ impl GstTestServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
+        die_with_parent(&mut cmd);
 
         let mut process = ServerProcess { child: cmd.spawn().expect("spawn redfog-server"), runtime_dir };
 
