@@ -22,6 +22,20 @@ const BITRATE_KBPS: u32 = 5_000;
 async fn cuda_direct_nvenc_encode_glxgears_test() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
+    // `CudaDirectEncoderSession::spawn` isolates setup failures to its own
+    // background thread rather than surfacing a `Result` here (see its own
+    // doc comment), so a missing GPU wouldn't fail fast — it'd instead show
+    // up as a confusing "no encoded access unit received within 2s" panic
+    // below, after already paying for a real KWin/glxgears spawn. Check for
+    // a CUDA-capable GPU directly first, matching
+    // `nvenc_two_sessions_same_process.rs`'s equivalent guard — this crate's
+    // tests otherwise can't run at all on hardware/CI without an NVIDIA GPU
+    // (e.g. GH Actions' hosted runners).
+    if cudarc016::driver::CudaContext::new(0).is_err() {
+        eprintln!("no CUDA-capable GPU available — skipping cuda_direct_nvenc_encode_glxgears_test");
+        return;
+    }
+
     let runtime_dir = std::env::temp_dir().join(format!("redfog-it-cuda-nvenc-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::env::set_var("REDFOG_RUNTIME_DIR", &runtime_dir);

@@ -761,45 +761,37 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
             )
         }
         // No CPU `videoconvert` here — `nvh264enc`'s sink pad accepts a wide
-        // format list directly (confirmed via `gst-inspect-1.0 nvh264enc`).
-        // `glupload`/`glcolorconvert`/DMA-BUF instead: KWin's virtual output
-        // is confirmed live (`nvidia-smi --query-compute-apps` showing a
-        // real C+G GPU context on `kwin_wayland --virtual`, at only ~8% CPU
-        // compositing a continuously-damaged 1920x1080@120Hz scene — far too
-        // cheap for software rasterization) to be genuinely GPU-composited
-        // (an earlier assumption that it wasn't, based on
-        // `LIBGL_ALWAYS_SOFTWARE=1` being set on every `kwin_wayland` spawn,
-        // was wrong: that's a Mesa-only knob NVIDIA's driver doesn't read).
-        // If `pipewiresrc` offers `memory:DMABuf` for this node, `glupload`
-        // imports it directly into a GL texture (EGLImage import, no CPU
-        // pixel touch at all); `nvh264enc` consumes it via CUDA-GL interop.
-        // `glcolorconvert` is a cheap GPU-side no-op unless a format
-        // mismatch needs fixing. Needs `GST_GL_WINDOW=surfaceless`/
-        // `GST_GL_PLATFORM=egl` set on the process (see `redfog-server::
-        // main`) since this process has no real display for GL context
-        // auto-detection to find.
+        // format list directly (confirmed via `gst-inspect-1.0 nvh264enc`),
+        // doing its own upload/colorspace handling on the GPU. Measured live
+        // (see TODO.md's "CPU usage during high-fps/high-bitrate NVENC
+        // streaming" entry): dropping the forced-BGRx `videoconvert` this
+        // arm used to have took CPU from ~15% to ~10% of a core at
+        // 1920x1080@120fps: real GPU compositing was confirmed live (KWin's
+        // virtual output genuinely GPU-composites — `LIBGL_ALWAYS_SOFTWARE`
+        // is a Mesa-only knob NVIDIA's driver doesn't read, despite being set
+        // unconditionally as a workaround for an unrelated NVIDIA/GBM
+        // segfault), which raised the question of going further: a
+        // `glupload`/`glcolorconvert` DMA-BUF import chain here, so
+        // `nvh264enc` gets zero-copy GPU-resident frames instead of a
+        // CPU-driven host-to-device staging copy. That was tried and
+        // abandoned in favor of `VideoEncoder::NvencDirect`
+        // (`CudaDirectEncoderSession`, DMA-BUF -> CUDA -> NVENC, bypassing
+        // GStreamer for the encode leg entirely) as the real fix for
+        // genuine zero-copy — this arm stays at its simpler, already-cheap
+        // form rather than carrying that complexity for a path `NvencDirect`
+        // now supersedes whenever it's available.
         //
-        // `videorate` is load-bearing, not optional: tried putting the fixed
-        // `framerate={fps}/1` request directly on `pipewiresrc`'s own output
-        // instead (`pipewiresrc` has no dedicated fps *property* — confirmed
-        // via `gst-inspect-1.0 pipewiresrc` — so this meant relying entirely
-        // on GStreamer's pipewire plugin translating that caps request into
-        // the SPA stream-format parameters it negotiates with the actual
-        // PipeWire graph, hoping KWin's screencast producer could satisfy an
-        // exact fixed rate directly, since its virtual output's own refresh
-        // rate is already configured to this same `fps`). Confirmed live
-        // that it can't: negotiation failed outright ("no more input
-        // formats" / `not-negotiated` on `pipewiresrc` itself) — KWin's
-        // screencast stream is fundamentally *variable*-rate, matching its
-        // damage-driven rendering model (a configured refresh rate is a
-        // ceiling on how often it *can* repaint when there's damage, not a
-        // promise to always produce a frame every interval). `videorate`
-        // downstream is what actually bridges that variable input into the
-        // fixed rate `rc-mode=cbr` needs — there's no way to make the
-        // source itself produce a genuinely fixed rate here.
-        // ! queue leaky=downstream max-size-buffers=3 max-size-bytes=0 max-size-time=0 \
-         //        ! videorate name=videorate skip-to-first=true \
-         //        ! video/x-raw(memory:DMABuf),framerate={fps}/1 \
+        // Unlike the `Software` arm above, no `videorate` here: KWin's
+        // screencast stream is fundamentally variable-rate (damage-driven
+        // rendering — a configured refresh rate is a ceiling on how often it
+        // *can* repaint, not a promise of a frame every interval; confirmed
+        // live that requesting a fixed rate straight from `pipewiresrc`
+        // itself fails to negotiate, since it has no dedicated fps property
+        // and relies entirely on the pipewire plugin's own SPA negotiation).
+        // `rc-mode=cbr` below still wants a fixed input rate in principle,
+        // same as the `Software` arm's `videorate` bridges — this arm just
+        // doesn't currently have that bridge; not revisited since this path
+        // is superseded by `NvencDirect` whenever that's available.
         (VideoSource::PipeWireNode(node_id), VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps }) => {
             format!(
                  "pipewiresrc name=pipewiresrc path={node_id} client-name=\"{client_name}\" \
@@ -1560,18 +1552,20 @@ mod tests {
         assert!(!login.contains("videorate"), "pipeline description: {login}");
     }
 
-    /// Neither `VideoSource::GstWaylandDisplay` nor `VideoSource::Login` can
-    /// ever satisfy a `memory:DMABuf` caps request (see `video_pipeline_
-    /// description`'s doc comment). Confirmed live for Login specifically:
-    /// requesting it unconditionally (back when Login and the PipeWire case
-    /// shared one downstream-description function) broke the Login stage
-    /// outright (`not-negotiated` on `GstAppSrc:login-appsrc`) before the
-    /// pipeline ever got as far as the real PipeWire capture this was meant
-    /// to test — exactly the kind of mistake having every combination
-    /// spelled out explicitly, in one match, should make structurally
-    /// harder to make again.
+    /// No current combination requests `memory:DMABuf`/`glupload` — the
+    /// `PipeWireNode`+`Nvenc` arm used to be the one exception (a genuine
+    /// zero-copy GL-import path), but that was tried and abandoned in favor
+    /// of `VideoEncoder::NvencDirect` for real zero-copy instead (see
+    /// `video_pipeline_description`'s doc comment on that arm). Kept as a
+    /// structural check, not just for those two: confirmed live that
+    /// requesting DMABuf unconditionally for `Login` specifically (back when
+    /// Login and the PipeWire case shared one downstream-description
+    /// function) broke the Login stage outright (`not-negotiated` on
+    /// `GstAppSrc:login-appsrc`) — exactly the kind of mistake having every
+    /// combination spelled out explicitly, in one match, should make
+    /// structurally harder to make again.
     #[test]
-    fn only_the_pipewire_pipeline_requests_dmabuf() {
+    fn no_video_pipeline_currently_requests_dmabuf() {
         let (login_tx, login_rx) = std::sync::mpsc::channel();
         drop(login_tx);
         let login = video_pipeline_description(
@@ -1598,8 +1592,8 @@ mod tests {
             120,
             &VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps: 10_000 },
         );
-        assert!(pipewire.contains("DMABuf"), "PipeWire pipeline description: {pipewire}");
-        assert!(pipewire.contains("glupload"), "PipeWire pipeline description: {pipewire}");
+        assert!(!pipewire.contains("DMABuf"), "PipeWire pipeline description: {pipewire}");
+        assert!(!pipewire.contains("glupload"), "PipeWire pipeline description: {pipewire}");
     }
 
     /// Real `gst::parse_launch` syntax/structure check for the `Software`

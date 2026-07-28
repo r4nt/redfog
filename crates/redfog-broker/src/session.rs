@@ -39,6 +39,24 @@ fn die_with_parent(cmd: &mut tokio::process::Command) {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // Read back what the kernel actually recorded, not just
+            // trusting a zero return code — confirmed live that this can
+            // silently not stick in at least one real environment (still
+            // being root-caused), which a bare return-code check can't
+            // detect: the call "succeeds" but the child never actually
+            // dies with its parent. Failing the spawn outright here is far
+            // better than silently proceeding with a protection that isn't
+            // actually in effect.
+            let mut got_sig: libc::c_int = -1;
+            if libc::prctl(libc::PR_GET_PDEATHSIG, &mut got_sig as *mut libc::c_int) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if got_sig != libc::SIGKILL {
+                return Err(std::io::Error::other(format!(
+                    "PR_SET_PDEATHSIG(SIGKILL) reported success but PR_GET_PDEATHSIG reads back {got_sig} instead of {}",
+                    libc::SIGKILL
+                )));
+            }
             // Close the race where the parent already exited between
             // fork() and this prctl() call — we'd already be reparented
             // and would never receive the signal for a parent that's
@@ -48,6 +66,95 @@ fn die_with_parent(cmd: &mut tokio::process::Command) {
             }
             Ok(())
         });
+    }
+}
+
+#[cfg(test)]
+mod die_with_parent_tests {
+    use super::die_with_parent;
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    /// A dead-but-unreaped zombie is still "gone" for our purposes here — see
+    /// `child_dies_when_its_direct_parent_dies`'s comment on why bare
+    /// existence/`comm` checks aren't enough.
+    fn process_is_alive(pid: i32) -> bool {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return false;
+        };
+        !status.lines().any(|l| l.trim_start().starts_with("State:") && l.contains('Z'))
+    }
+
+    /// Not a real test on its own — re-exec'd by
+    /// `child_dies_when_its_direct_parent_dies` as a throwaway "middle"
+    /// process (a real subprocess, not just a function call in the same
+    /// process, since `die_with_parent`'s whole point only shows up across
+    /// an actual parent/child boundary). Spawns a grandchild with
+    /// `die_with_parent`, prints its pid, then sleeps until killed — the
+    /// outer test SIGKILLs *this* process and checks whether the
+    /// grandchild died too.
+    #[tokio::test]
+    async fn pdeathsig_helper_middle_process() {
+        if std::env::var_os("REDFOG_PDEATHSIG_TEST_HELPER").is_none() {
+            return;
+        }
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("100").stdout(Stdio::null()).stderr(Stdio::null());
+        die_with_parent(&mut cmd);
+        let child = cmd.spawn().expect("spawn grandchild");
+        println!("GRANDCHILD_PID={}", child.id().expect("child has a pid right after spawn"));
+        use std::io::Write;
+        std::io::stdout().flush().unwrap();
+        tokio::time::sleep(Duration::from_secs(100)).await;
+    }
+
+    #[test]
+    fn child_dies_when_its_direct_parent_dies() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut middle = std::process::Command::new(&exe)
+            .args(["--exact", "session::die_with_parent_tests::pdeathsig_helper_middle_process", "--nocapture"])
+            .env("REDFOG_PDEATHSIG_TEST_HELPER", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn middle helper process");
+
+        let stdout = middle.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).expect("read helper output");
+            assert!(n > 0, "middle process exited before printing GRANDCHILD_PID");
+            if let Some(pid) = line.trim().strip_prefix("GRANDCHILD_PID=") {
+                let grandchild_pid: i32 = pid.parse().expect("parse grandchild pid");
+
+                // SIGKILL, not a graceful stop — simulates the exact
+                // scenario die_with_parent exists for: the parent dying
+                // with no chance to run any cleanup of its own.
+                unsafe { libc::kill(middle.id() as i32, libc::SIGKILL) };
+                middle.wait().expect("wait for middle process");
+
+                // Neither bare `/proc/{pid}` existence nor `/proc/{pid}/comm`
+                // is enough to prove the grandchild is genuinely still
+                // running — confirmed live (via `act`'s own container, a bare
+                // `tail -f /dev/null` as PID 1): PDEATHSIG does fire
+                // correctly, the grandchild does die, but once reparented to
+                // a PID 1 that never calls wait() on orphans it sits forever
+                // as a zombie — still present in /proc, `comm` still reading
+                // "sleep", despite already being dead. A zombie's `State:` in
+                // /proc/{pid}/status is `Z`; treat that the same as gone.
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if !process_is_alive(grandchild_pid) {
+                        return;
+                    }
+                    assert!(Instant::now() < deadline, "grandchild pid {grandchild_pid} is still alive 30s after its parent was SIGKILLed");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
     }
 }
 

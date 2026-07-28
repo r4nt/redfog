@@ -19,20 +19,61 @@ jobs:
         # rather than inheriting it silently (see project memory: some
         # invocation paths don't have it at all) — `env:` above can't run
         # a shell command, so compute it here instead of hardcoding a UID.
-        run: echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+        # Nothing else creates this directory in a bare container running
+        # natively as root (no logind/systemd session ever runs here) —
+        # confirmed live: PipeWire/D-Bus/etc. all failed outright with
+        # "XDG_RUNTIME_DIR ... not available" until this `mkdir` was added.
+        run: |
+          RUNTIME_DIR="/run/user/$(id -u)"
+          mkdir -p "$RUNTIME_DIR"
+          chmod 700 "$RUNTIME_DIR"
+          echo "XDG_RUNTIME_DIR=$RUNTIME_DIR" >> "$GITHUB_ENV"
+          # Same story: KWin's `--xwayland` needs this to establish its X11
+          # socket — normally created by X11/display-manager package
+          # infrastructure, which a bare container never runs. Confirmed
+          # live: "kwin_xwl: /tmp/.X11-unix does not exist" / "Failed to
+          # establish X11 socket" without this. 1777 matches the real X11
+          # convention (world-writable, sticky bit) for this directory.
+          mkdir -p /tmp/.X11-unix
+          chmod 1777 /tmp/.X11-unix
+
+      - name: Install NVIDIA encode/decode userspace libraries (link-time only, no GPU needed)
+        # redfog-core -> kwin-capture -> nvidia-video-codec-sdk's build.rs
+        # hard-panics unless it can find libnvidia-encode.so/libnvcuvid.so
+        # (this broke the workspace build here for several commits,
+        # unnoticed, before this was added). Those two files are shipped as
+        # userspace-only components of Ubuntu's NVIDIA driver packaging —
+        # separate from the kernel module — so apt can install them with no
+        # physical GPU present at all; confirmed live (via `act` + this same
+        # container image) that this lets the whole workspace build and link
+        # successfully, and that both files land at
+        # /usr/lib/x86_64-linux-gnu/, a path nvidia-video-codec-sdk's build.rs
+        # already searches by default (no env var needed). They'll never
+        # actually *work* here (no real GPU) — that's fine, kwin-capture's own
+        # GPU-dependent tests are excluded from the test run below; this step
+        # exists purely so everything else can build against the real code,
+        # no feature-flag workarounds needed. Version-numbered package names
+        # (e.g. libnvidia-encode-610) change over time as Ubuntu rolls driver
+        # branches forward, so discover the current one instead of pinning it.
+        run: |
+          sudo apt-get update
+          ENCODE_PKG=$(apt-cache search '^libnvidia-encode-[0-9]+$' | awk '{print $1}' | sort -t- -k4 -n | tail -1)
+          DECODE_PKG=$(apt-cache search '^libnvidia-decode-[0-9]+$' | awk '{print $1}' | sort -t- -k4 -n | tail -1)
+          echo "Installing $ENCODE_PKG $DECODE_PKG"
+          sudo apt-get install -y --no-install-recommends "$ENCODE_PKG" "$DECODE_PKG"
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config cmake clang libclang-dev \
-            libwayland-dev wayland-protocols libxkbcommon-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libxkbcommon-x11-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
             gstreamer1.0-libav gstreamer1.0-pipewire \
-            libpipewire-0.3-dev pipewire wireplumber \
+            libpipewire-0.3-dev pipewire pipewire-pulse wireplumber \
             libpam0g-dev libdbus-1-dev dbus-user-session \
-            libssl-dev
+            libssl-dev libvulkan-dev libsdl2-dev
           # Best-effort: the isolated KWin resume tests
           # (redfog-core/tests/pause_resume.rs) skip themselves with a
           # clear message rather than failing if kwin_wayland isn't
@@ -42,20 +83,77 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Fetch patched vendor dependencies
         run: bash scripts/fetch-patched-deps.sh
 
-      - name: Build workspace
-        run: cargo build --workspace
+      - name: Check that kwin-capture (incl. its GPU-only tests) at least builds
+        # Actually *running* these needs a real NVIDIA GPU (see
+        # scripts/run-gpu-tests.sh, meant for local hardware) — this job has
+        # none — but there's no reason not to at least verify the code
+        # compiles and links here too, now that the NVENC libraries above
+        # make that possible.
+        run: cargo test -p kwin-capture --no-run
 
+      - name: Build workspace binaries under coverage instrumentation
+        # Deliberately *not* `cargo llvm-cov --workspace` here — confirmed
+        # live that subcommand's own separate `target/llvm-cov-target`
+        # build only produces test-harness binaries for bin-only crates
+        # with no `#[test]`s of their own (redfog-server, redfog-test-ux,
+        # ...), never their plain runnable executable — which
+        # connection_integration.rs's `workspace_binary()` needs to actually
+        # spawn them as subprocesses, since neither can be a dev-dependency
+        # of redfog-moonlight (redfog-server depends on redfog-moonlight
+        # itself). `cargo llvm-cov show-env` sets up the exact same
+        # instrumentation (RUSTC_WRAPPER, LLVM_PROFILE_FILE, ...) for a
+        # *plain* `cargo build`/`cargo test` instead, which does produce
+        # normal binaries in the normal `target/debug/` — the extra build
+        # step here is what's needed to actually get them built (`cargo
+        # test` alone won't build a bin crate's plain binary target).
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo build --workspace --exclude kwin-capture
 
-      - name: redfog-moonlight connection_integration tests
-        # gst_wayland_display_backend_smoke_test is excluded: it requires
-        # REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR pointed at a separately
-        # built gst-wayland-display plugin (see scripts/run-gst-viewer.sh)
-        # that this job doesn't build — not part of the default local
-        # `scripts/run-tests.sh` run either, for the same reason.
-        run: cargo test -p redfog-moonlight --test connection_integration -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test
+      - name: Run tests with coverage
+        # kwin-capture is excluded from both the test run and the coverage
+        # report: its whole test suite needs a real NVIDIA GPU to actually
+        # execute (the step above only proves it builds). Run everything
+        # else workspace-wide, including crates that never got exercised in
+        # CI before this (e.g. redfog-broker's own unit tests).
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo test --workspace --exclude kwin-capture -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test
+
+      - name: Coverage summary
+        # `cargo llvm-cov report` needs the same show-env vars as the build/
+        # test steps above to find the *.profraw files -- without it, it
+        # defaults to looking under its own separate target/llvm-cov-target,
+        # not the plain target/ dir those steps actually wrote to (confirmed
+        # live: "not found *.profraw files in .../target/llvm-cov-target").
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          {
+            echo '## Coverage summary'
+            echo '(excludes kwin-capture — see "kwin-capture ... at least builds" above; run scripts/run-gpu-tests.sh locally on real GPU hardware for that crate)'
+            echo '```'
+            cargo llvm-cov report
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate HTML coverage report
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov report --html --output-dir target/llvm-cov-html
+
+      - name: Upload coverage HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: target/llvm-cov-html/html

@@ -84,6 +84,24 @@ fn die_with_parent(cmd: &mut Command) {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // Read back what the kernel actually recorded, not just
+            // trusting a zero return code — confirmed live that this can
+            // silently not stick in at least one real environment (still
+            // being root-caused), which a bare return-code check can't
+            // detect: the call "succeeds" but the child never actually
+            // dies with its parent. Failing the spawn outright here is far
+            // better than silently proceeding with a protection that isn't
+            // actually in effect.
+            let mut got_sig: libc::c_int = -1;
+            if libc::prctl(libc::PR_GET_PDEATHSIG, &mut got_sig as *mut libc::c_int) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if got_sig != libc::SIGKILL {
+                return Err(std::io::Error::other(format!(
+                    "PR_SET_PDEATHSIG(SIGKILL) reported success but PR_GET_PDEATHSIG reads back {got_sig} instead of {}",
+                    libc::SIGKILL
+                )));
+            }
             // Close the race where the parent already exited between
             // fork() and this prctl() call: we'd have already been
             // reparented (to the nearest subreaper, usually PID 1) and
@@ -94,6 +112,91 @@ fn die_with_parent(cmd: &mut Command) {
             }
             Ok(())
         });
+    }
+}
+
+/// A dead-but-unreaped zombie is still "gone" for our purposes here — see
+/// `direct_child_dies_when_its_direct_parent_dies`'s comment on why bare
+/// existence/`comm` checks aren't enough.
+fn process_is_alive(pid: i32) -> bool {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    !status.lines().any(|l| l.trim_start().starts_with("State:") && l.contains('Z'))
+}
+
+/// Not a real test on its own — re-exec'd by
+/// `direct_child_dies_when_its_direct_parent_dies` as a throwaway "middle"
+/// process (a real subprocess, not just a function call, since
+/// `die_with_parent`'s whole point only shows up across an actual
+/// parent/child boundary). Spawns a grandchild with `die_with_parent`,
+/// prints its pid, then sleeps until killed — the outer test SIGKILLs
+/// *this* process and checks whether the grandchild died too.
+#[test]
+fn pdeathsig_helper_middle_process() {
+    if std::env::var_os("REDFOG_PDEATHSIG_TEST_HELPER").is_none() {
+        return;
+    }
+    let mut cmd = Command::new("sleep");
+    cmd.arg("100").stdout(Stdio::null()).stderr(Stdio::null());
+    die_with_parent(&mut cmd);
+    let child = cmd.spawn().expect("spawn grandchild");
+    println!("GRANDCHILD_PID={}", child.id());
+    use std::io::Write;
+    std::io::stdout().flush().unwrap();
+    std::thread::sleep(Duration::from_secs(100));
+}
+
+/// Verifies the actual mechanism `die_with_parent` relies on — not just
+/// that it compiles, but that a child registered with it genuinely dies the
+/// moment its direct parent is killed, including a hard `SIGKILL` that
+/// gives the parent no chance to run any cleanup of its own. This is the
+/// property the whole leaked-process fix depends on; the rest of the test
+/// suite only demonstrates the *absence* of leaks, which is a much weaker
+/// signal (could just as easily mean the mechanism silently isn't firing at
+/// all and everything happens to exit cleanly anyway).
+#[test]
+fn direct_child_dies_when_its_direct_parent_dies() {
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut middle = Command::new(&exe)
+        .args(["--exact", "pdeathsig_helper_middle_process", "--nocapture"])
+        .env("REDFOG_PDEATHSIG_TEST_HELPER", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn middle helper process");
+
+    let stdout = middle.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).expect("read helper output");
+        assert!(n > 0, "middle process exited before printing GRANDCHILD_PID");
+        if let Some(pid) = line.trim().strip_prefix("GRANDCHILD_PID=") {
+            let grandchild_pid: i32 = pid.parse().expect("parse grandchild pid");
+
+            unsafe { libc::kill(middle.id() as i32, libc::SIGKILL) };
+            middle.wait().expect("wait for middle process");
+
+            // Neither bare `/proc/{pid}` existence nor `/proc/{pid}/comm` is
+            // enough to prove the grandchild is genuinely still running —
+            // confirmed live (via `act`'s own container, a bare
+            // `tail -f /dev/null` as PID 1): PDEATHSIG does fire correctly,
+            // the grandchild does die, but once reparented to a PID 1 that
+            // never calls wait() on orphans it sits forever as a zombie —
+            // still present in /proc, `comm` still reading "sleep", despite
+            // already being dead. A zombie's `State:` in /proc/{pid}/status
+            // is `Z`; treat that the same as gone.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if !process_is_alive(grandchild_pid) {
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "grandchild pid {grandchild_pid} is still alive 30s after its parent was SIGKILLed");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 
@@ -166,9 +269,29 @@ fn workspace_binary(name: &str) -> PathBuf {
     // a dev-dependency of this crate (redfog-server depends on
     // redfog-moonlight itself), so there's no CARGO_BIN_EXE_* env var for
     // them — locate the binaries directly instead.
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/debug/{name}"));
-    assert!(path.exists(), "{name} binary not found at {path:?} — run `cargo build --workspace` first");
-    path
+    //
+    // Not just a bare `target/debug/{name}` — confirmed live that
+    // `cargo llvm-cov` builds into `target/llvm-cov-target/debug/` instead
+    // (its own separate, instrumented target dir), which a hardcoded
+    // `target/debug` path silently can't find, failing every test that
+    // needs a workspace binary. Check `CARGO_TARGET_DIR` first in case
+    // that's been set explicitly, then both known layouts.
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let candidates = [
+        std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
+        Some(workspace_root.join("target")),
+        Some(workspace_root.join("target/llvm-cov-target")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        let path = candidate.join("debug").join(name);
+        if path.exists() {
+            return path;
+        }
+    }
+    panic!(
+        "{name} binary not found under target/debug or target/llvm-cov-target/debug (relative to \
+         {workspace_root:?}) — run `cargo build --workspace` (or `cargo llvm-cov --workspace --no-report`) first"
+    );
 }
 
 /// Kills the whole process group on drop (the child is spawned as its own
@@ -236,15 +359,18 @@ impl Drop for BrokerProcess {
 /// `$SUDO_USER` (the invoking non-root user), not root itself — real
 /// desktop sessions/PipeWire/D-Bus generally don't tolerate running as root.
 fn broker_spawn_mode_env() -> Vec<(String, String)> {
-    if nix::unistd::Uid::effective().is_root() {
-        let target_user = std::env::var("SUDO_USER").expect(
-            "running as root but $SUDO_USER isn't set — invoke via `sudo -E cargo test ...` as your normal user, not a raw root \
-             login, so the broker knows which non-root user to spawn the session as",
-        );
-        println!("running as root (sudo) — exercising the REAL systemd/cross-user path, spawning as {target_user}");
-        vec![("REDFOG_BROKER_FORCE_SPAWN_USER".to_string(), target_user)]
-    } else {
-        vec![("REDFOG_BROKER_FAKE_SPAWN".to_string(), "1".to_string())]
+    // `$SUDO_USER`'s presence, not bare root status, is what actually means
+    // "deliberately invoked via `sudo -E cargo test ...` to exercise the
+    // real systemd/cross-user path" (see scripts/sudo-test-runner.sh).
+    // Confirmed live: CI/Docker containers commonly run natively as root
+    // with no `sudo` involved at all and no SUDO_USER set — treating bare
+    // root as that signal made every test needing this path panic in CI.
+    match std::env::var("SUDO_USER") {
+        Ok(target_user) => {
+            println!("SUDO_USER set — exercising the REAL systemd/cross-user path, spawning as {target_user}");
+            vec![("REDFOG_BROKER_FORCE_SPAWN_USER".to_string(), target_user)]
+        }
+        Err(_) => vec![("REDFOG_BROKER_FAKE_SPAWN".to_string(), "1".to_string())],
     }
 }
 
@@ -319,7 +445,7 @@ impl TestServer {
         // reconnects) into the same buffer. Not needed under
         // REDFOG_BROKER_FAKE_SPAWN (the non-root path), which inherits
         // redfog-broker's own piped stdout instead, already captured below.
-        let journal = if nix::unistd::Uid::effective().is_root() {
+        let journal = if std::env::var_os("SUDO_USER").is_some() {
             let mut journal_cmd = Command::new("journalctl");
             journal_cmd
                 .args(["--no-pager", "-f", "-n", "0", "-o", "cat", "-u", "redfog-session-*"])
@@ -501,6 +627,7 @@ impl TestServer {
         }
     }
 
+
     /// Same path `redfog-server`'s own `main.rs` derives (`REDFOG_RUNTIME_DIR`
     /// is fixed per-test, `REDFOG_LOGIN_SOCKET` itself is left unset) — see
     /// `LoginReportServer`. Lets a test speak `LoginRequest`/`LoginResponse`
@@ -667,6 +794,9 @@ async fn poll_frames_tracking_gaps(stream: &MoonlightStream, stop: impl std::fut
     (video_frames, max_gap)
 }
 
+#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
+            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
+            real desktop hardware with --include-ignored."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_client_connects_reconnects_and_sends_input() {
     // Our own rustls usage and moonlight-common's pull in different crypto
@@ -886,6 +1016,9 @@ async fn real_client_connects_reconnects_and_sends_input() {
 /// matched — not a simple key-mismatch bug), while server-side video kept
 /// encoding normally the whole time. Bounded by an overall timeout so a
 /// genuine hang fails the test cleanly instead of blocking the suite.
+#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
+            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
+            real desktop hardware with --include-ignored."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_channel_survives_resume_then_reconnect() {
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -1045,6 +1178,9 @@ async fn control_channel_survives_resume_then_reconnect() {
 /// *later* reconnect ever gets a working video stream again — repeating
 /// the check a few times with real settle time between attempts, since the
 /// live symptom was "never recovers", not "occasionally flaky".
+#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
+            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
+            real desktop hardware with --include-ignored."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn video_port_recovers_after_a_resume_hang() {
     tokio::time::timeout(Duration::from_secs(120), async {
@@ -1275,6 +1411,9 @@ async fn track_server_side_video_frame_gap_sequence(server: &TestServer, baselin
 /// something even this harness doesn't have — a long-lived `kwin_wayland`
 /// process accumulating state over real hours, not just several cycles in
 /// under a couple of minutes.
+#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
+            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
+            real desktop hardware with --include-ignored."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn video_stays_sustained_across_many_resumes_under_continuous_rendering() {
     const RESUME_CYCLES: usize = 8;
@@ -1411,6 +1550,9 @@ async fn video_stays_sustained_across_many_resumes_under_continuous_rendering() 
 /// long (90s) observation window, printing every individual gap in order
 /// so a growing/periodic pattern would actually be visible in the output,
 /// not just collapsed into a single worst-case number.
+#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
+            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
+            real desktop hardware with --include-ignored."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn video_frame_gaps_over_one_long_sustained_resumed_connection() {
     const OBSERVE_WINDOW: Duration = Duration::from_secs(90);
@@ -1546,6 +1688,9 @@ async fn video_frame_gaps_over_one_long_sustained_resumed_connection() {
 /// the Login->User handoff stays reliable) so input is the *only* damage
 /// source, matching a real desktop instead of masking the bug behind an
 /// artificial timer.
+#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
+            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
+            real desktop hardware with --include-ignored."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn video_throttles_after_resume_under_input_driven_damage() {
     const DAMAGE_WINDOW: Duration = Duration::from_secs(10);
@@ -1710,6 +1855,9 @@ async fn drive_mouse_wiggle_damage(stream: MoonlightStream) {
 /// socket — the same wire message the login screen's own "Log out" button
 /// sends — rather than driving a UI, since `redfog-test-ux`'s headless
 /// Login stand-in has no such button to click (see its own doc comment).
+#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
+            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
+            real desktop hardware with --include-ignored."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn login_after_log_out_recovers_from_a_resume_hang() {
     tokio::time::timeout(Duration::from_secs(120), async {
@@ -1922,6 +2070,10 @@ fn find_broker_grandchild_kwin_wayland_pid(broker_pid: u32) -> Option<u32> {
 /// the same process-tree shape as the real PAM-spawn path, without needing
 /// real root/PAM/setuid — so this runs under a plain `cargo test`, no sudo
 /// needed, unlike `real_pam_spawn_login_after_log_out_recovers_from_a_resume_hang`.
+#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
+            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
+            real desktop hardware with --include-ignored. (Its own ensure_user_systemd_for_fake_pam_spawn \
+            self-skip only covers the missing-sudo case, not this.)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_out_actually_kills_the_real_compositor_process() {
     let Some(user_systemd_env) = ensure_user_systemd_for_fake_pam_spawn() else {
@@ -2058,9 +2210,14 @@ async fn log_out_actually_kills_the_real_compositor_process() {
 /// the default sudo-free suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_pam_spawn_login_after_log_out_recovers_from_a_resume_hang() {
-    if !nix::unistd::Uid::effective().is_root() {
+    // `$SUDO_USER`'s presence, not bare root status, is what actually means
+    // "deliberately invoked via `sudo -E cargo test ...`" — confirmed live
+    // that CI/Docker containers commonly run natively as root with no
+    // `sudo` involved and no SUDO_USER set, which made this attempt (and
+    // fail) the real PAM path instead of skipping cleanly.
+    if std::env::var_os("SUDO_USER").is_none() {
         eprintln!(
-            "skipping real_pam_spawn_login_after_log_out_recovers_from_a_resume_hang: needs root — \
+            "skipping real_pam_spawn_login_after_log_out_recovers_from_a_resume_hang: needs SUDO_USER set — \
              run via `sudo -E cargo test -p redfog-moonlight --test connection_integration \
              real_pam_spawn_login_after_log_out_recovers_from_a_resume_hang`"
         );

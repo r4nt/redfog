@@ -22,11 +22,23 @@ const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 const DATA_LEN: usize = (WIDTH * HEIGHT * 4) as usize;
 
-fn open_session_and_encode_a_frame(label: &str) {
+/// Returns `false` (having already printed a skip message) if there's no
+/// CUDA-capable GPU on this machine, so callers can skip gracefully instead
+/// of hard-failing — this whole file otherwise can't run at all in CI/on
+/// hardware without an NVIDIA GPU (e.g. GH Actions' hosted runners), unlike
+/// the `nvh264enc`-availability check `nvenc_session_plus_gstreamer_nvh264enc`
+/// already does below.
+fn open_session_and_encode_a_frame(label: &str) -> bool {
     eprintln!("[{label}] retaining primary CUDA context for device 0...");
     // `cudarc016`, matching `nvidia-video-codec-sdk`'s own (semver-
     // incompatible) cudarc dependency — see `cuda_import.rs`'s doc comment.
-    let cuda_ctx = cudarc016::driver::CudaContext::new(0).expect("CudaContext::new(0)");
+    let cuda_ctx = match cudarc016::driver::CudaContext::new(0) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!("[{label}] no CUDA-capable GPU available ({e}) — skipping");
+            return false;
+        }
+    };
 
     eprintln!("[{label}] Encoder::initialize_with_cuda...");
     let encoder = Encoder::initialize_with_cuda(cuda_ctx).unwrap_or_else(|e| {
@@ -64,13 +76,16 @@ fn open_session_and_encode_a_frame(label: &str) {
     std::mem::forget(input_buffer);
     std::mem::forget(output_bitstream);
     std::mem::forget(session);
+    true
 }
 
 #[test]
 fn two_nvenc_sessions_same_process() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    open_session_and_encode_a_frame("session-1");
-    open_session_and_encode_a_frame("session-2");
+    if !open_session_and_encode_a_frame("session-1") {
+        return;
+    }
+    assert!(open_session_and_encode_a_frame("session-2"), "second session failed to open even though the first one succeeded");
     eprintln!("Both sessions opened and encoded successfully in the same process.");
 }
 
@@ -84,7 +99,9 @@ fn nvenc_session_plus_gstreamer_nvh264enc() {
 
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
-    open_session_and_encode_a_frame("our-own-session");
+    if !open_session_and_encode_a_frame("our-own-session") {
+        return;
+    }
     eprintln!("Our own session is open and held (leaked). Now starting a real GStreamer nvh264enc pipeline...");
 
     gstreamer::init().unwrap();
