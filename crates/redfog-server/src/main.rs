@@ -121,6 +121,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let clients = Arc::new(ClientManager::new(&state_dir, identity.cert_pem.clone(), identity.private_key_pem.clone()));
 
     let log_mouse_events = std::env::var("REDFOG_LOG_MOUSE_EVENTS").is_ok_and(|v| v != "0");
+    // Default posture: reject a second device logging in as a username
+    // that's already actively attached elsewhere, rather than silently
+    // spawning a second, independent desktop for the same account — see
+    // `SessionConfig::allow_concurrent_sessions_per_user`'s doc comment for
+    // the live bug this guards against. Opt-in to the old (looser) behavior
+    // via this var, e.g. for testing.
+    let allow_concurrent_sessions_per_user = std::env::var("REDFOG_ALLOW_CONCURRENT_SESSIONS_PER_USER").is_ok_and(|v| v != "0");
     let broker_socket_path = std::env::var("REDFOG_BROKER_SOCKET").ok().map(std::path::PathBuf::from);
     // The server-startup default — used for the Login stage always (it
     // renders before any choice is known), and as the User-stage fallback
@@ -183,6 +190,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         log_mouse_events,
         backend,
         session_presets,
+        allow_concurrent_sessions_per_user,
     })
     .await?;
 

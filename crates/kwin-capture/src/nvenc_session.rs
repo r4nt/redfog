@@ -77,6 +77,16 @@ pub struct CudaDirectEncoderSession {
 }
 
 impl CudaDirectEncoderSession {
+    /// Returns immediately — the actual capture/CUDA/NVENC setup (and
+    /// anything that can fail: no CUDA device, driver too old, ...) all
+    /// happens on the spawned background thread, isolated from the caller.
+    /// A failure there just logs and lets the thread exit; it degrades to
+    /// "no video for this session" rather than propagating a panic/error
+    /// back to whoever called `spawn`. This matters now that
+    /// `detect_video_encoder` defaults to this path whenever `nvh264enc` is
+    /// merely *registered* (not a real capability check — see its own doc
+    /// comment) — a box where that registration is stale/unhealthy fails
+    /// safe here instead of taking the process down.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         node_id: u32,

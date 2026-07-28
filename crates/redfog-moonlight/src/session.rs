@@ -74,6 +74,31 @@ pub struct SessionConfig {
     /// `redfog-login`'s own copy comes from independently reading the same
     /// file, not from this — see `load_presets`'s doc comment for why.
     pub session_presets: Vec<redfog_login_protocol::SessionPreset>,
+    /// Whether a second, different physical client is allowed to end up
+    /// with its *own independent* session for a username that already has
+    /// one *actively attached* elsewhere (under a different `ClientKey` —
+    /// see that type's doc comment in pairing.rs). `false` (the default
+    /// posture) means `handoff_to_user` instead makes the new login *take
+    /// over* that already-active session — moving it to the new client and
+    /// disconnecting the old one — the same way logging in again from the
+    /// very same client has always taken over whatever that client itself
+    /// was attached to. The takeover is keyed purely by username, not by
+    /// which client currently holds the session: confirmed live, without
+    /// this, logging in as an already-logged-in user from a second device
+    /// (e.g. a client launched *from inside* that same user's own
+    /// already-running session) silently spawned a second, fully
+    /// independent desktop for that account, running concurrently with the
+    /// first, instead of reattaching to it.
+    ///
+    /// This is unrelated to a client's *own* previous attachment (to a
+    /// possibly different username) getting backgrounded on every fresh
+    /// `/launch` — that's per-`ClientKey`, unconditional, and never
+    /// force-logs-out a different user's session; only a matching username
+    /// ever takes over another client's session. Also unrelated to
+    /// *resuming* a backgrounded session (nothing else attached right now)
+    /// — that's always allowed regardless of this setting, since it
+    /// displaces nothing.
+    pub allow_concurrent_sessions_per_user: bool,
 }
 
 // `Backend`/`SpawnedCompositor` themselves live in `session-backend` now —
@@ -600,15 +625,23 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Whether `username` currently has a running (possibly backgrounded)
-    /// session — see `LoginRequest::CheckUsername`'s doc comment for why
-    /// this needs no password. `shared.state` is deliberately not
-    /// consulted: while the login screen asking this question is even on
-    /// screen at all, whatever it's replacing has *already* been
-    /// backgrounded into `background_sessions` (see `launch()`), so that
-    /// map alone is authoritative for "is anyone's session running".
+    /// Whether `username` currently has a running session anywhere — either
+    /// backgrounded, or *actively attached* under some other `ClientKey`
+    /// right now (a real, live case with concurrent sessions: logging in as
+    /// a username that's already streaming to a different client should
+    /// still offer Resume/Log Out, not silently look like a fresh login) —
+    /// see `LoginRequest::CheckUsername`'s doc comment for why this needs
+    /// no password. Checking only `background_sessions` used to be
+    /// sufficient (this same client's own previous attachment, if any, is
+    /// always backgrounded by the time its own fresh login screen is even
+    /// showing — see `launch()`), but that reasoning never covered a
+    /// *different* client's still-active session for the same username.
     pub fn handle_check_username(&self, username: &str) -> bool {
-        self.background_sessions.lock().unwrap().contains_key(username)
+        if self.background_sessions.lock().unwrap().contains_key(username) {
+            return true;
+        }
+        let shared = self.shared.lock().unwrap();
+        shared.clients.values().any(|slot| slot.state.session().is_some_and(|s| matches!(&s.kind, SessionType::User(u) if u == username)))
     }
 
     /// Terminates `username`'s session outright — see
@@ -1671,23 +1704,57 @@ impl SessionManager {
 
         // `handle_login_report` already resolved which username this is
         // before Login even exited, keyed by this same login's own
-        // generation (see `pending_logins`'s doc comment) — if that user
-        // already has a backgrounded session (see `background_or_discard`),
-        // resume it instead of starting a fresh one: the desktop they left
-        // behind (and anything still running in it) is exactly where they
-        // left it.
+        // generation (see `pending_logins`'s doc comment). Three cases,
+        // checked in order:
+        //  1. That user already has a *backgrounded* session (see
+        //     `background_or_discard`) — resume it: the desktop they left
+        //     behind (and anything still running in it) is exactly where
+        //     they left it.
+        //  2. That user has no backgrounded session, but does have one
+        //     *actively attached* elsewhere right now (a different physical
+        //     client, possibly this exact same session mid-stream) — take
+        //     it over rather than spawn a duplicate, unless
+        //     `allow_concurrent_sessions_per_user` opts out of that (see
+        //     its own doc comment for why this is keyed by username, not by
+        //     which client currently holds it, and how it differs from a
+        //     client's own previous attachment just getting backgrounded).
+        //  3. Neither — spawn fresh.
         //
-        // For all backends, resuming a backgrounded session is a clean no-op
-        // (see `rebuild_for_resume`'s doc comment). The GStreamer pipelines
-        // are kept in the Playing state while backgrounded, so the PipeWire
-        // stream remains hot and active, avoiding both the damage-source stall
-        // on resume and the need to recreate/reconnect the capture session.
+        // For both (1) and (2), reusing the existing compositor/pipelines is
+        // a clean no-op (see `rebuild_for_resume`'s doc comment): they're
+        // kept in the Playing state throughout, so the PipeWire stream
+        // remains hot and active, avoiding both the damage-source stall on
+        // resume and the need to recreate/reconnect the capture session.
         let reported = self.pending_logins.lock().unwrap().remove(&login_generation);
         let username = reported.as_ref().map(|r| r.username.clone()).unwrap_or_else(|| "user".to_string());
         let existing_background = self.background_sessions.lock().unwrap().remove(&username);
-        let (user_session, is_resume) = match existing_background {
+        let (existing, was_active_takeover) = match existing_background {
+            Some(session) => (Some(session), false),
+            None if !self.config.allow_concurrent_sessions_per_user => {
+                let mut shared = self.shared.lock().unwrap();
+                (take_active_session_by_username(&mut shared, &username), true)
+            }
+            None => (None, false),
+        };
+        let (user_session, is_resume) = match existing {
             Some(mut background) => {
-                tracing::info!("resuming existing session for user {username}");
+                if was_active_takeover {
+                    tracing::info!("taking over already-active session for user {username} from another client");
+                } else {
+                    tracing::info!("resuming existing session for user {username}");
+                }
+                // Whichever client this session was previously attached to
+                // (if actively, not just backgrounded) had its own learned
+                // video/audio address and control-channel rikey registered
+                // for it — those are about to be overwritten below with
+                // this login's, so the old client needs to be disconnected
+                // from them explicitly rather than left dangling. A no-op
+                // if this session was only backgrounded: `launch`/`cancel`/
+                // `watch_user_session_exit` (whichever backgrounded it)
+                // already drained these at the time.
+                self.video_sender.drain_pending(background.origin.ping_token);
+                self.audio_sender.drain_pending(background.origin.ping_token);
+                self.control_registry.forget(background.origin.rikey);
                 // This resume is still a brand-new wire-level RTSP session
                 // from the client's perspective (a fresh `/launch`, fresh
                 // RTP epoch) even though the compositor underneath is old —
@@ -1949,6 +2016,25 @@ fn resolve_client_key_by_ip(shared: &Shared, ip: IpAddr) -> Option<ClientKey> {
 /// generated fresh per launch) whose `origin.rikey` equals it.
 fn resolve_client_key_by_rikey(shared: &Shared, rikey: [u8; 16]) -> Option<ClientKey> {
     shared.clients.iter().find(|(_, slot)| slot.state.session().is_some_and(|s| s.origin.rikey == rikey)).map(|(key, _)| key.clone())
+}
+
+/// Steals whatever's currently *actively attached* (`Launched` or
+/// `Streaming`, under any `ClientKey`) as `SessionType::User(username)` —
+/// used by `handoff_to_user` so a new login as an already-attached username
+/// takes over that session (moving it to the new client) instead of
+/// spawning a duplicate — see `SessionConfig::allow_concurrent_sessions_per_user`'s
+/// doc comment. Deliberately doesn't look at `background_sessions`: a
+/// backgrounded session is already what a plain resume reattaches to, not
+/// something this needs to steal. Same locking/blocking constraints as
+/// `take_active_session` (which this delegates to once the right
+/// `ClientKey` is found) — callers must not do anything blocking with the
+/// returned session while still holding `shared`'s lock.
+fn take_active_session_by_username(shared: &mut Shared, username: &str) -> Option<RunningSession> {
+    let key = shared
+        .clients
+        .iter()
+        .find_map(|(key, slot)| slot.state.session().filter(|s| matches!(&s.kind, SessionType::User(u) if u == username)).map(|_| key.clone()))?;
+    take_active_session(shared, &key)
 }
 
 /// What to do with a session `take_active_session` just extracted — split

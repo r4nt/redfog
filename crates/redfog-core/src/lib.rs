@@ -1130,25 +1130,40 @@ impl std::str::FromStr for VideoEncoder {
     }
 }
 
-/// Picks `Nvenc` if the `nvh264enc` element is registered, `Software`
+/// Picks `NvencDirect` if the `nvh264enc` element is registered, `Software`
 /// otherwise. Requires `gst::init()` to have already run (element factory
 /// lookups return nothing before then) — `redfog-server::main` calls this
 /// after `gstreamer::init()`, only as the fallback when `REDFOG_VIDEO_ENCODER`
 /// isn't set explicitly, so the env var always wins over auto-detection in
 /// either direction.
 ///
+/// `nvh264enc`'s presence is used purely as an "is there an NVIDIA GPU with
+/// a working driver at all" signal, same as before this defaulted to
+/// `NvencDirect` — `nvh264enc` itself is never actually used when this path
+/// is taken (`NvencDirect` bypasses GStreamer's video leg entirely; see
+/// `VideoEncoder::NvencDirect`'s doc comment). `NvencDirect` is also the
+/// stronger choice whenever both are viable: confirmed live at ~5% CPU vs.
+/// `Nvenc`'s ~10% floor for the same 60fps stream. Sessions that can't
+/// actually use it (the Login stage, and any `Backend::GstWaylandDisplay`
+/// session — neither produces the `VideoSource::KwinNativeDmaBuf` it
+/// requires) transparently fall back to `Nvenc` instead, per-session, in
+/// `make_encoder_pipeline`'s own caller — this function doesn't need to
+/// know about that.
+///
 /// Deliberately just a factory-registration check, not a real pipeline
 /// construction attempt: cheap, and doesn't open a CUDA context just to
 /// answer the question. That means this can say "available" for a plugin
-/// that's installed but unhealthy (wrong driver, no GPU) — a real
-/// mismatch will only surface when [`make_encoder_pipeline`] actually
-/// tries to build the pipeline, which is why *that* failure path needs to
-/// say something useful (see its own panic message) rather than relying
-/// on this check to have already ruled it out.
+/// that's installed but unhealthy (wrong driver, no GPU) — a real mismatch
+/// will only surface once a session actually tries to use it, on that
+/// session's own dedicated encoder thread (see
+/// `CudaDirectEncoderSession::spawn`'s doc comment for why a failure there
+/// degrades to "no video for this session" rather than taking the whole
+/// process down), or, for the `Nvenc` GStreamer fallback path specifically,
+/// via `make_encoder_pipeline`'s own panic message.
 pub fn detect_video_encoder() -> VideoEncoder {
     if gst::ElementFactory::find("nvh264enc").is_some() {
-        eprintln!("redfog-core: nvh264enc is available, defaulting to hardware video encoding");
-        VideoEncoder::Nvenc
+        eprintln!("redfog-core: nvh264enc is available, defaulting to direct NVENC video encoding");
+        VideoEncoder::NvencDirect
     } else {
         eprintln!("redfog-core: nvh264enc not found, defaulting to software video encoding (x264enc)");
         VideoEncoder::Software
@@ -1511,7 +1526,7 @@ mod tests {
     fn detect_video_encoder_matches_element_factory_lookup() {
         gst::init().expect("gst::init");
         let expected = if gst::ElementFactory::find("nvh264enc").is_some() {
-            VideoEncoder::Nvenc
+            VideoEncoder::NvencDirect
         } else {
             VideoEncoder::Software
         };
