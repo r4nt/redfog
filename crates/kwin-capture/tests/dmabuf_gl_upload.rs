@@ -16,7 +16,9 @@ use gstreamer::prelude::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dmabuf_gl_upload_test() {
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    // See capture_integration.rs's identical call for why this is here.
+    redfog_test_cleanup::ensure_active();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
     let runtime_dir = std::env::temp_dir().join(format!("redfog-it-dmabuf-gl-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&runtime_dir).unwrap();
@@ -27,7 +29,7 @@ async fn dmabuf_gl_upload_test() {
     std::env::set_var("GST_GL_WINDOW", "surfaceless");
     std::env::set_var("GST_GL_PLATFORM", "egl");
 
-    redfog_core::ensure_private_dbus_session();
+    let _dbus_session = redfog_core::ensure_private_dbus_session();
     let _headless_runtime = redfog_core::HeadlessRuntime::start(runtime_dir).unwrap();
 
     eprintln!("Spawning KWin running glxgears...");
@@ -48,6 +50,19 @@ async fn dmabuf_gl_upload_test() {
         session_backend::SpawnedCompositor::Kwin(session) => session.socket_path.clone(),
         _ => panic!("expected a Kwin-backed compositor"),
     };
+    // See capture_integration.rs's identical guard for why this is here.
+    struct KillCompositorOnDrop(session_backend::SpawnedCompositor);
+    impl Drop for KillCompositorOnDrop {
+        fn drop(&mut self) {
+            self.0.kill_best_effort();
+            // kill_best_effort() only signals kwin_wayland itself, not
+            // Xwayland/glxgears (kwin_wayland's *own* children, spawned via
+            // --exit-with-session) -- confirmed live, those survived on
+            // their own otherwise. See kill_descendants_named's doc comment.
+            redfog_test_cleanup::kill_descendants_named("kwin_wayland");
+        }
+    }
+    let _compositor_guard = KillCompositorOnDrop(compositor);
 
     eprintln!("Starting native Pipewire capture...");
     let capture = kwin_capture::pipewire_capture::PipewireCapture::start(node_id, socket_path, false).unwrap();

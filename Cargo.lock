@@ -1141,6 +1141,16 @@ dependencies = [
 
 [[package]]
 name = "ctor"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a2785755761f3ddc1492979ce1e48d2c00d09311c39e4466429188f3dd6501"
+dependencies = [
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "ctor"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83cf0d42651b16c6dfe68685716d18480d18a9c39c62d76e8cf3eb6ed5d8bcbf"
@@ -3005,6 +3015,7 @@ dependencies = [
  "nvidia-video-codec-sdk",
  "pipewire",
  "redfog-core",
+ "redfog-test-cleanup",
  "session-backend",
  "tokio",
  "tracing-subscriber",
@@ -4347,6 +4358,7 @@ dependencies = [
  "redfog-broker-protocol",
  "redfog-core",
  "redfog-login-protocol",
+ "redfog-test-cleanup",
  "rsa",
  "rtsp-types",
  "rustls",
@@ -4396,6 +4408,14 @@ version = "0.1.0"
 dependencies = [
  "nix",
  "pam",
+]
+
+[[package]]
+name = "redfog-test-cleanup"
+version = "0.1.0"
+dependencies = [
+ "ctor 0.2.9",
+ "libc",
 ]
 
 [[package]]
@@ -5298,7 +5318,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a90a0ca3ee6a69f2ad28fd11621a4c3f03b371f366be500b64df260c4ffbafb4"
 dependencies = [
  "as-raw-xcb-connection",
- "ctor",
+ "ctor 0.10.1",
  "libloading 0.8.9",
  "pkg-config",
  "tracing",

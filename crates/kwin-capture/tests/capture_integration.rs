@@ -1,6 +1,14 @@
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kwin_native_pipewire_capture_glxgears_test() {
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    // Not what actually installs the protection (that already ran, via
+    // redfog-test-cleanup's own #[ctor], before this binary's main() even
+    // started) -- keeps the linker from stripping the crate as unused. See
+    // that crate's doc comment for why PR_SET_PDEATHSIG alone can't
+    // protect kwin_wayland's own spawn (file capabilities clear it at
+    // exec time), confirmed live after this test's spawned sessions leaked
+    // repeatedly.
+    redfog_test_cleanup::ensure_active();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
     // 1. Create a temporary runtime dir
     let runtime_dir = std::env::temp_dir().join(format!("redfog-it-pw-capture-{}", uuid::Uuid::new_v4()));
@@ -9,7 +17,7 @@ async fn kwin_native_pipewire_capture_glxgears_test() {
     std::env::set_var("REDFOG_ALWAYS_SOFTWARE", "0");
 
     // 2. Start headless D-Bus and PipeWire runtime
-    redfog_core::ensure_private_dbus_session();
+    let _dbus_session = redfog_core::ensure_private_dbus_session();
     let _headless_runtime = redfog_core::HeadlessRuntime::start(runtime_dir).unwrap();
 
     // 3. Spawn KWin running glxgears
@@ -33,6 +41,25 @@ async fn kwin_native_pipewire_capture_glxgears_test() {
         session_backend::SpawnedCompositor::Kwin(session) => session.socket_path.clone(),
         _ => panic!("expected a Kwin-backed compositor"),
     };
+    // Kills kwin_wayland synchronously when this test function returns for
+    // *any* reason, including a panic on one of the asserts below --
+    // redfog-test-cleanup's watchdog is only a safety net for this whole
+    // process dying abnormally; without this, a fast-panicking test can
+    // finish (and cargo can start the next kwin-capture test binary)
+    // before the watchdog gets scheduled, and the two collide on the
+    // hardcoded "redfog-user-0" socket name (confirmed live).
+    struct KillCompositorOnDrop(session_backend::SpawnedCompositor);
+    impl Drop for KillCompositorOnDrop {
+        fn drop(&mut self) {
+            self.0.kill_best_effort();
+            // kill_best_effort() only signals kwin_wayland itself, not
+            // Xwayland/glxgears (kwin_wayland's *own* children, spawned via
+            // --exit-with-session) -- confirmed live, those survived on
+            // their own otherwise. See kill_descendants_named's doc comment.
+            redfog_test_cleanup::kill_descendants_named("kwin_wayland");
+        }
+    }
+    let _compositor_guard = KillCompositorOnDrop(compositor);
 
     // 4. Start our native PipeWire capture
     eprintln!("Starting native Pipewire capture...");

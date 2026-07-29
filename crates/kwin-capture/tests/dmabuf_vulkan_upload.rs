@@ -6,15 +6,23 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use gstreamer::prelude::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "GStreamer's vulkanupload can't consume this system's DMA_DRM/tiled-modifier \
+            caps -- confirmed a real, permanent driver limitation, not a flake: fails with \
+            the same pipeline error every run. vulkan_direct_import.rs is the working \
+            replacement (hand-rolled ash import bypassing vulkanupload entirely). Kept \
+            around, not deleted, as a live check that GStreamer's own element still can't \
+            do this -- worth knowing if/when that ever changes upstream."]
 async fn dmabuf_vulkan_upload_test() {
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    // See capture_integration.rs's identical call for why this is here.
+    redfog_test_cleanup::ensure_active();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
     let runtime_dir = std::env::temp_dir().join(format!("redfog-it-dmabuf-vk-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::env::set_var("REDFOG_RUNTIME_DIR", &runtime_dir);
     std::env::set_var("REDFOG_ALWAYS_SOFTWARE", "0");
 
-    redfog_core::ensure_private_dbus_session();
+    let _dbus_session = redfog_core::ensure_private_dbus_session();
     let _headless_runtime = redfog_core::HeadlessRuntime::start(runtime_dir).unwrap();
 
     eprintln!("Spawning KWin running glxgears...");
@@ -35,6 +43,19 @@ async fn dmabuf_vulkan_upload_test() {
         session_backend::SpawnedCompositor::Kwin(session) => session.socket_path.clone(),
         _ => panic!("expected a Kwin-backed compositor"),
     };
+    // See capture_integration.rs's identical guard for why this is here.
+    struct KillCompositorOnDrop(session_backend::SpawnedCompositor);
+    impl Drop for KillCompositorOnDrop {
+        fn drop(&mut self) {
+            self.0.kill_best_effort();
+            // kill_best_effort() only signals kwin_wayland itself, not
+            // Xwayland/glxgears (kwin_wayland's *own* children, spawned via
+            // --exit-with-session) -- confirmed live, those survived on
+            // their own otherwise. See kill_descendants_named's doc comment.
+            redfog_test_cleanup::kill_descendants_named("kwin_wayland");
+        }
+    }
+    let _compositor_guard = KillCompositorOnDrop(compositor);
 
     eprintln!("Starting native Pipewire capture...");
     let capture = kwin_capture::pipewire_capture::PipewireCapture::start(node_id, socket_path, false).unwrap();

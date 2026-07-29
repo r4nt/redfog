@@ -358,11 +358,11 @@ fn build_and_play_pipeline(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
 
-    if args.backend == Backend::Kwin {
-        // Must run before anything else touches D-Bus: re-execs the whole
-        // process inside dbus-run-session on first launch.
-        redfog_core::ensure_private_dbus_session();
-    }
+    // Must run before anything else touches D-Bus. Bound to a name that
+    // lives for the rest of main() (not just this if), same as
+    // _headless_runtime below -- the private session bus dies the moment
+    // its guard is dropped.
+    let _dbus_session = if args.backend == Backend::Kwin { redfog_core::ensure_private_dbus_session() } else { None };
 
     // For Backend::GstWaylandDisplay: waylanddisplaysrc isn't installed
     // system-wide, so it won't be on GStreamer's default plugin search path.

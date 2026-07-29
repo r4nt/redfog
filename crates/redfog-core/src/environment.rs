@@ -6,37 +6,98 @@
 //! sessions via `CompositorSession::spawn`.
 
 use std::env;
+use std::io::BufRead;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-const REEXEC_MARKER: &str = "_REDFOG_INNER";
+const ALREADY_SETUP_MARKER: &str = "_REDFOG_INNER";
 
-/// Re-exec the current process inside `dbus-run-session` so headless
-/// compositor services (KWin, plasmashell) get a private D-Bus session bus
-/// instead of colliding with the desktop session's bus (plasmashell would
-/// fail to claim org.kde.plasmashell, and our KWin would steal org.kde.KWin
-/// from the desktop portal).
+/// A private D-Bus session bus, killed on drop. See
+/// [`ensure_private_dbus_session`].
+pub struct DbusSession {
+    daemon: Child,
+}
+
+impl Drop for DbusSession {
+    fn drop(&mut self) {
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+    }
+}
+
+/// Spawns a private D-Bus session bus (`dbus-daemon --session`) and exports
+/// `DBUS_SESSION_BUS_ADDRESS` for the current process (and its children) to
+/// pick up, so headless compositor services (KWin, plasmashell) get a
+/// private session bus instead of colliding with the desktop session's bus
+/// (plasmashell would fail to claim org.kde.plasmashell, and our KWin would
+/// steal org.kde.KWin from the desktop portal).
 ///
 /// Must be called as the very first thing in `main()`, before any other
-/// setup. No-op if already running inside the private bus.
-pub fn ensure_private_dbus_session() {
-    if env::var_os(REEXEC_MARKER).is_some() {
-        return;
+/// setup, and the returned guard held for as long as the private session is
+/// needed — dropping it kills the bus. Returns `None`, a no-op, if an
+/// earlier call in this same process already set one up.
+///
+/// Previously re-exec'd the whole process inside `dbus-run-session` instead
+/// of spawning `dbus-daemon` directly — changed because that meant
+/// `dbus-daemon`'s own service-activation noise (and everything else that
+/// ended up sharing its fds through the re-exec) inherited this process's
+/// raw stdout/stderr directly, bypassing Rust's own stdout machinery (and
+/// therefore libtest's per-test capturing) entirely — confirmed live, the
+/// single biggest remaining source of terminal noise across an ordinary
+/// test run even after `kwin_wayland`'s own equivalent fix (see
+/// `CompositorSession::spawn`). Spawning `dbus-daemon` directly, piped and
+/// relayed through `println!`/`eprintln!` like everything else, fixes that
+/// the same way — and is simpler besides: no re-exec, no marker env var
+/// needing to survive it, no `current_exe()`/`args()` reconstruction.
+///
+/// `--nofork` (not `--fork`, `dbus-daemon`'s own default for exactly this
+/// use case) is deliberate: confirmed live that `--fork` makes it call
+/// `setsid()` and fully detach (new session, new process group, reparented
+/// to init) — which would let it escape whatever process group/cleanup
+/// mechanism the caller relies on (redfog-test-cleanup's, for tests).
+/// `--nofork` keeps it a perfectly ordinary child, in the same process
+/// group, that this guard can just `kill()` directly.
+#[must_use = "the private D-Bus session bus is killed as soon as this is dropped -- bind it \
+              to a variable that lives as long as it's needed"]
+pub fn ensure_private_dbus_session() -> Option<DbusSession> {
+    if env::var_os(ALREADY_SETUP_MARKER).is_some() {
+        return None;
     }
-    let exe = env::current_exe().expect("could not resolve current executable path");
-    let args: Vec<String> = env::args().skip(1).collect();
-    let err = Command::new("dbus-run-session")
-        .arg("--")
-        .arg(exe)
-        .args(&args)
-        .env(REEXEC_MARKER, "1")
-        .exec();
-    panic!("failed to exec dbus-run-session: {err}");
+    env::set_var(ALREADY_SETUP_MARKER, "1");
+
+    let mut cmd = Command::new("dbus-daemon");
+    cmd.arg("--session").arg("--print-address").arg("--nofork");
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut daemon = cmd.spawn().expect("failed to spawn dbus-daemon");
+
+    let mut stdout = std::io::BufReader::new(daemon.stdout.take().expect("piped stdout"));
+    let mut address = String::new();
+    stdout.read_line(&mut address).expect("failed to read dbus-daemon's printed address");
+    let address = address.trim();
+    assert!(!address.is_empty(), "dbus-daemon printed an empty address");
+    env::set_var("DBUS_SESSION_BUS_ADDRESS", address);
+
+    // Relay the rest of stdout (unlikely to have more, but just in case)
+    // and all of stderr through println!/eprintln!, not a raw inherited fd
+    // — see this function's own doc comment for why.
+    std::thread::spawn(move || {
+        for line in stdout.lines().map_while(Result::ok) {
+            println!("[dbus-daemon] {line}");
+        }
+    });
+    if let Some(stderr) = daemon.stderr.take() {
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                eprintln!("[dbus-daemon] {line}");
+            }
+        });
+    }
+
+    Some(DbusSession { daemon })
 }
 
 fn wait_for_path(path: &Path, timeout: Duration) -> bool {

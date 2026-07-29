@@ -28,7 +28,7 @@ async fn real_client_pairs_and_lists_apps() {
     // (ring vs aws-lc-rs); rustls can't auto-pick one when both are linked
     // into the same test binary, so install one explicitly.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let _ = tracing_subscriber::fmt().with_env_filter("redfog_moonlight=debug").try_init();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("redfog_moonlight=debug").try_init();
 
     let tmp = std::env::temp_dir().join(format!("redfog-it-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp).unwrap();

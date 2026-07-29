@@ -1,0 +1,52 @@
+# Discoverable shortcuts for this workspace's test scoping -- run `cargo
+# --list` to see these alongside cargo's own built-in subcommands.
+#
+# These are plain `cargo test` invocations, nothing more: no env var setup
+# (e.g. XDG_RUNTIME_DIR), no build step, no GitHub commit-status upload.
+# scripts/run-tests.sh and scripts/run-gpu-tests.sh wrap the same
+# underlying commands with that extra orchestration -- use the aliases
+# below for quick, ad-hoc runs; use the scripts (or scripts/run-all-tests.sh
+# for both) for the real thing.
+#
+# Two different, deliberately separate gating mechanisms are at play here --
+# don't conflate them:
+#   - Needs different hardware/build artifacts this machine may not have:
+#     either whole-package selection (kwin-capture needs a real NVIDIA GPU --
+#     select or exclude the whole package with -p/--exclude), or a cargo
+#     feature (redfog-moonlight's "compositor-tests", gating
+#     connection_integration.rs's tests that need a real, working User-stage
+#     compositor -- Xwayland segfaults spawning a headless, no-DRM-device
+#     KWin backend, confirmed live, not fixable in redfog's own code). A
+#     feature not enabled means those tests don't exist in the build at all.
+#   - #[ignore]: reserved *exclusively* for a test that's actually broken and
+#     needs fixing (see e.g. kwin-capture's dmabuf_vulkan_upload_test,
+#     two_nvenc_sessions_same_process, nvenc_session_plus_gstreamer_nvh264enc),
+#     never for "needs hardware this machine happens to have". None of the
+#     aliases below pass --include-ignored -- that's deliberate. #[ignore]
+#     plus --include-ignored can't tell those two reasons apart (both are
+#     just "ignored"), which used to force these aliases to hand-maintain a
+#     --skip list naming every genuinely-broken test to undo
+#     --include-ignored's blanket sweep-back-in. Keeping #[ignore] meaning
+#     only one thing means these aliases need no such list at all.
+[alias]
+# The full sudo-free suite, no special hardware needed -- matches exactly
+# what .github/workflows/tests.yml runs in CI. kwin-capture is excluded
+# (needs a real NVIDIA GPU); gst_wayland_display_backend_smoke_test needs a
+# separately-built plugin (see scripts/run-gst-viewer.sh) -- not gated via
+# #[ignore] or a feature since it's a runtime (env var), not compile-time,
+# requirement.
+test-workspace = "test --workspace --exclude kwin-capture -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test"
+
+# kwin-capture's own GPU/NVENC tests -- needs a real NVIDIA GPU, can't run
+# in CI (no free GPU runner tier). See scripts/run-gpu-tests.sh.
+test-gpu = "test -p kwin-capture -- --test-threads=1"
+
+# connection_integration.rs's tests needing a real, working User-stage
+# compositor -- see this file's own header for why that's a cargo feature,
+# not #[ignore]. See scripts/run-gpu-tests.sh.
+test-gpu-compositor = "test -p redfog-moonlight --test connection_integration --features compositor-tests -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test"
+
+# Literally everything in one invocation: the sudo-free suite plus
+# kwin-capture plus the compositor tests above -- only makes sense on a
+# machine with a real NVIDIA GPU (this one).
+test-all = "test --workspace --features redfog-moonlight/compositor-tests -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test"

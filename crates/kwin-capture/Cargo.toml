@@ -34,6 +34,7 @@ cudarc016 = { package = "cudarc", version = "0.16", features = ["cuda-12080"] }
 [dev-dependencies]
 redfog-core = { path = "../redfog-core" }
 session-backend = { path = "../session-backend" }
+redfog-test-cleanup = { path = "../redfog-test-cleanup" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 uuid = { version = "1", features = ["v4"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

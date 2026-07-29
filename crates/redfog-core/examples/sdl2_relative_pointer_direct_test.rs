@@ -15,7 +15,7 @@ use std::time::Duration;
 use redfog_core::{CompositorSession, InputForwarder, SessionType};
 
 fn main() {
-    redfog_core::ensure_private_dbus_session();
+    let _dbus_session = redfog_core::ensure_private_dbus_session();
 
     let sdl_check = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../redfog-test-ux/target/debug/examples/sdl2_relative_pointer_check");
     let sdl_check = if sdl_check.exists() {

@@ -29,9 +29,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .install_default()
         .expect("no CryptoProvider installed yet");
 
-    // Must run before anything else touches D-Bus: re-execs the whole
-    // process inside dbus-run-session on first launch.
-    redfog_core::ensure_private_dbus_session();
+    // Must run before anything else touches D-Bus: spawns a private session
+    // bus and exports DBUS_SESSION_BUS_ADDRESS for the rest of this process.
+    let _dbus_session = redfog_core::ensure_private_dbus_session();
 
     // For Backend::GstWaylandDisplay: waylanddisplaysrc isn't installed
     // system-wide, so it won't be on GStreamer's default plugin search path

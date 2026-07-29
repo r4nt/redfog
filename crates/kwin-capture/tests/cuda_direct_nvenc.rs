@@ -20,7 +20,9 @@ const BITRATE_KBPS: u32 = 5_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cuda_direct_nvenc_encode_glxgears_test() {
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    // See capture_integration.rs's identical call for why this is here.
+    redfog_test_cleanup::ensure_active();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
     // `CudaDirectEncoderSession::spawn` isolates setup failures to its own
     // background thread rather than surfacing a `Result` here (see its own
@@ -41,7 +43,7 @@ async fn cuda_direct_nvenc_encode_glxgears_test() {
     std::env::set_var("REDFOG_RUNTIME_DIR", &runtime_dir);
     std::env::set_var("REDFOG_ALWAYS_SOFTWARE", "0");
 
-    redfog_core::ensure_private_dbus_session();
+    let _dbus_session = redfog_core::ensure_private_dbus_session();
     let _headless_runtime = redfog_core::HeadlessRuntime::start(runtime_dir).unwrap();
 
     eprintln!("Spawning KWin running glxgears...");
@@ -63,6 +65,25 @@ async fn cuda_direct_nvenc_encode_glxgears_test() {
         session_backend::SpawnedCompositor::Kwin(session) => session.socket_path.clone(),
         _ => panic!("expected a Kwin-backed compositor"),
     };
+    // Kills kwin_wayland synchronously when this test function returns for
+    // *any* reason, including a panic on one of the asserts below --
+    // redfog-test-cleanup's watchdog is only a safety net for this whole
+    // process dying abnormally; without this, a fast-panicking test can
+    // finish (and cargo can start the next kwin-capture test binary)
+    // before the watchdog gets scheduled, and the two collide on the
+    // hardcoded "redfog-user-0" socket name (confirmed live).
+    struct KillCompositorOnDrop(session_backend::SpawnedCompositor);
+    impl Drop for KillCompositorOnDrop {
+        fn drop(&mut self) {
+            self.0.kill_best_effort();
+            // kill_best_effort() only signals kwin_wayland itself, not
+            // Xwayland/glxgears (kwin_wayland's *own* children, spawned via
+            // --exit-with-session) -- confirmed live, those survived on
+            // their own otherwise. See kill_descendants_named's doc comment.
+            redfog_test_cleanup::kill_descendants_named("kwin_wayland");
+        }
+    }
+    let _compositor_guard = KillCompositorOnDrop(compositor);
 
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
     eprintln!("Starting CudaDirectEncoderSession (DMA-BUF -> CUDA -> NVENC, no GStreamer)...");

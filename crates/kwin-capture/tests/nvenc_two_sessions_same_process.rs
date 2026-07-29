@@ -79,9 +79,36 @@ fn open_session_and_encode_a_frame(label: &str) -> bool {
     true
 }
 
+// TODO: figure out what's actually going on here before re-enabling either
+// test in this file (see nvenc_session_plus_gstreamer_nvh264enc below too).
+// Confirmed live (2026-07-30): `CudaContext::new()` genuinely uses CUDA's
+// primary-context retain API (cudarc-0.16.6's `result::primary_ctx::retain`),
+// not a separate `cuCtxCreate`, so both sessions correctly share the same
+// underlying context -- that part of this test's design is right. But run
+// together with `nvenc_session_plus_gstreamer_nvh264enc` in the same
+// process (the default -- both are #[test] fns in one binary), this test's
+// own "session-1" failed immediately with `EncodeError { kind:
+// InvalidEncoderDevice }`, right after the other test had already opened
+// and deliberately leaked its own session first -- so this may not be
+// isolating a fresh-process scenario the way it's meant to, and might
+// really be measuring the *same* cross-test interference the whole file
+// exists to investigate, just via a different path than intended.
+//
+// Separately, and more importantly: confirmed live that just running
+// `nvenc_session_plus_gstreamer_nvh264enc` *alone* in this binary (this
+// test skipped) still hangs the whole process during teardown, well after
+// libtest itself already printed "1 passed; 0 failed; 1 ignored" --
+// blocked in `futex_wait` per /proc/<pid>/wchan, killed only by an external
+// `timeout`. So this isn't really about interaction between the two tests
+// specifically -- `nvenc_session_plus_gstreamer_nvh264enc`'s own
+// deliberately-leaked NVENC session + CUDA context, combined with its
+// GStreamer nvh264enc pipeline, is apparently enough on its own to wedge
+// something during process exit. That's why it's ignored too, below.
 #[test]
+#[ignore = "leaves the whole process hanging during teardown, not just this specific test \
+            failing/hanging -- root cause not yet understood, see the TODO above"]
 fn two_nvenc_sessions_same_process() {
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
     if !open_session_and_encode_a_frame("session-1") {
         return;
     }
@@ -93,11 +120,17 @@ fn two_nvenc_sessions_same_process() {
 /// own raw `nvidia-video-codec-sdk` session plus GStreamer's own `nvh264enc`
 /// (which may create its own, separate CUDA context rather than sharing the
 /// primary one) — not two raw sessions both using the primary context.
+// TODO: see two_nvenc_sessions_same_process's TODO above -- this test's own
+// assertions pass, but confirmed live it leaves the process hanging during
+// teardown afterward (blocked in futex_wait), which is why it's ignored.
 #[test]
+#[ignore = "passes its own assertions but leaves the process hanging during teardown \
+            afterward -- root cause not yet understood, see two_nvenc_sessions_same_process's \
+            TODO above"]
 fn nvenc_session_plus_gstreamer_nvh264enc() {
     use gstreamer::prelude::*;
 
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
     if !open_session_and_encode_a_frame("our-own-session") {
         return;

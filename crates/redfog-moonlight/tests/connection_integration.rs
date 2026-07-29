@@ -219,6 +219,7 @@ fn direct_child_dies_when_its_direct_parent_dies() {
 /// confirmed live: `systemd-run --user --scope` fails with "Process
 /// org.freedesktop.systemd1 exited with status 1" without it, even once the
 /// bus socket already exists at `$XDG_RUNTIME_DIR/bus`.
+#[cfg(feature = "compositor-tests")]
 fn ensure_user_systemd_for_fake_pam_spawn() -> Option<Vec<(String, String)>> {
     let uid = nix::unistd::Uid::current().as_raw();
     let runtime_dir = format!("/run/user/{uid}");
@@ -308,6 +309,7 @@ impl Drop for ServerProcess {
         let pgid = nix::unistd::Pid::from_raw(-(self.child.id() as i32));
         let _ = nix::sys::signal::kill(pgid, nix::sys::signal::Signal::SIGTERM);
         let _ = self.child.wait();
+        redfog_test_cleanup::untrack_extra_pgid(self.child.id() as i32);
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
     }
 }
@@ -328,6 +330,7 @@ impl Drop for BrokerProcess {
         let pgid = nix::unistd::Pid::from_raw(-(self.child.id() as i32));
         let _ = nix::sys::signal::kill(pgid, nix::sys::signal::Signal::SIGTERM);
         let _ = self.child.wait();
+        redfog_test_cleanup::untrack_extra_pgid(self.child.id() as i32);
         // Best-effort: only relevant for the real (non-FAKE_SPAWN) systemd
         // path, which this test doesn't use — skip entirely otherwise so a
         // plain, unprivileged test run doesn't print confusing "access
@@ -404,6 +407,15 @@ impl TestServer {
     /// spawn path (see `real_pam_spawn_env`) instead of whatever
     /// `broker_spawn_mode_env` would otherwise pick.
     fn spawn_with_broker_env(extra_broker_env: Vec<(String, String)>) -> Self {
+        // Not what actually installs the protection (that's
+        // redfog-test-cleanup's own #[ctor], which already ran before this
+        // test binary's main() even started) -- this call just keeps the
+        // linker from stripping the crate out as unused, and documents,
+        // right where the real subprocess-spawning begins, that it's
+        // active. See that crate's doc comment for the full mechanism and
+        // why die_with_parent (above) alone isn't enough for kwin_wayland.
+        redfog_test_cleanup::ensure_active();
+
         let runtime_dir = std::env::temp_dir().join(format!("redfog-it-runtime-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&runtime_dir).unwrap();
         // Short and fixed (not under runtime_dir, which has a variable-
@@ -498,6 +510,12 @@ impl TestServer {
         // earlier failed runs left orphaned pipewire/wireplumber/kwin_wayland
         // processes behind).
         let mut broker = BrokerProcess { child: broker_cmd.spawn().expect("spawn redfog-broker") };
+        // Own process group (see the comment on BrokerProcess) means the
+        // outer test-binary-wide watchdog installed by ensure_active()
+        // above can't see this subtree on its own -- register it so the
+        // watchdog also kills it if the whole test binary dies before
+        // BrokerProcess's own Drop gets a chance to run.
+        redfog_test_cleanup::track_extra_pgid(broker.child.id() as i32);
         {
             let stdout = broker.child.stdout.take().unwrap();
             let stdout_lines = stdout_lines.clone();
@@ -555,6 +573,8 @@ impl TestServer {
 
         // Wrapped immediately, same reasoning as `broker` above.
         let mut process = ServerProcess { child: cmd.spawn().expect("spawn redfog-server"), runtime_dir };
+        // See the identical call after spawning `broker` above.
+        redfog_test_cleanup::track_extra_pgid(process.child.id() as i32);
 
         {
             let stdout = process.child.stdout.take().unwrap();
@@ -794,16 +814,14 @@ async fn poll_frames_tracking_gaps(stream: &MoonlightStream, stop: impl std::fut
     (video_frames, max_gap)
 }
 
-#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
-            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
-            real desktop hardware with --include-ignored."]
+#[cfg(feature = "compositor-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_client_connects_reconnects_and_sends_input() {
     // Our own rustls usage and moonlight-common's pull in different crypto
     // provider backends (ring vs aws-lc-rs); can't auto-pick one when both
     // are linked into the same test binary.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
     let server = TestServer::spawn();
 
@@ -1016,14 +1034,12 @@ async fn real_client_connects_reconnects_and_sends_input() {
 /// matched — not a simple key-mismatch bug), while server-side video kept
 /// encoding normally the whole time. Bounded by an overall timeout so a
 /// genuine hang fails the test cleanly instead of blocking the suite.
-#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
-            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
-            real desktop hardware with --include-ignored."]
+#[cfg(feature = "compositor-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_channel_survives_resume_then_reconnect() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
         let server = TestServer::spawn();
 
@@ -1178,14 +1194,12 @@ async fn control_channel_survives_resume_then_reconnect() {
 /// *later* reconnect ever gets a working video stream again — repeating
 /// the check a few times with real settle time between attempts, since the
 /// live symptom was "never recovers", not "occasionally flaky".
-#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
-            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
-            real desktop hardware with --include-ignored."]
+#[cfg(feature = "compositor-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn video_port_recovers_after_a_resume_hang() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
         let server = TestServer::spawn();
 
@@ -1358,6 +1372,7 @@ async fn video_port_recovers_after_a_resume_hang() {
 /// signature of the client giving up, not the server failing to send
 /// anything (the server's own logs showed frames the whole time). Counting
 /// server-side log lines sidesteps that client-library quirk entirely.
+#[cfg(feature = "compositor-tests")]
 async fn track_server_side_video_frame_gaps(server: &TestServer, baseline: usize, window: Duration) -> (usize, Duration) {
     let (frames, max_gap, _gaps) = track_server_side_video_frame_gap_sequence(server, baseline, window).await;
     (frames, max_gap)
@@ -1370,6 +1385,7 @@ async fn track_server_side_video_frame_gaps(server: &TestServer, baseline: usize
 /// actually characterized live (progressively growing gaps over several
 /// *minutes* of one continuous connection, eventually settling into a
 /// ~60s-periodic cadence) rather than found via many quick reconnects.
+#[cfg(feature = "compositor-tests")]
 async fn track_server_side_video_frame_gap_sequence(server: &TestServer, baseline: usize, window: Duration) -> (usize, Duration, Vec<Duration>) {
     let window_start = tokio::time::Instant::now();
     let mut last_count = baseline;
@@ -1411,9 +1427,7 @@ async fn track_server_side_video_frame_gap_sequence(server: &TestServer, baselin
 /// something even this harness doesn't have — a long-lived `kwin_wayland`
 /// process accumulating state over real hours, not just several cycles in
 /// under a couple of minutes.
-#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
-            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
-            real desktop hardware with --include-ignored."]
+#[cfg(feature = "compositor-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn video_stays_sustained_across_many_resumes_under_continuous_rendering() {
     const RESUME_CYCLES: usize = 8;
@@ -1422,7 +1436,7 @@ async fn video_stays_sustained_across_many_resumes_under_continuous_rendering() 
 
     tokio::time::timeout(Duration::from_secs(240), async {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
         let server = TestServer::spawn();
 
@@ -1550,9 +1564,7 @@ async fn video_stays_sustained_across_many_resumes_under_continuous_rendering() 
 /// long (90s) observation window, printing every individual gap in order
 /// so a growing/periodic pattern would actually be visible in the output,
 /// not just collapsed into a single worst-case number.
-#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
-            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
-            real desktop hardware with --include-ignored."]
+#[cfg(feature = "compositor-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn video_frame_gaps_over_one_long_sustained_resumed_connection() {
     const OBSERVE_WINDOW: Duration = Duration::from_secs(90);
@@ -1560,7 +1572,7 @@ async fn video_frame_gaps_over_one_long_sustained_resumed_connection() {
 
     tokio::time::timeout(Duration::from_secs(150), async {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
         let server = TestServer::spawn();
 
@@ -1688,9 +1700,7 @@ async fn video_frame_gaps_over_one_long_sustained_resumed_connection() {
 /// the Login->User handoff stays reliable) so input is the *only* damage
 /// source, matching a real desktop instead of masking the bug behind an
 /// artificial timer.
-#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
-            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
-            real desktop hardware with --include-ignored."]
+#[cfg(feature = "compositor-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn video_throttles_after_resume_under_input_driven_damage() {
     const DAMAGE_WINDOW: Duration = Duration::from_secs(10);
@@ -1701,7 +1711,7 @@ async fn video_throttles_after_resume_under_input_driven_damage() {
 
     tokio::time::timeout(Duration::from_secs(60), async {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
         let server = TestServer::spawn_with_broker_env(vec![("REDFOG_TEST_UX_NO_AUTOREPAINT".to_string(), "1".to_string())]);
 
@@ -1834,6 +1844,7 @@ async fn video_throttles_after_resume_under_input_driven_damage() {
 /// `video_throttles_after_resume_under_input_driven_damage`'s pre/post-resume
 /// comparison, matching how a real desktop's damage is actually generated
 /// (event-driven, not a steady internal repaint timer).
+#[cfg(feature = "compositor-tests")]
 async fn drive_mouse_wiggle_damage(stream: MoonlightStream) {
     let mut x = 640.0;
     loop {
@@ -1855,14 +1866,12 @@ async fn drive_mouse_wiggle_damage(stream: MoonlightStream) {
 /// socket — the same wire message the login screen's own "Log out" button
 /// sends — rather than driving a UI, since `redfog-test-ux`'s headless
 /// Login stand-in has no such button to click (see its own doc comment).
-#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
-            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
-            real desktop hardware with --include-ignored."]
+#[cfg(feature = "compositor-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn login_after_log_out_recovers_from_a_resume_hang() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
         let server = TestServer::spawn();
 
@@ -2028,6 +2037,7 @@ async fn login_after_log_out_recovers_from_a_resume_hang() {
 /// `kill_broker_spawned_user_compositor`, which only looks one level deep).
 /// Matches via `/proc/<pid>/status`'s `PPid:` field for the same reason that
 /// helper does (see its own doc comment on why not `environ`).
+#[cfg(feature = "compositor-tests")]
 fn find_broker_grandchild_kwin_wayland_pid(broker_pid: u32) -> Option<u32> {
     let ppid_of = |pid: &str| -> Option<u32> {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
@@ -2070,10 +2080,7 @@ fn find_broker_grandchild_kwin_wayland_pid(broker_pid: u32) -> Option<u32> {
 /// the same process-tree shape as the real PAM-spawn path, without needing
 /// real root/PAM/setuid — so this runs under a plain `cargo test`, no sudo
 /// needed, unlike `real_pam_spawn_login_after_log_out_recovers_from_a_resume_hang`.
-#[ignore = "needs a working User-stage compositor -- Xwayland segfaults in headless/no-GPU environments \
-            (confirmed via act, including --privileged; not a capability/seccomp issue). Run manually on \
-            real desktop hardware with --include-ignored. (Its own ensure_user_systemd_for_fake_pam_spawn \
-            self-skip only covers the missing-sudo case, not this.)"]
+#[cfg(feature = "compositor-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_out_actually_kills_the_real_compositor_process() {
     let Some(user_systemd_env) = ensure_user_systemd_for_fake_pam_spawn() else {
@@ -2081,7 +2088,7 @@ async fn log_out_actually_kills_the_real_compositor_process() {
     };
     tokio::time::timeout(Duration::from_secs(60), async {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
         let mut broker_env = vec![("REDFOG_BROKER_FAKE_PAM_SPAWN".to_string(), "1".to_string())];
         broker_env.extend(user_systemd_env);
@@ -2226,7 +2233,7 @@ async fn real_pam_spawn_login_after_log_out_recovers_from_a_resume_hang() {
 
     tokio::time::timeout(Duration::from_secs(150), async {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
         let server = TestServer::spawn_with_broker_env(vec![("REDFOG_BROKER_PAM_SPAWN".to_string(), "1".to_string())]);
 
@@ -2389,7 +2396,7 @@ async fn real_pam_spawn_login_after_log_out_recovers_from_a_resume_hang() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redfog_pair_binary_completes_a_real_pairing_handshake() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
     let server = TestServer::spawn();
 
@@ -2440,6 +2447,7 @@ async fn redfog_pair_binary_completes_a_real_pairing_handshake() {
 /// likely because KWin hardens itself against `ptrace`-based input/screen
 /// snooping (`environ`/`mem` require `ptrace` access; `comm`/`status` don't
 /// and stay readable regardless).
+#[cfg(feature = "compositor-tests")]
 fn kill_broker_spawned_user_compositor(broker_pid: u32) {
     let mut killed_any = false;
     for entry in std::fs::read_dir("/proc").expect("read /proc").flatten() {
@@ -2519,6 +2527,8 @@ impl GstTestServer {
         die_with_parent(&mut cmd);
 
         let mut process = ServerProcess { child: cmd.spawn().expect("spawn redfog-server"), runtime_dir };
+        // See the identical call in TestServer::spawn_with_broker_env.
+        redfog_test_cleanup::track_extra_pgid(process.child.id() as i32);
 
         {
             let stdout = process.child.stdout.take().unwrap();
@@ -2571,7 +2581,7 @@ impl GstTestServer {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gst_wayland_display_backend_smoke_test() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 
     let server = GstTestServer::spawn();
 

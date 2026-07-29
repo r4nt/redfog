@@ -3,6 +3,22 @@ name = "redfog-moonlight"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Gates connection_integration.rs's tests that need a real, working
+# User-stage compositor (Xwayland segfaults spawning a headless, no-DRM-
+# device KWin backend -- confirmed live, not fixable in redfog's own code).
+# A cargo feature, not #[ignore] -- see that attribute's own removal from
+# these tests for why: #[ignore] plus --include-ignored can't distinguish
+# "ignored because this machine lacks the hardware" from "ignored because
+# it's actually broken and needs fixing" -- they're both just "ignored",
+# forcing test-all to hand-maintain a --skip list naming every genuinely
+# broken test to undo --include-ignored's blanket sweep. A feature flag
+# means these tests don't exist at all in a build without it -- no
+# --include-ignored, no --skip list, and #[ignore] stays free to mean
+# exactly one thing: this specific test is broken, not that a whole
+# category needs different hardware.
+compositor-tests = []
+
 [dependencies]
 redfog-core = { path = "../redfog-core" }
 session-backend = { path = "../session-backend" }
@@ -51,6 +67,7 @@ ureq = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nix = { version = "0.26", features = ["signal"] }
 libc = "0.2"
+redfog-test-cleanup = { path = "../redfog-test-cleanup" }
 # GPL-3.0-or-later, dev-only: the real reference client implementation, used
 # to validate our server against actual client-side crypto/parsing rather
 # than our own (possibly-biased) reimplementation of both sides.

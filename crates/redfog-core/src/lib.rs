@@ -3,6 +3,7 @@ use std::process::{Command, Stdio, Child};
 use std::sync::{Arc, Mutex};
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 use gstreamer as gst;
 use gstreamer_allocators as gst_allocators;
@@ -21,7 +22,7 @@ use wayland_client::{
 pub use kwin_capture::CaptureSession;
 
 mod environment;
-pub use environment::{ensure_private_dbus_session, HeadlessRuntime};
+pub use environment::{ensure_private_dbus_session, DbusSession, HeadlessRuntime};
 
 /// Shared by `HeadlessRuntime::start` and `CompositorSession::spawn` so the
 /// PipeWire runtime dir and the KWin socket dir always agree.
@@ -167,6 +168,58 @@ pub trait InputSink: Send {
     fn flush(&mut self) {}
 }
 
+/// Registers `PR_SET_PDEATHSIG(SIGKILL)` on the about-to-exec `kwin_wayland`
+/// child so the kernel kills it the instant this process dies, for any
+/// reason — not just a clean shutdown that gets a chance to run its own
+/// teardown. Confirmed live: without this, a hung/crashed/killed
+/// redfog-server (or a test spawning a compositor this same way) leaves
+/// real, orphaned `kwin_wayland`/`glxgears`/`Xwayland`/`xdg-desktop-portal-
+/// kde`/`ksecretd` processes running forever — 17 of them accumulated
+/// across a couple of hours of testing before this was added.
+///
+/// Default-on, since a compositor session outliving its own server process
+/// indefinitely is arguably never wanted; set
+/// `REDFOG_KILL_COMPOSITOR_WITH_SERVER=0` to opt out if some deployment
+/// wants sessions to keep running (e.g. to survive a server restart) —
+/// that property isn't otherwise relied on today (backgrounded sessions are
+/// tracked and reattached within the same server process, not across a
+/// restart of it), but this is cheap to make reversible rather than assume.
+fn maybe_die_with_parent(cmd: &mut Command) {
+    if std::env::var("REDFOG_KILL_COMPOSITOR_WITH_SERVER").as_deref() == Ok("0") {
+        return;
+    }
+    unsafe {
+        cmd.pre_exec(|| {
+            let parent_before = libc::getppid();
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Read back what the kernel actually recorded, not just
+            // trusting a zero return code — confirmed live elsewhere that
+            // this can silently not stick, which a bare return-code check
+            // can't detect.
+            let mut got_sig: libc::c_int = -1;
+            if libc::prctl(libc::PR_GET_PDEATHSIG, &mut got_sig as *mut libc::c_int) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if got_sig != libc::SIGKILL {
+                return Err(std::io::Error::other(format!(
+                    "PR_SET_PDEATHSIG(SIGKILL) reported success but PR_GET_PDEATHSIG reads back {got_sig} instead of {}",
+                    libc::SIGKILL
+                )));
+            }
+            // Close the race where the parent already exited between
+            // fork() and this prctl() call — we'd already be reparented
+            // and would never receive the signal for a parent that's
+            // already gone.
+            if libc::getppid() != parent_before {
+                libc::raise(libc::SIGKILL);
+            }
+            Ok(())
+        });
+    }
+}
+
 impl CompositorSession {
     /// The abstracted form of `pipewire_node_id`, for callers that build
     /// pipelines via [`make_pipeline`]/[`make_encoder_pipeline`] against
@@ -250,9 +303,41 @@ impl CompositorSession {
             }
         }
 
-        let child = cmd.stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        maybe_die_with_parent(&mut cmd);
+        let mut child = cmd.spawn()?;
+
+        // Piped + relayed through println!/eprintln!, not Stdio::inherit()
+        // -- so kwin_wayland's own output (and everything it spawns that
+        // inherits its fds in turn: Xwayland, the --exit-with-session
+        // payload) goes through the same capturing every other println!
+        // in a test process already gets: hidden on a passing run, shown
+        // automatically if the test fails. Confirmed live: a bare
+        // Stdio::inherit() bypasses that entirely (it's a raw fd, not
+        // something Rust's own stdout machinery sees), and was the single
+        // biggest source of terminal noise across an ordinary test run --
+        // xkbcomp warnings, Qt/KDE startup chatter, glxgears's own FPS
+        // counter -- none of which respected --nocapture either way.
+        // Functionally equivalent for production: redfog-server's own
+        // stdout/stderr are what systemd/journald actually capture, and
+        // relaying through println!/eprintln! still ends up there, just
+        // with a `[kwin_wayland]` prefix instead of unprefixed raw output.
+        if let Some(stdout) = child.stdout.take() {
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                    println!("[kwin_wayland] {line}");
+                }
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                    eprintln!("[kwin_wayland] {line}");
+                }
+            });
+        }
 
         Self::wait_and_attach(session_type, socket_name, socket_path, width, height, scale, fps, Some(child), &runtime, &pw_sock)
     }
