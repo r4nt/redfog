@@ -1,0 +1,49 @@
+[Unit]
+Description=redfog session broker (privileged, cross-user session spawning)
+Documentation=https://github.com/REPLACE_ME/redfog
+After=network.target
+
+[Service]
+Type=simple
+# Genuinely needs root: PAM session establishment and `systemd-run --scope`
+# for arbitrary target users are both fundamentally root operations. See
+# design.md's "Privilege separation: broker vs. server" and this crate's
+# own main.rs doc comment.
+ExecStart=/usr/bin/redfog-broker
+Restart=on-failure
+RestartSec=2
+
+# Creates /run/redfog (root-owned, mode 0755) before start, removed on
+# stop -- redfog-broker's own secure_socket() then chowns just its own
+# socket file inside it to root:redfog, mode 0660, once
+# REDFOG_BROKER_SOCKET_GROUP (below) tells it to.
+RuntimeDirectory=redfog
+RuntimeDirectoryMode=0755
+
+# Must be the *same path* as redfog-server.service's own RuntimeDirectory=
+# (not a private one of this unit's own, and not left at this crate's
+# built-in /tmp/redfog-runtime default) -- confirmed live these silently
+# disagreeing broke two different things: first, redfog-server (running
+# as its own unprivileged system user, not root) couldn't even traverse
+# into a runtime dir it had no grant on to find sessions the broker
+# spawned; then, once that was fixed, redfog-broker was still computing
+# the shared PipeWire/pulse socket paths from *its own* wrong default and
+# handing them straight to the KWin session it spawns via PIPEWIRE_REMOTE/
+# PULSE_SERVER -- so KWin's screencast tried to connect to a PipeWire
+# socket that was never actually created at that path at all ("Failed to
+# connect PipeWire context"). Deliberately NOT a directory this unit
+# declares via its own RuntimeDirectory=: redfog-server.service's
+# `HeadlessRuntime::start` unconditionally chmods this directory to 0700,
+# which only works because redfog-server owns it outright -- root (this
+# process) can still freely read/write inside it regardless of that mode,
+# same as any other root process ignores DAC permission bits, so nothing
+# else here needs to change to accommodate that.
+Environment=REDFOG_RUNTIME_DIR=/run/redfog-server
+Environment=REDFOG_BROKER_SOCKET=/run/redfog/broker.sock
+Environment=REDFOG_BROKER_SOCKET_GROUP=redfog
+# Optional, admin-editable overrides (debug flags, etc.) -- the leading
+# "-" means this unit still starts fine if the file doesn't exist.
+EnvironmentFile=-/etc/redfog/redfog.conf
+
+[Install]
+WantedBy=multi-user.target

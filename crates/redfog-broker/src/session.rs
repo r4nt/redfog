@@ -576,6 +576,13 @@ impl SessionManager {
         ] {
             grant_acl(username, &path, perm, what).await;
         }
+        // See `redfog_server_user`'s doc comment: without this, redfog-server
+        // (once it's not root/`username` itself) can't even traverse into
+        // `default_runtime_dir()` to reach this session's own Wayland socket
+        // below, regardless of that socket's own permissions.
+        if let Some(server_user) = redfog_server_user() {
+            grant_acl(&server_user, &default_runtime_dir(), "x", "traverse").await;
+        }
         // dbus-run-session gives KWin (and whatever it spawns via
         // --exit-with-session, e.g. plasmashell) its own private, ephemeral
         // D-Bus session bus — without this, a systemd service running as
@@ -647,11 +654,18 @@ impl SessionManager {
         // gets SocketMode=0660 owned by the broker's own user — the target
         // user isn't in that group, so without this the KWin session's own
         // --exit-with-session child (running as that unprivileged user) has
-        // no rw on the socket it's actually listening on. Confirmed live:
-        // redfog-server's own CaptureSession never hit this because it
-        // connects as root, which bypasses file permission checks entirely
-        // — only non-root clients on this same socket were ever affected.
+        // no rw on the socket it's actually listening on.
         grant_acl(username, &wayland_socket_path, "rw", "connect to").await;
+        // `redfog-server`'s own `CaptureSession::connect` (a *third* identity,
+        // distinct from both the broker/root and `username`) needs the same
+        // grant on this same file — see `redfog_server_user`'s doc comment.
+        // Confirmed live this is real, not hypothetical: with no dedicated
+        // `redfog` system user (redfog-server running as root instead), this
+        // was a non-issue (root bypasses DAC checks entirely) — packaging
+        // this with `User=redfog` in `redfog-server.service` surfaced it.
+        if let Some(server_user) = redfog_server_user() {
+            grant_acl(&server_user, &wayland_socket_path, "rw", "connect to").await;
+        }
         run_systemctl(&["start", &format!("{unit_name}.service")]).await?;
 
         self.active
@@ -769,6 +783,23 @@ impl SessionManager {
                     String::from_utf8_lossy(&output.stderr)
                 ),
                 Err(e) => tracing::warn!("failed to run setfacl granting {username} {what} access on {path}: {e}"),
+            }
+        }
+        // See `redfog_server_user`'s doc comment / `spawn_via_systemd`'s
+        // equivalent grants: `redfog-server`'s own `CaptureSession::connect`
+        // is a *third* identity (distinct from both the broker/root and
+        // `username`) that needs the same traverse/connect access.
+        if let Some(server_user) = redfog_server_user() {
+            for (path, perm, what) in [(default_runtime_dir(), "x", "traverse"), (wayland_socket_path.clone(), "rw", "connect to")] {
+                match tokio::process::Command::new("setfacl").args(["-m", &format!("u:{server_user}:{perm}"), &path]).output().await {
+                    Ok(output) if output.status.success() => tracing::info!("granted {server_user} {what} access on {path}"),
+                    Ok(output) => tracing::warn!(
+                        "setfacl granting {server_user} {what} access on {path} exited with {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    Err(e) => tracing::warn!("failed to run setfacl granting {server_user} {what} access on {path}: {e}"),
+                }
             }
         }
 
@@ -1374,6 +1405,28 @@ fn which_kwin_wayland() -> Option<String> {
 
 fn default_runtime_dir() -> String {
     std::env::var("REDFOG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp/redfog-runtime".to_string())
+}
+
+/// Which identity `redfog-server` itself runs as, if it's not the same
+/// process/user as this broker — `None` (the default, if unset) means
+/// "don't grant anyone else access beyond `username`", preserving the old
+/// behavior every dev/test invocation still relies on, where `redfog-server`
+/// runs as root (bypassing DAC checks entirely) or as the same uid doing the
+/// spawning.
+///
+/// Real gap this closes: once packaging gave `redfog-server` its own
+/// dedicated, unprivileged system user (`packaging/arch/redfog-server.service`'s
+/// `User=redfog`), it needs the exact same kind of per-resource ACL grant
+/// `username` (the login target) already gets on `default_runtime_dir()`
+/// and the session's Wayland socket — `CaptureSession::connect` in
+/// `redfog-core::session_backend` runs as *this* identity, not root or
+/// `username`. Confirmed live: without this, `default_runtime_dir()` itself
+/// (mode 0710, no ACL entry for anyone but `username`) blocked even a
+/// traverse/`stat()`, so redfog-server's wait loop for the compositor socket
+/// timed out claiming it "failed to appear" even though the broker and KWin
+/// had both already created it successfully.
+fn redfog_server_user() -> Option<String> {
+    std::env::var("REDFOG_SERVER_USER").ok().filter(|s| !s.is_empty())
 }
 
 /// PipeWire/wireplumber/pipewire-pulse all run under `redfog-server`'s own

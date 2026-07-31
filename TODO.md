@@ -184,7 +184,7 @@ obviously than audio's hard stall.
   fully received. `SessionManager::on_loss_stats` compares that against
   the frame number we've actually sent and steps the *running* encoder's
   `bitrate` property up/down accordingly
-  (`redfog_core::set_encoder_bitrate` — live-settable on both `x264enc`
+  (`redfog_core::set_encoder_bitrate` — live-settable on both `openh264enc`
   and `nvh264enc`, no pipeline rebuild or client cooperation needed).
   Heuristic multiplicative step down/up with a dead zone
   (`adapt_bitrate_kbps`, unit tested); never exceeds the configured

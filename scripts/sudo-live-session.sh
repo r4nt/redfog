@@ -5,29 +5,48 @@
 #
 #   bash scripts/sudo-live-session.sh
 #
-# Builds the gst-wayland-display plugin (cloning/building it if needed,
-# same as scripts/run-gst-viewer.sh) and the whole workspace as YOUR user
-# first, then re-execs itself under sudo for the part that actually needs
-# root. Building as root would leave root-owned files in vendor/ and
-# target/, breaking every future normal-user `cargo build` — that's the
-# whole reason for the two-phase split, not just a style preference.
+# Package-parity mode (default whenever redfog-git is installed --
+# packaging/arch/PKGBUILD, `makepkg -si`): builds the same binaries the
+# package ships, installs them straight over the package's own
+# /usr/bin/redfog-{server,broker,login,pair}, then starts the REAL
+# redfog-broker.service/redfog-server.service systemd units -- the exact
+# same privilege-separated setup (unprivileged "redfog" system user for
+# redfog-server, root broker, shared /run/redfog-server runtime dir) a real
+# install runs. This exists specifically because that setup has its own
+# real permission/environment bugs that a from-scratch root-run test never
+# exercises at all -- three separate ones were only ever found by testing
+# the actual package, never this script, before this rewrite (a
+# REDFOG_RUNTIME_DIR mismatch between the two services, and a missing ACL
+# grant for redfog-server's own dedicated system user). Any *.conf drop-in
+# this script writes under /run/systemd/system/*.d/ to inject debug env
+# vars is removed again on exit -- /etc/redfog/redfog.conf and the units
+# themselves are never touched, so this never drifts from what makepkg -si
+# would produce on its own.
 #
-# Starts the REAL redfog-broker + redfog-server on the default Moonlight
-# ports, using the REAL redfog-login as the Login stage (type your actual
-# account's username/password) — with the gst-wayland-display plugin dir
-# set, so BOTH of the login screen's default session-picker entries (KDE
-# Plasma via KWin, Sway via gst-wayland-display) actually work, not just
-# whichever one happened to be REDFOG_BACKEND's startup default. Pick
-# either one from the real dropdown once connected.
+# Falls back to a standalone, from-scratch root-run mode (today's original
+# behavior, pre-package-parity) if redfog-git isn't installed at all --
+# still useful for quick iteration before you've ever run `makepkg -si`,
+# but doesn't exercise the packaged privilege-separation/systemd-unit model
+# above, so prefer installing the package first if you're chasing anything
+# permission- or environment-related.
 #
-# REDFOG_BROKER_PAM_SPAWN: defaults to 1, using the direct fork/PAM/setuid
-# session path (crates/redfog-session-init) instead of generating systemd
-# units — see design.md's "Privilege separation" section and project
-# memory for the comparison between the two. Set to empty/0 in your own
-# environment before invoking to use the systemd-unit path instead (still
-# preserved across the sudo re-exec below).
+# Two things the package deliberately doesn't build/wire up at all are
+# opt-in extras here, in both modes, off by default (each has its own real
+# cost -- an extra git clone + cargo-c build for Sway, real PAM session
+# establishment for PAM_SPAWN -- not worth paying on every quick KWin-only
+# test run):
+#   REDFOG_LIVE_SWAY=1          also builds/wires up the gst-wayland-display
+#                                Sway backend (MIT, cloned into vendor/) --
+#                                without this, only the KDE Plasma/KWin
+#                                session-picker entry actually works.
+#   REDFOG_BROKER_PAM_SPAWN=1   experimental direct fork/PAM/setuid session
+#                                path (crates/redfog-session-init) instead
+#                                of the systemd-run path the package always
+#                                uses -- see design.md's "Privilege
+#                                separation" section and project memory.
 #
-# Ctrl-C stops both processes and cleans up.
+# Ctrl-C stops both processes (and, in package mode, reverts the units to
+# exactly what the package itself installed) and cleans up.
 
 set -uo pipefail
 
@@ -44,26 +63,39 @@ if [ "$(id -u)" -ne 0 ]; then
         exit 1
     fi
 
-    if [ ! -d "$VENDOR_DIR" ]; then
-        echo "cloning gst-wayland-display (MIT) into $VENDOR_DIR..."
-        mkdir -p "$REPO_DIR/vendor"
-        git clone --depth 1 https://github.com/games-on-whales/gst-wayland-display.git "$VENDOR_DIR"
-    fi
-    if ! cargo cinstall --version >/dev/null 2>&1; then
-        echo "installing cargo-c (one-time build tool for gst-wayland-display)..."
-        cargo install cargo-c
-    fi
-    if [ ! -e "$PLUGIN_DIR/libgstwaylanddisplaysrc.so" ]; then
-        echo "building gst-wayland-display plugin (cargo cinstall)..."
-        (cd "$VENDOR_DIR" && cargo cinstall --prefix="$VENDOR_DIR/install")
+    if [ -n "${REDFOG_LIVE_SWAY:-}" ]; then
+        if [ ! -d "$VENDOR_DIR" ]; then
+            echo "cloning gst-wayland-display (MIT) into $VENDOR_DIR..."
+            mkdir -p "$REPO_DIR/vendor"
+            git clone --depth 1 https://github.com/games-on-whales/gst-wayland-display.git "$VENDOR_DIR"
+        fi
+        if ! cargo cinstall --version >/dev/null 2>&1; then
+            echo "installing cargo-c (one-time build tool for gst-wayland-display)..."
+            cargo install cargo-c
+        fi
+        if [ ! -e "$PLUGIN_DIR/libgstwaylanddisplaysrc.so" ]; then
+            echo "building gst-wayland-display plugin (cargo cinstall)..."
+            (cd "$VENDOR_DIR" && cargo cinstall --prefix="$VENDOR_DIR/install")
+        fi
     fi
 
     # --release, not a plain debug build: confirmed live, redfog-login's
     # own rendering is ~800ms/frame in debug vs ~2ms/frame in release —
     # slow enough in debug to starve input responsiveness badly enough to
     # feel completely broken (input events queue up behind frame writes).
-    echo "building redfog workspace (release)..."
-    (cd "$REPO_DIR" && cargo build --workspace --release)
+    #
+    # Only the binaries actually needed, not `--workspace`: matches exactly
+    # what packaging/arch/PKGBUILD's own build() builds, plus
+    # redfog-session-init when REDFOG_BROKER_PAM_SPAWN is opted into (the
+    # package never builds that one at all -- see session_init_path's doc
+    # comment in redfog-broker for why it still works unpackaged, via
+    # REDFOG_SESSION_INIT_PATH below).
+    build_pkgs=(-p redfog-server -p redfog-broker -p redfog-login -p redfog-pair)
+    if [ -n "${REDFOG_BROKER_PAM_SPAWN:-}" ]; then
+        build_pkgs+=(-p redfog-session-init)
+    fi
+    echo "building redfog (release): ${build_pkgs[*]}"
+    (cd "$REPO_DIR" && cargo build --release "${build_pkgs[@]}")
 
     echo "re-executing as root for the broker/server run phase (sudo may prompt for your password)..."
     exec sudo -E env "PATH=$PATH" "$SELF" "$@"
@@ -89,6 +121,12 @@ fi
 # `MemoryMax` is a real backstop, not just cosmetic isolation: a future leak
 # now gets OOM-killed within this scope specifically, long before it could
 # threaten the rest of a 31G machine that also runs your desktop session.
+#
+# Package mode doesn't actually run redfog-server/redfog-broker as
+# descendants of this scope at all (systemctl start hands them to their own
+# real units instead) -- kept anyway so the standalone fallback below still
+# gets the same isolation it always has, and so this phase's own `install`/
+# `systemctl`/build-artifact-copy work isn't affected either way.
 if [ -z "${REDFOG_LIVE_SCOPED:-}" ]; then
     echo "moving into a dedicated systemd scope (redfog-live.slice), isolated from this shell's own cgroup..."
     exec systemd-run --scope --unit="redfog-live-$$" --slice=redfog-live.slice --collect \
@@ -96,7 +134,8 @@ if [ -z "${REDFOG_LIVE_SCOPED:-}" ]; then
         --setenv="REDFOG_LIVE_SCOPED=1" \
         --setenv="SUDO_USER=$SUDO_USER" \
         --setenv="PATH=$PATH" \
-        --setenv="REDFOG_BROKER_PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN-1}" \
+        --setenv="REDFOG_LIVE_SWAY=${REDFOG_LIVE_SWAY:-}" \
+        --setenv="REDFOG_BROKER_PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN:-}" \
         --setenv="GST_TRACERS=${GST_TRACERS:-}" \
         --setenv="GST_DEBUG=${GST_DEBUG:-}" \
         --setenv="REDFOG_VIDEO_ENCODER=${REDFOG_VIDEO_ENCODER:-}" \
@@ -105,109 +144,197 @@ if [ -z "${REDFOG_LIVE_SCOPED:-}" ]; then
         -- "$SELF" "$@"
 fi
 
-if [ ! -e "$PLUGIN_DIR/libgstwaylanddisplaysrc.so" ]; then
+if [ -n "${REDFOG_LIVE_SWAY:-}" ] && [ ! -e "$PLUGIN_DIR/libgstwaylanddisplaysrc.so" ]; then
     echo "warning: gst-wayland-display plugin not found at $PLUGIN_DIR — the Sway session option will fail if picked." >&2
     echo "         (this shouldn't happen via the normal 'bash scripts/sudo-live-session.sh' invocation; run that instead of sudo directly.)" >&2
 fi
 
-BROKER_LOG="/tmp/redfog-live-broker.log"
-SERVER_LOG="/tmp/redfog-live-server.log"
-REDFOG_BROKER_PAM_SPAWN="${REDFOG_BROKER_PAM_SPAWN-1}"
-
-# Debugging aids for the "resume works but video updates are severely
-# throttled" investigation — see the doc comments at their corresponding
-# call sites (redfog-broker/src/session.rs's spawn_via_pam,
-# redfog-server/src/main.rs) for what these actually do. Off by default
-# (empty) since level-6 GST_DEBUG on pipewiresrc fires on every single
-# buffer poll — including no-op "popped buffer (nil)" polls — and was
-# measured generating ~370 log lines/sec of synchronous I/O on the
-# pipeline's own threads, a real perceptible overhead source, not just
-# log noise. Opt in explicitly when actively debugging that investigation:
-#   REDFOG_DEBUG_GST_DEBUG=pipewiresrc:6 ./scripts/sudo-live-session.sh
-# kwin_screencast/kwin_platform_virtual found via `strings` on the
-# installed screencast.so/libkwin.so — this repo has no KWin source.
-REDFOG_DEBUG_KWIN_LOGGING_RULES="${REDFOG_DEBUG_KWIN_LOGGING_RULES-}"
-REDFOG_DEBUG_GST_DEBUG="${REDFOG_DEBUG_GST_DEBUG-}"
-# `info` gets a periodic fps/kbps summary per video pipeline (see
-# `EncodedFrameStats` in redfog-moonlight/src/session.rs) without the
-# per-frame/per-input-event volume `debug` produces. Bump to `debug`
-# (or `trace`) when actually chasing something at that granularity:
-#   REDFOG_LIVE_SERVER_RUST_LOG=redfog_moonlight=debug,redfog_server=debug,gst_backend=debug ./scripts/sudo-live-session.sh
-REDFOG_LIVE_BROKER_RUST_LOG="${REDFOG_LIVE_BROKER_RUST_LOG-redfog_broker=info}"
-REDFOG_LIVE_SERVER_RUST_LOG="${REDFOG_LIVE_SERVER_RUST_LOG-redfog_moonlight=info,redfog_server=info,gst_backend=info}"
-
-cleanup() {
-    echo "stopping..."
-    [ -n "${SERVER_PID:-}" ] && kill -TERM "-$SERVER_PID" 2>/dev/null
-    [ -n "${BROKER_PID:-}" ] && kill -TERM "-$BROKER_PID" 2>/dev/null
-    wait 2>/dev/null
-    for unit in /run/systemd/system/redfog-session-*; do
-        [ -e "$unit" ] || continue
-        name=$(basename "$unit")
-        systemctl stop "$name" 2>/dev/null
-        rm -f "$unit"
-    done
-    systemctl daemon-reload 2>/dev/null
-    echo "stopped."
-}
-trap cleanup EXIT INT TERM
-
-rm -rf /tmp/redfog-runtime
-rm -f /tmp/redfog-live-broker.sock
-
-echo "starting redfog-broker (PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN:-<unset, systemd-unit path>}, real PAM auth)..."
-REDFOG_BROKER_PAM_SPAWN="$REDFOG_BROKER_PAM_SPAWN" \
-REDFOG_DEBUG_KWIN_LOGGING_RULES="$REDFOG_DEBUG_KWIN_LOGGING_RULES" \
-RUST_LOG="$REDFOG_LIVE_BROKER_RUST_LOG" \
-setsid "$REPO_DIR/target/release/redfog-broker" > "$BROKER_LOG" 2>&1 &
-BROKER_PID=$!
-
-deadline=$((SECONDS + 10))
-while [ ! -S /tmp/redfog-runtime/broker.sock ]; do
-    if [ $SECONDS -ge $deadline ]; then
-        echo "redfog-broker never created its socket, see $BROKER_LOG"
-        exit 1
-    fi
-    sleep 0.2
-done
-
-echo "starting redfog-server on default ports (47989/47984/48010/...)..."
-if [ -n "${REDFOG_VIDEO_ENCODER:-}" ]; then
-    echo "REDFOG_VIDEO_ENCODER=$REDFOG_VIDEO_ENCODER (forced, overriding auto-detection)"
-fi
-REDFOG_BROKER_SOCKET=/tmp/redfog-runtime/broker.sock \
-REDFOG_LOGIN_APP="$REPO_DIR/target/release/redfog-login" \
-REDFOG_USER_APP="plasmashell --no-respawn" \
-REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR="$PLUGIN_DIR" \
-REDFOG_DEBUG_GST_DEBUG="$REDFOG_DEBUG_GST_DEBUG" \
-REDFOG_VIDEO_ENCODER="${REDFOG_VIDEO_ENCODER:-}" \
-RUST_LOG="$REDFOG_LIVE_SERVER_RUST_LOG" \
-GST_TRACERS="${GST_TRACERS:-}" \
-GST_DEBUG="${GST_DEBUG:-}" \
-setsid "$REPO_DIR/target/release/redfog-server" > "$SERVER_LOG" 2>&1 &
-SERVER_PID=$!
-
-deadline=$((SECONDS + 15))
-while ! (exec 3<>/dev/tcp/127.0.0.1/47989) 2>/dev/null; do
-    exec 3<&- 2>/dev/null || true
-    if [ $SECONDS -ge $deadline ]; then
-        echo "redfog-server never came up, see $SERVER_LOG"
-        exit 1
-    fi
-    sleep 0.2
-done
-exec 3<&- 2>/dev/null || true
-
 ip=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.' | head -1)
-echo ""
-echo "=== redfog is up ==="
-echo "Point a real Moonlight client at: $ip"
-echo "(pairing PIN: watch $SERVER_LOG for the pairing request, or check the client UI)"
-echo "Login screen's session picker offers both KDE Plasma (kwin) and Sway (gst-wayland-display) — pick either."
-echo "broker log: $BROKER_LOG"
-echo "server log: $SERVER_LOG"
-echo "journal for the User-stage session (systemd-unit path only): journalctl -u 'redfog-session-*' -f"
-echo ""
-echo "Ctrl-C to stop."
 
-wait
+# ── Package-parity mode ──────────────────────────────────────────────────
+if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
+    && [ -e /usr/lib/systemd/system/redfog-server.service ] \
+    && [ -e /usr/lib/systemd/system/redfog-broker.service ]; then
+    echo "redfog-git package detected — testing via the real installed systemd units (package-parity mode)."
+
+    echo "installing freshly-built binaries over the package's own (in place; the currently-running process, if any, keeps its own already-open copy until restarted below)..."
+    install -Dm755 "$REPO_DIR/target/release/redfog-server" /usr/bin/redfog-server
+    install -Dm755 "$REPO_DIR/target/release/redfog-broker" /usr/bin/redfog-broker
+    install -Dm755 "$REPO_DIR/target/release/redfog-login" /usr/bin/redfog-login
+    install -Dm755 "$REPO_DIR/target/release/redfog-pair" /usr/bin/redfog-pair
+    if [ -n "${REDFOG_BROKER_PAM_SPAWN:-}" ]; then
+        install -Dm755 "$REPO_DIR/target/release/redfog-session-init" /usr/bin/redfog-session-init
+    fi
+
+    # Ephemeral (/run, not /etc) drop-ins so the debug env vars below never
+    # touch the package's own committed units or /etc/redfog/redfog.conf --
+    # removed again in cleanup() below, restoring exactly what `makepkg -si`
+    # installed. A distinct filename (not systemctl edit's default
+    # "override.conf") so this never collides with/clobbers any override
+    # you may have added yourself for a separate one-off debugging session.
+    broker_env=(RUST_LOG=redfog_broker=info)
+    server_env=(RUST_LOG=redfog_moonlight=info,redfog_server=info,gst_backend=info)
+    [ -n "${REDFOG_BROKER_PAM_SPAWN:-}" ] && broker_env+=(REDFOG_BROKER_PAM_SPAWN=1 REDFOG_SESSION_INIT_PATH=/usr/bin/redfog-session-init)
+    [ -n "${REDFOG_DEBUG_KWIN_LOGGING_RULES:-}" ] && broker_env+=("REDFOG_DEBUG_KWIN_LOGGING_RULES=${REDFOG_DEBUG_KWIN_LOGGING_RULES}")
+    [ -n "${REDFOG_LIVE_SWAY:-}" ] && server_env+=("REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR=${PLUGIN_DIR}")
+    [ -n "${REDFOG_VIDEO_ENCODER:-}" ] && server_env+=("REDFOG_VIDEO_ENCODER=${REDFOG_VIDEO_ENCODER}")
+    [ -n "${REDFOG_DEBUG_GST_DEBUG:-}" ] && server_env+=("REDFOG_DEBUG_GST_DEBUG=${REDFOG_DEBUG_GST_DEBUG}")
+    [ -n "${GST_TRACERS:-}" ] && server_env+=("GST_TRACERS=${GST_TRACERS}")
+    [ -n "${GST_DEBUG:-}" ] && server_env+=("GST_DEBUG=${GST_DEBUG}")
+
+    write_dropin() {
+        local dir="/run/systemd/system/$1.d"
+        shift
+        mkdir -p "$dir"
+        { echo "[Service]"; for kv in "$@"; do echo "Environment=$kv"; done; } > "$dir/zz-redfog-live-session.conf"
+    }
+    write_dropin redfog-broker.service "${broker_env[@]}"
+    write_dropin redfog-server.service "${server_env[@]}"
+
+    was_active_broker=$(systemctl is-active redfog-broker.service 2>/dev/null || true)
+    was_active_server=$(systemctl is-active redfog-server.service 2>/dev/null || true)
+
+    cleanup() {
+        echo "stopping..."
+        # Only stop a unit this script itself brought up -- if it was
+        # already running as a real, persistent deployment before this
+        # script started, leave it running (just without this session's
+        # debug env overrides, removed below).
+        [ "$was_active_broker" = "active" ] || systemctl stop redfog-broker.service 2>/dev/null
+        [ "$was_active_server" = "active" ] || systemctl stop redfog-server.service 2>/dev/null
+        rm -f "/run/systemd/system/redfog-broker.service.d/zz-redfog-live-session.conf" \
+              "/run/systemd/system/redfog-server.service.d/zz-redfog-live-session.conf"
+        for unit in /run/systemd/system/redfog-session-*; do
+            [ -e "$unit" ] || continue
+            name=$(basename "$unit")
+            systemctl stop "$name" 2>/dev/null
+            rm -f "$unit"
+        done
+        systemctl daemon-reload 2>/dev/null
+        if [ "$was_active_broker" = "active" ] || [ "$was_active_server" = "active" ]; then
+            echo "restarting redfog-broker/redfog-server to drop this session's debug overrides (they were already running before this script started)..."
+            [ "$was_active_broker" = "active" ] && systemctl restart redfog-broker.service 2>/dev/null
+            [ "$was_active_server" = "active" ] && systemctl restart redfog-server.service 2>/dev/null
+        fi
+        echo "stopped."
+    }
+    trap cleanup EXIT INT TERM
+
+    systemctl daemon-reload
+    echo "starting redfog-broker + redfog-server (real systemd units)..."
+    systemctl restart redfog-broker.service
+    systemctl restart redfog-server.service
+
+    deadline=$((SECONDS + 15))
+    while ! (exec 3<>/dev/tcp/127.0.0.1/47989) 2>/dev/null; do
+        exec 3<&- 2>/dev/null || true
+        if [ $SECONDS -ge $deadline ]; then
+            echo "redfog-server never came up, see: journalctl -u redfog-server -n 100 --no-pager"
+            exit 1
+        fi
+        sleep 0.2
+    done
+    exec 3<&- 2>/dev/null || true
+
+    echo ""
+    echo "=== redfog is up (package-parity mode: real systemd units, /usr/bin binaries, redfog-server running as its own unprivileged 'redfog' system user) ==="
+    echo "Point a real Moonlight client at: $ip"
+    echo "(pairing PIN: watch the journal below for the pairing request, or check the client UI)"
+    if [ -n "${REDFOG_LIVE_SWAY:-}" ]; then
+        echo "Login screen's session picker offers both KDE Plasma (kwin) and Sway (gst-wayland-display) — pick either."
+    else
+        echo "Login screen's session picker offers KDE Plasma only (set REDFOG_LIVE_SWAY=1 to also wire up the Sway option)."
+    fi
+    echo ""
+    echo "Ctrl-C to stop and revert to exactly what the package itself installed."
+    echo ""
+    journalctl -u redfog-broker -u redfog-server -f --since "-1s"
+
+# ── Standalone fallback (no package installed) ───────────────────────────
+else
+    echo "redfog-git not installed — falling back to standalone root-run mode."
+    echo "(doesn't exercise the packaged privilege-separation/systemd-unit model; run 'cd packaging/arch && makepkg -si' first for full parity.)"
+
+    BROKER_LOG="/tmp/redfog-live-broker.log"
+    SERVER_LOG="/tmp/redfog-live-server.log"
+    REDFOG_BROKER_PAM_SPAWN="${REDFOG_BROKER_PAM_SPAWN-}"
+
+    cleanup() {
+        echo "stopping..."
+        [ -n "${SERVER_PID:-}" ] && kill -TERM "-$SERVER_PID" 2>/dev/null
+        [ -n "${BROKER_PID:-}" ] && kill -TERM "-$BROKER_PID" 2>/dev/null
+        wait 2>/dev/null
+        for unit in /run/systemd/system/redfog-session-*; do
+            [ -e "$unit" ] || continue
+            name=$(basename "$unit")
+            systemctl stop "$name" 2>/dev/null
+            rm -f "$unit"
+        done
+        systemctl daemon-reload 2>/dev/null
+        echo "stopped."
+    }
+    trap cleanup EXIT INT TERM
+
+    rm -rf /tmp/redfog-runtime
+    rm -f /tmp/redfog-live-broker.sock
+
+    echo "starting redfog-broker (PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN:-<unset, systemd-unit path>}, real PAM auth)..."
+    REDFOG_BROKER_PAM_SPAWN="$REDFOG_BROKER_PAM_SPAWN" \
+    REDFOG_DEBUG_KWIN_LOGGING_RULES="${REDFOG_DEBUG_KWIN_LOGGING_RULES-}" \
+    RUST_LOG="${REDFOG_LIVE_BROKER_RUST_LOG-redfog_broker=info}" \
+    setsid "$REPO_DIR/target/release/redfog-broker" > "$BROKER_LOG" 2>&1 &
+    BROKER_PID=$!
+
+    deadline=$((SECONDS + 10))
+    while [ ! -S /tmp/redfog-runtime/broker.sock ]; do
+        if [ $SECONDS -ge $deadline ]; then
+            echo "redfog-broker never created its socket, see $BROKER_LOG"
+            exit 1
+        fi
+        sleep 0.2
+    done
+
+    echo "starting redfog-server on default ports (47989/47984/48010/...)..."
+    if [ -n "${REDFOG_VIDEO_ENCODER:-}" ]; then
+        echo "REDFOG_VIDEO_ENCODER=$REDFOG_VIDEO_ENCODER (forced, overriding auto-detection)"
+    fi
+    REDFOG_BROKER_SOCKET=/tmp/redfog-runtime/broker.sock \
+    REDFOG_LOGIN_APP="$REPO_DIR/target/release/redfog-login" \
+    REDFOG_USER_APP="plasmashell --no-respawn" \
+    REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR="${REDFOG_LIVE_SWAY:+$PLUGIN_DIR}" \
+    REDFOG_DEBUG_GST_DEBUG="${REDFOG_DEBUG_GST_DEBUG-}" \
+    REDFOG_VIDEO_ENCODER="${REDFOG_VIDEO_ENCODER:-}" \
+    RUST_LOG="${REDFOG_LIVE_SERVER_RUST_LOG-redfog_moonlight=info,redfog_server=info,gst_backend=info}" \
+    GST_TRACERS="${GST_TRACERS:-}" \
+    GST_DEBUG="${GST_DEBUG:-}" \
+    setsid "$REPO_DIR/target/release/redfog-server" > "$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+
+    deadline=$((SECONDS + 15))
+    while ! (exec 3<>/dev/tcp/127.0.0.1/47989) 2>/dev/null; do
+        exec 3<&- 2>/dev/null || true
+        if [ $SECONDS -ge $deadline ]; then
+            echo "redfog-server never came up, see $SERVER_LOG"
+            exit 1
+        fi
+        sleep 0.2
+    done
+    exec 3<&- 2>/dev/null || true
+
+    echo ""
+    echo "=== redfog is up (standalone mode: both processes run as root) ==="
+    echo "Point a real Moonlight client at: $ip"
+    echo "(pairing PIN: watch $SERVER_LOG for the pairing request, or check the client UI)"
+    if [ -n "${REDFOG_LIVE_SWAY:-}" ]; then
+        echo "Login screen's session picker offers both KDE Plasma (kwin) and Sway (gst-wayland-display) — pick either."
+    else
+        echo "Login screen's session picker offers KDE Plasma only (set REDFOG_LIVE_SWAY=1 to also wire up the Sway option)."
+    fi
+    echo "broker log: $BROKER_LOG"
+    echo "server log: $SERVER_LOG"
+    echo "journal for the User-stage session (systemd-unit path only): journalctl -u 'redfog-session-*' -f"
+    echo ""
+    echo "Ctrl-C to stop."
+
+    wait
+fi

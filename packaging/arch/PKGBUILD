@@ -1,0 +1,120 @@
+# Maintainer: REPLACE_ME <REPLACE_ME@example.com>
+#
+# Arch/CachyOS package (PKGBUILD/pacman format -- not CachyOS-specific, just
+# what CachyOS happens to use as an Arch derivative; see packaging/debian/
+# etc. alongside this for other package formats, if/when added).
+#
+# Local-build package: builds straight from this checkout via
+# git+file://$startdir/../.. (no need for a public remote yet). To move this
+# to a real AUR submission later, the *only* thing that needs to change is
+# the source= URL below (git+file://... -> git+https://...) -- everything
+# else (pkgver(), build(), package(), the systemd units, sysusers.d entry)
+# already follows normal AUR VCS-package conventions and needs no rework.
+#
+# Build with: cd packaging/arch && makepkg -si
+
+pkgname=redfog-git
+pkgver=r70.c528188
+pkgrel=1
+pkgdesc="Moonlight/GameStream-compatible game streaming server for KDE Plasma on Wayland"
+arch=('x86_64')
+url="https://github.com/REPLACE_ME/redfog"
+license=('Apache-2.0')
+depends=(
+    'kwin'               # kwin_wayland, the default compositor backend
+    'dbus'               # private per-session D-Bus bus
+    'pipewire'
+    'wireplumber'
+    'gstreamer'
+    'gst-plugins-base'
+    'gst-plugin-pipewire'    # pipewiresrc, our actual capture source
+    'gst-plugins-bad'        # openh264enc (the software encoder fallback,
+                             # replaced x264enc/gst-plugins-ugly entirely) +
+                             # vulkan*/nv* elements (NVENC, Vulkan import) --
+                             # openh264enc itself is owned by this package,
+                             # not gst-plugins-bad-libs (confirmed via
+                             # pacman -Qo); depends on gst-plugins-bad-libs
+                             # anyway, so listing just this one still covers
+                             # the vulkan/nv elements too.
+    'wayland'
+    'pam'                # redfog-broker links libpam.so.0 directly for
+                         # authentication -- confirmed via namcap, missing
+                         # from an earlier draft of this list
+)
+optdepends=(
+    'nvidia-utils: hardware-accelerated NVENC video encoding'
+    'plasma-workspace: plasmashell, the default User-stage session (REDFOG_USER_APP)'
+)
+makedepends=('cargo' 'clang' 'git')
+provides=('redfog')
+conflicts=('redfog')
+backup=('etc/redfog/redfog.conf')
+# Confirmed live: with the system default OPTIONS=(... lto ...) active,
+# `ring` (pulled in transitively via rustls, for TLS) fails to *link* --
+# undefined symbols for every one of its C/assembly-implemented crypto
+# routines (aes_hw_set_encrypt_key, x25519_*, p384_*, ...). `ring`'s C/ASM
+# code gets compiled with -flto by cc-rs picking up the ambient CFLAGS,
+# producing LTO-intermediate object files that rust-lld (rustc's linker)
+# can't resolve, unlike gcc's own LTO-aware linker plugin. Isolated by
+# comparing an identical `cargo build --release` of the same packages
+# against a fresh target dir in the main checkout (succeeds, no ambient
+# LTO flags) with the same build under makepkg (fails) -- nothing else
+# about the two environments differed.
+options=('!lto')
+# #branch=main is deliberate, not cosmetic: a bare git+file:// URL clones
+# whatever this repo's *own* HEAD currently is, which in a jj-colocated
+# repo can be a stale, detached commit that doesn't match the "main"
+# bookmark/branch -- confirmed live, silently building an old tree with no
+# error at all. Naming the branch explicitly clones what "main" actually
+# points at, matching a real AUR git+https://... source's usual intent
+# (build the project's main branch) when this URL gets swapped later.
+source=("redfog::git+file://$startdir/../..#branch=main")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/redfog"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+    cd "$srcdir/redfog"
+    # pam-sys (a real dependency, via redfog-broker's PAM integration) needs
+    # a bindgen bump not yet published upstream; moonlight-common-rust is
+    # dev-only (redfog-moonlight's own tests, never linked into anything
+    # shipped here) but `cargo fetch` still wants it present in vendor/ to
+    # resolve the full workspace lockfile. See this script's own comments
+    # for exactly why each one is patched instead of just version-bumped.
+    ./scripts/fetch-patched-deps.sh
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$srcdir/redfog"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    # Only the real production binaries -- not the dev/test tools (viewer,
+    # redfog-test-ux, kwin-capture's own main.rs, redfog-session-init) that
+    # live in the same workspace but were never meant to be installed.
+    cargo build --frozen --release \
+        -p redfog-server \
+        -p redfog-broker \
+        -p redfog-login \
+        -p redfog-pair
+}
+
+package() {
+    cd "$srcdir/redfog"
+
+    install -Dm755 target/release/redfog-server "$pkgdir/usr/bin/redfog-server"
+    install -Dm755 target/release/redfog-broker "$pkgdir/usr/bin/redfog-broker"
+    install -Dm755 target/release/redfog-login  "$pkgdir/usr/bin/redfog-login"
+    install -Dm755 target/release/redfog-pair   "$pkgdir/usr/bin/redfog-pair"
+
+    install -Dm644 packaging/arch/redfog-broker.service "$pkgdir/usr/lib/systemd/system/redfog-broker.service"
+    install -Dm644 packaging/arch/redfog-server.service "$pkgdir/usr/lib/systemd/system/redfog-server.service"
+    install -Dm644 packaging/arch/redfog.sysusers        "$pkgdir/usr/lib/sysusers.d/redfog.conf"
+    install -Dm644 packaging/arch/redfog.conf            "$pkgdir/etc/redfog/redfog.conf"
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -17,6 +17,17 @@ target
 # and patches/*.patch) — not vendored into git, fetched on demand instead.
 /vendor/
 
+# makepkg's own working dirs (bare VCS clone, source clone, package
+# staging) and build output -- confirmed live these can include the bare
+# clone's own pack files and multi-hundred-MB release binaries, none of
+# which were ever meant to be tracked.
+/packaging/arch/redfog/
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.pkg.tar.*
+/packaging/arch/*.log
+/packaging/arch/.SRCINFO
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

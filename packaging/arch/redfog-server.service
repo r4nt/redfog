@@ -1,0 +1,46 @@
+[Unit]
+Description=redfog game streaming server (Moonlight-compatible)
+Documentation=https://github.com/REPLACE_ME/redfog
+After=network.target redfog-broker.service
+Wants=redfog-broker.service
+
+[Service]
+Type=simple
+User=redfog
+Group=redfog
+ExecStart=/usr/bin/redfog-server
+Restart=on-failure
+RestartSec=2
+
+# This unit's own ephemeral runtime state (PipeWire/KWin sockets etc, via
+# REDFOG_RUNTIME_DIR) -- distinct from redfog-broker's own /run/redfog
+# (which just holds its socket file, group-readable by this service's
+# "redfog" group for REDFOG_BROKER_SOCKET below). Owned outright by this
+# unit (not shared with redfog-broker.service the way /run/redfog-server's
+# *contents* still effectively are -- see below): `HeadlessRuntime::start`
+# unconditionally chmods this directory to 0700, which only succeeds
+# because this unit owns it; a directory redfog-broker.service also
+# declared via its own RuntimeDirectory= would be root-owned instead, and
+# that chmod would fail with EPERM, taking this whole service down at
+# startup.
+RuntimeDirectory=redfog-server
+RuntimeDirectoryMode=0750
+
+# Persistent TLS identity + paired-client list -- see
+# redfog_moonlight::tls::default_state_dir's doc comment for why this
+# can't just be the runtime dir above (that one's wiped on every stop).
+# $STATE_DIRECTORY is exported automatically from this and picked up by
+# that same function; no explicit REDFOG_STATE_DIR needed.
+StateDirectory=redfog-server
+StateDirectoryMode=0750
+
+Environment=REDFOG_RUNTIME_DIR=/run/redfog-server
+Environment=REDFOG_BROKER_SOCKET=/run/redfog/broker.sock
+Environment=REDFOG_LOGIN_APP=/usr/bin/redfog-login
+# Admin-editable: ports, REDFOG_USER_APP, video encoder, debug flags, etc.
+# -- see /etc/redfog/redfog.conf's own comments. The leading "-" means this
+# unit still starts fine if the file doesn't exist.
+EnvironmentFile=-/etc/redfog/redfog.conf
+
+[Install]
+WantedBy=multi-user.target

@@ -829,6 +829,29 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
         // with a CPU `videoconvert` ahead of the encoder). `leaky=downstream`
         // + a small `max-size-buffers` keeps it a pure threading boundary,
         // not a latency-adding buffer.
+        // `rate-control=bitrate`: openh264enc's default (`quality`) ignores
+        // the `bitrate` property entirely (confirmed via `gst-inspect-1.0
+        // openh264enc`) -- needs to be set explicitly to get the same
+        // "target this bitrate" behavior `x264enc`'s `bitrate` property had
+        // by default. `bitrate` is bits/sec, not kbit/sec like `x264enc`'s
+        // was, hence the `* 1000`. No explicit stream-format property
+        // needed either: unlike `x264enc`, openh264enc's src pad is
+        // hardwired to byte-stream/au already (confirmed via its SRC
+        // template), so the downstream capsfilter is purely a formality
+        // here, not a real conversion.
+        //
+        // Deliberately no `max-bitrate=` here: setting it to the same value
+        // as the *initial* `bitrate` (as this arm used to) broke live
+        // adaptive bitrate outright -- confirmed live, `set_encoder_bitrate`
+        // raising `bitrate` past that frozen ceiling made OpenH264's own
+        // internal validation reject it ("MaxSpatialBitrate should be
+        // larger than SpatialBitrate"), which fails `WelsInitEncoderExt`
+        // and kills the whole pipeline (`not-negotiated` on the source
+        // element). Leaving `max-bitrate` at its own default (0, confirmed
+        // live via `gst-launch-1.0` to mean "no cap", not "cap at zero")
+        // avoids the whole class of bug — there's no real reason for this
+        // encoder to have a *separate*, narrower ceiling than `bitrate`
+        // itself in the first place.
         (VideoSource::PipeWireNode(node_id), VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps }) => {
             format!(
                 "pipewiresrc name=pipewiresrc path={node_id} client-name=\"{client_name}\" \
@@ -838,11 +861,11 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
                  ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
                  ! videoconvert \
                  ! video/x-raw,format=I420 \
-                 ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
-                           byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
+                 ! openh264enc name={ENCODER_ELEMENT_NAME} usage-type=screen rate-control=bitrate \
+                               gop-size=300 bitrate={} \
                  ! video/x-h264,stream-format=byte-stream,alignment=au \
                  ! appsink name=sink sync=false",
-                2000 / fps,
+                2000 / fps, bitrate_kbps * 1000,
             )
         }
         // No CPU `videoconvert` here — `nvh264enc`'s sink pad accepts a wide
@@ -959,7 +982,7 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
         // Never implemented: `KwinNativeDmaBuf` only exists to feed hardware encoders
         // — there's no CPU-side consumer of a raw
         // DMA-BUF frame without a GPU upload step, and neither `LocalDisplay` (the `viewer` debug
-        // tool) nor `Software` (`x264enc`, no GPU dependency by design) has
+        // tool) nor `Software` (`openh264enc`, no GPU dependency by design) has
         // any reason to pull in a GPU context for that. Use `PipeWireNode`
         // (the default) for either of those.
         (VideoSource::KwinNativeDmaBuf { .. }, VideoSink::LocalDisplay)
@@ -1000,10 +1023,11 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
              ! identity name={FPS_CAP_ELEMENT_NAME} \
              ! videoconvert \
              ! video/x-raw,format=I420 \
-             ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
-                       byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
+             ! openh264enc name={ENCODER_ELEMENT_NAME} usage-type=screen rate-control=bitrate \
+                           gop-size=300 bitrate={} \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
-             ! appsink name=sink sync=false"
+             ! appsink name=sink sync=false",
+            bitrate_kbps * 1000,
         ),
         (VideoSource::GstWaylandDisplay { render_node, width, height, fps }, VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps }) => format!(
             "waylanddisplaysrc name=waylanddisplaysrc render-node=\"{render_node}\" \
@@ -1055,10 +1079,11 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
              ! identity name={FPS_CAP_ELEMENT_NAME} \
              ! videoconvert \
              ! video/x-raw,format=I420 \
-             ! x264enc name={ENCODER_ELEMENT_NAME} tune=zerolatency speed-preset=ultrafast \
-                       byte-stream=true key-int-max=300 bitrate={bitrate_kbps} \
+             ! openh264enc name={ENCODER_ELEMENT_NAME} usage-type=screen rate-control=bitrate \
+                           gop-size=300 bitrate={} \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
-             ! appsink name=sink sync=false"
+             ! appsink name=sink sync=false",
+            bitrate_kbps * 1000,
         ),
         (VideoSource::Login { width, height, .. }, VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps }) => format!(
             "appsrc name=login-appsrc format=time is-live=true block=false \
@@ -1133,7 +1158,7 @@ where
     pipeline
 }
 
-/// Name of the H.264 encoder element (`x264enc` or `nvh264enc`, whichever
+/// Name of the H.264 encoder element (`openh264enc` or `nvh264enc`, whichever
 /// [`VideoEncoder`] selected) in the pipeline built by
 /// [`make_encoder_pipeline`], so callers can address it (e.g. [`request_keyframe`]).
 /// Kept identical across both so `request_keyframe` stays encoder-agnostic —
@@ -1154,8 +1179,15 @@ const KWIN_NATIVE_APPSRC_NAME: &str = "kwin-native-appsrc";
 /// Which H.264 encoder [`make_encoder_pipeline`] builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoEncoder {
-    /// `x264enc` — always available, no GPU dependency. Default: safe on
-    /// any machine, including CI/dev boxes without an NVIDIA GPU.
+    /// `openh264enc` — always available, no GPU dependency. Default: safe
+    /// on any machine, including CI/dev boxes without an NVIDIA GPU.
+    /// `usage-type=screen` (OpenH264's screen-content-coding mode, tuned for
+    /// sharp UI edges/text over natural video) is set unconditionally in
+    /// `video_pipeline_description` — every source here is a screen/desktop
+    /// capture (KWin, PipeWire, the Login stage's `tiny-skia` UI), never an
+    /// actual camera feed, so there's no case where the `camera` default
+    /// would be the better fit. Replaced `x264enc` entirely (see git history)
+    /// — dropping the `gst-plugins-ugly` dependency it required.
     #[default]
     Software,
     /// `nvh264enc` (NVCODEC/NVENC) — confirmed live on an RTX 2080 to work
@@ -1242,7 +1274,7 @@ pub fn detect_video_encoder() -> VideoEncoder {
         eprintln!("redfog-core: nvh264enc is available, defaulting to direct NVENC video encoding");
         VideoEncoder::NvencDirect
     } else {
-        eprintln!("redfog-core: nvh264enc not found, defaulting to software video encoding (x264enc)");
+        eprintln!("redfog-core: nvh264enc not found, defaulting to software video encoding (openh264enc)");
         VideoEncoder::Software
     }
 }
@@ -1399,23 +1431,32 @@ pub fn request_keyframe(pipeline: &gst::Pipeline) {
 
 /// Live-adjust a [`make_encoder_pipeline`] pipeline's target bitrate — no
 /// rebuild/reconnect needed: `bitrate` is `changeable in NULL, READY,
-/// PAUSED or PLAYING state` on both `x264enc` and `nvh264enc` (confirmed
-/// via `gst-inspect-1.0`), and an H.264 bitstream doesn't need the decoder
-/// told anything when it changes — a decoder just decodes whatever NAL
-/// units arrive, whatever size they are. For server-side adaptive
-/// bitrate, reacting to the client's `LossStats` control-channel reports
-/// (see `control::ControlEventHandler::on_loss_stats`) — unlike a
-/// resolution/fps change, this needs no client-side protocol support at
-/// all, which is why it's the tractable half of "live renegotiation" (see
-/// project notes on the Foundation-Sunshine dynamic-stream-param-change
-/// extension, which bundles resolution/fps in too — those genuinely do
-/// need the client to know, since decoder output geometry isn't something
-/// downstream rendering can just shrug off).
+/// PAUSED or PLAYING state` on `openh264enc`, `nvh264enc`, and
+/// `vulkanh264enc` alike (confirmed via `gst-inspect-1.0`), and an H.264
+/// bitstream doesn't need the decoder told anything when it changes — a
+/// decoder just decodes whatever NAL units arrive, whatever size they are.
+/// For server-side adaptive bitrate, reacting to the client's `LossStats`
+/// control-channel reports (see `control::ControlEventHandler::on_loss_stats`)
+/// — unlike a resolution/fps change, this needs no client-side protocol
+/// support at all, which is why it's the tractable half of "live
+/// renegotiation" (see project notes on the Foundation-Sunshine
+/// dynamic-stream-param-change extension, which bundles resolution/fps in
+/// too — those genuinely do need the client to know, since decoder output
+/// geometry isn't something downstream rendering can just shrug off).
+///
+/// `openh264enc`'s own `bitrate` property is bits/sec, unlike every other
+/// encoder used here (`nvh264enc`/`vulkanh264enc`), which take kbit/sec
+/// directly — same mismatch `video_pipeline_description`'s `Software` arms
+/// already account for at pipeline-construction time. Checked by factory
+/// name here since this function has no `VideoEncoder` of its own to switch
+/// on, only the already-built pipeline.
 pub fn set_encoder_bitrate(pipeline: &gst::Pipeline, bitrate_kbps: u32) {
     let Some(encoder) = pipeline.by_name(ENCODER_ELEMENT_NAME) else {
         return;
     };
-    encoder.set_property("bitrate", bitrate_kbps);
+    let is_openh264 = encoder.factory().is_some_and(|f| f.name() == "openh264enc");
+    let bitrate = if is_openh264 { bitrate_kbps * 1000 } else { bitrate_kbps };
+    encoder.set_property("bitrate", bitrate);
 }
 
 /// [`kwin_capture::nvenc_session::CudaDirectEncoderSession`] re-exported so

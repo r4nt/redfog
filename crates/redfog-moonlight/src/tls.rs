@@ -123,7 +123,32 @@ impl ServerIdentity {
     }
 }
 
+/// Where the server's TLS identity and paired-client list persist.
+/// Deliberately *not* just `default_runtime_dir()` (which this used to be
+/// -- `/tmp/redfog-runtime` by default, tmpfs-backed, wiped every reboot):
+/// that's the right place for genuinely ephemeral per-session state
+/// (PipeWire/KWin sockets), but pairing/TLS identity needs to survive a
+/// reboot or every client has to re-pair each time — a real problem for an
+/// actual install, only surfaced by packaging this for the first time.
+///
+/// Prefers `REDFOG_STATE_DIR` if set (explicit override), then systemd's
+/// own `$STATE_DIRECTORY` (automatically exported when a unit sets
+/// `StateDirectory=`, so a packaged install needs zero extra configuration
+/// for this to just work), falling back to the old runtime-dir-based path
+/// for backward compatibility with existing dev/test usage (which sets
+/// `REDFOG_RUNTIME_DIR` to a fresh per-run temp dir and expects everything,
+/// including this, to live under it).
 pub fn default_state_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("REDFOG_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(dirs) = std::env::var("STATE_DIRECTORY") {
+        if let Some(first) = dirs.split(':').next() {
+            if !first.is_empty() {
+                return PathBuf::from(first);
+            }
+        }
+    }
     PathBuf::from(redfog_core::default_runtime_dir()).join("moonlight")
 }
 
