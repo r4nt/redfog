@@ -14,7 +14,7 @@
 # Build with: cd packaging/arch && makepkg -si
 
 pkgname=redfog-git
-pkgver=r70.c528188
+pkgver=r70.246042d
 pkgrel=1
 pkgdesc="Moonlight/GameStream-compatible game streaming server for KDE Plasma on Wayland"
 arch=('x86_64')

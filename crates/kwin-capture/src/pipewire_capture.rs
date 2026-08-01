@@ -391,7 +391,21 @@ impl PipewireCapture {
         Ok(())
     }
 
+    /// Bounded, not a plain `recv()`: a damage-driven source (KWin's virtual
+    /// output) can legitimately have nothing new to deliver for an arbitrary
+    /// stretch of real time (an idle desktop, or one taken over from another
+    /// client with nothing currently forcing a repaint) — an unbounded
+    /// `recv()` here blocked the caller's whole loop for that entire
+    /// stretch, including its `shutdown` flag check, which only happens
+    /// *between* calls. That in turn made `CudaDirectEncoderSession::drop`'s
+    /// `thread.join()` block just as indefinitely, since setting `shutdown`
+    /// alone can't wake an in-progress `recv()` — confirmed live via a gdb
+    /// thread dump on a session stuck exactly this way. `None` on timeout is
+    /// already a case every caller already handles identically to a real
+    /// disconnect (see `nvenc_session::run`'s own `let Some(frame) = ...
+    /// else { sleep; continue }`), so this changes nothing about their
+    /// control flow, just how promptly they get to re-check `shutdown`.
     pub fn next_frame(&self) -> Option<CapturedFrame> {
-        self.frame_rx.recv().ok()
+        self.frame_rx.recv_timeout(std::time::Duration::from_millis(200)).ok()
     }
 }
