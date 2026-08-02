@@ -159,10 +159,21 @@ impl PairingServer {
         // *which* certificate a request actually presents — see
         // `is_paired_by_cert`'s doc comment for why that's the only
         // trustworthy way to tell two physical clients apart.
-        let tls_config = rustls::ServerConfig::builder()
+        let mut tls_config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(crate::tls::AcceptAnyClientCert::new())
             .with_single_cert(cert, key)
             .map_err(|e| format!("failed to build tls config: {e}"))?;
+        // Opt-in only (never unconditional -- this would otherwise let
+        // anyone who can read the log file decrypt every captured TLS
+        // session): set SSLKEYLOGFILE to a writable path to have rustls
+        // log per-session key material there, in the standard NSS
+        // key-log format Wireshark/tshark already know how to consume
+        // (`-o tls.keylog_file:...`) to decrypt a capture of this
+        // traffic -- e.g. for verifying what a real client actually
+        // received, not just inferring it from packet lengths/timing.
+        if std::env::var_os("SSLKEYLOGFILE").is_some() {
+            tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
+        }
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
 
         let listener = TcpListener::bind((bind_addr, self.https_port))
@@ -232,8 +243,9 @@ impl PairingServer {
         let client_key = client_cert_fingerprint.clone().map(ClientKey::Cert).unwrap_or(ClientKey::Ip(peer.ip()));
 
         match path.as_str() {
-            "/serverinfo" => self.server_info(&params, https, client_cert_fingerprint.as_deref()),
+            "/serverinfo" => self.server_info(&params, https, client_cert_fingerprint.as_deref(), local_addr.ip()),
             "/applist" => self.app_list(),
+            "/appasset" => app_asset(),
             "/pair" => self.pair(&params).await,
             "/unpair" => self.unpair(&params),
             "/launch" => self.launch(&params, local_addr.ip(), client_key, peer.ip()).await,
@@ -246,7 +258,7 @@ impl PairingServer {
         }
     }
 
-    fn server_info(&self, _params: &HashMap<String, String>, https: bool, client_cert_fingerprint: Option<&str>) -> Response<Full<Bytes>> {
+    fn server_info(&self, _params: &HashMap<String, String>, https: bool, client_cert_fingerprint: Option<&str>, local_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
         // `uniqueid` alone can't tell two physical clients apart — real
         // Moonlight clients share a hardcoded placeholder uniqueid for any
         // server they don't detect as genuine Nvidia GFE (see
@@ -281,7 +293,7 @@ impl PairingServer {
     <HttpsPort>{https_port}</HttpsPort>
     <ExternalPort>{http_port}</ExternalPort>
     <mac>00:00:00:00:00:00</mac>
-    <LocalIP>127.0.0.1</LocalIP>
+    <LocalIP>{local_ip}</LocalIP>
     <SupportedDisplayMode>
 {display_modes}    </SupportedDisplayMode>
     <PairStatus>{pair_status}</PairStatus>
@@ -292,6 +304,7 @@ impl PairingServer {
             server_id = self.identity.unique_id,
             https_port = self.https_port,
             http_port = self.http_port,
+            local_ip = local_ip,
             pair_status = if paired { 1 } else { 0 },
             display_modes = SUPPORTED_DISPLAY_MODES
                 .iter()
@@ -302,17 +315,7 @@ impl PairingServer {
     }
 
     fn app_list(&self) -> Response<Full<Bytes>> {
-        let body = format!(
-            r#"<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200">
-    <App>
-        <AppTitle>{APP_NAME}</AppTitle>
-        <ID>{APP_ID}</ID>
-        <IsHdrSupported>0</IsHdrSupported>
-    </App>
-</root>"#
-        );
-        xml_response(body)
+        xml_response(app_list_body())
     }
 
     async fn pair(&self, params: &HashMap<String, String>) -> Response<Full<Bytes>> {
@@ -591,6 +594,37 @@ fn xml_response(body: impl Into<String>) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+/// No whitespace between tags: real Moonlight clients (e.g. moonlight-android's
+/// NvHTTP.getAppListByReader) call appList.getLast() on every XML TEXT event, but
+/// only push an entry once <App> is seen. A stray text node from indentation
+/// whitespace between <root> and <App> fires before any app exists, throwing
+/// NoSuchElementException and crashing the client's app-list polling thread.
+fn app_list_body() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><App><AppTitle>{APP_NAME}</AppTitle><ID>{APP_ID}</ID><IsHdrSupported>0</IsHdrSupported></App></root>"#
+    )
+}
+
+/// Real clients fetch this themselves for box art (constructing the URL
+/// from `/applist`'s `<ID>`) whether or not we ever advertise support for
+/// it — this isn't optional/best-effort the way it might look. Confirmed
+/// live: with no handler here at all, this fell through to `not_found()`
+/// (an empty body, no `Content-Type`) — harmless for a browser-based
+/// client (just a broken-image placeholder), but a plausible crash for a
+/// native client's image decoder fed zero bytes instead of a real image.
+/// A single static 1x1 transparent PNG regardless of `appid`/`AssetType`/
+/// `AssetIdx` is enough to fix that: this server only ever lists one
+/// fixed `App` (see `APP_NAME`/`APP_ID`), so there's nothing to actually
+/// look up any of those params against.
+static PLACEHOLDER_BOXART_PNG: &[u8] = include_bytes!("../assets/placeholder-boxart.png");
+
+fn app_asset() -> Response<Full<Bytes>> {
+    Response::builder()
+        .header("Content-Type", "image/png")
+        .body(Full::new(Bytes::from_static(PLACEHOLDER_BOXART_PNG)))
+        .unwrap()
+}
+
 fn bad_request(message: String) -> Response<Full<Bytes>> {
     tracing::warn!("bad pairing request: {message}");
     Response::builder()
@@ -648,5 +682,25 @@ mod tests {
         params.insert("height".to_string(), "480".to_string());
         params.insert("fps".to_string(), "15".to_string());
         assert_eq!(PairingServer::parse_mode(&params), (1920, 1080, 60));
+    }
+
+    /// Regression test for a real crash: moonlight-android's XML pull-parser
+    /// calls `appList.getLast()` on *every* text node, and only pushes an
+    /// entry once it has seen a `<App>` start tag. Whitespace between
+    /// `<root ...>` and `<App>` (or between `</App>` and `</root>`) is itself
+    /// a text node, so if it appears before any `<App>` has been seen, the
+    /// client throws `NoSuchElementException` and its app-list polling
+    /// thread dies. Confirmed live via `adb logcat` against a real device.
+    #[test]
+    fn app_list_body_has_no_whitespace_between_structural_tags() {
+        let body = app_list_body();
+        assert!(
+            body.contains(r#"<root status_code="200"><App>"#),
+            "found whitespace/text between <root> and <App>, which crashes real clients: {body}"
+        );
+        assert!(
+            body.contains("</App></root>"),
+            "found whitespace/text between </App> and </root>, which crashes real clients: {body}"
+        );
     }
 }

@@ -141,6 +141,9 @@ if [ -z "${REDFOG_LIVE_SCOPED:-}" ]; then
         --setenv="REDFOG_VIDEO_ENCODER=${REDFOG_VIDEO_ENCODER:-}" \
         --setenv="REDFOG_DEBUG_GST_DEBUG=${REDFOG_DEBUG_GST_DEBUG:-}" \
         --setenv="REDFOG_DEBUG_KWIN_LOGGING_RULES=${REDFOG_DEBUG_KWIN_LOGGING_RULES:-}" \
+        --setenv="REDFOG_LIVE_BROKER_RUST_LOG=${REDFOG_LIVE_BROKER_RUST_LOG:-}" \
+        --setenv="REDFOG_LIVE_SERVER_RUST_LOG=${REDFOG_LIVE_SERVER_RUST_LOG:-}" \
+        --setenv="REDFOG_LIVE_TLS_KEYLOG=${REDFOG_LIVE_TLS_KEYLOG:-}" \
         -- "$SELF" "$@"
 fi
 
@@ -172,8 +175,8 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
     # installed. A distinct filename (not systemctl edit's default
     # "override.conf") so this never collides with/clobbers any override
     # you may have added yourself for a separate one-off debugging session.
-    broker_env=(RUST_LOG=redfog_broker=info)
-    server_env=(RUST_LOG=redfog_moonlight=info,redfog_server=info,gst_backend=info)
+    broker_env=("RUST_LOG=${REDFOG_LIVE_BROKER_RUST_LOG:-redfog_broker=info}")
+    server_env=("RUST_LOG=${REDFOG_LIVE_SERVER_RUST_LOG:-redfog_moonlight=info,redfog_server=info,gst_backend=info}")
     [ -n "${REDFOG_BROKER_PAM_SPAWN:-}" ] && broker_env+=(REDFOG_BROKER_PAM_SPAWN=1 REDFOG_SESSION_INIT_PATH=/usr/bin/redfog-session-init)
     [ -n "${REDFOG_DEBUG_KWIN_LOGGING_RULES:-}" ] && broker_env+=("REDFOG_DEBUG_KWIN_LOGGING_RULES=${REDFOG_DEBUG_KWIN_LOGGING_RULES}")
     [ -n "${REDFOG_LIVE_SWAY:-}" ] && server_env+=("REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR=${PLUGIN_DIR}")
@@ -181,6 +184,21 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
     [ -n "${REDFOG_DEBUG_GST_DEBUG:-}" ] && server_env+=("REDFOG_DEBUG_GST_DEBUG=${REDFOG_DEBUG_GST_DEBUG}")
     [ -n "${GST_TRACERS:-}" ] && server_env+=("GST_TRACERS=${GST_TRACERS}")
     [ -n "${GST_DEBUG:-}" ] && server_env+=("GST_DEBUG=${GST_DEBUG}")
+    # Opt-in TLS session key logging (rustls honors SSLKEYLOGFILE directly)
+    # -- lets a packet capture of this session's HTTPS traffic be decrypted
+    # afterward (e.g. `tshark -o tls.keylog_file:...`). Never set by
+    # default -- see pairing.rs's own doc comment on why this is gated at
+    # all. Deliberately a separate REDFOG_LIVE_-prefixed name, translated
+    # to the real SSLKEYLOGFILE only here, at the one place that actually
+    # invokes redfog-server -- setting the raw SSLKEYLOGFILE for this
+    # whole script would also reach the `cargo build` step above (env vars
+    # apply to a script's entire process tree), and cargo's own HTTP/TLS
+    # stack honors that same variable too: confirmed live, it eagerly
+    # opens/creates the file the moment it sees it, as this user, before
+    # the root phase even starts -- permanently blocking the actual
+    # redfog-server process (running as a different user) from ever
+    # writing to that same now-pre-existing file.
+    [ -n "${REDFOG_LIVE_TLS_KEYLOG:-}" ] && server_env+=("SSLKEYLOGFILE=${REDFOG_LIVE_TLS_KEYLOG}")
 
     write_dropin() {
         local dir="/run/systemd/system/$1.d"
@@ -281,7 +299,7 @@ else
     echo "starting redfog-broker (PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN:-<unset, systemd-unit path>}, real PAM auth)..."
     REDFOG_BROKER_PAM_SPAWN="$REDFOG_BROKER_PAM_SPAWN" \
     REDFOG_DEBUG_KWIN_LOGGING_RULES="${REDFOG_DEBUG_KWIN_LOGGING_RULES-}" \
-    RUST_LOG="${REDFOG_LIVE_BROKER_RUST_LOG-redfog_broker=info}" \
+    RUST_LOG="${REDFOG_LIVE_BROKER_RUST_LOG:-redfog_broker=info}" \
     setsid "$REPO_DIR/target/release/redfog-broker" > "$BROKER_LOG" 2>&1 &
     BROKER_PID=$!
 
@@ -304,9 +322,10 @@ else
     REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR="${REDFOG_LIVE_SWAY:+$PLUGIN_DIR}" \
     REDFOG_DEBUG_GST_DEBUG="${REDFOG_DEBUG_GST_DEBUG-}" \
     REDFOG_VIDEO_ENCODER="${REDFOG_VIDEO_ENCODER:-}" \
-    RUST_LOG="${REDFOG_LIVE_SERVER_RUST_LOG-redfog_moonlight=info,redfog_server=info,gst_backend=info}" \
+    RUST_LOG="${REDFOG_LIVE_SERVER_RUST_LOG:-redfog_moonlight=info,redfog_server=info,gst_backend=info}" \
     GST_TRACERS="${GST_TRACERS:-}" \
     GST_DEBUG="${GST_DEBUG:-}" \
+    SSLKEYLOGFILE="${REDFOG_LIVE_TLS_KEYLOG:-}" \
     setsid "$REPO_DIR/target/release/redfog-server" > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
 
