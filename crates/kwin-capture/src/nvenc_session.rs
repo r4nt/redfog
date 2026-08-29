@@ -200,6 +200,14 @@ fn run(
         config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
         config.rcParams.averageBitRate = bitrate_kbps * 1000;
         config.rcParams.maxBitRate = bitrate_kbps * 1000;
+        // Spatial adaptive quantization: redistributes bits *within* each
+        // frame toward detailed/high-motion regions instead of spreading
+        // them evenly, at the same CBR average bitrate — doesn't touch
+        // preset/tuning/GOP, so it costs no extra latency, just NVENC's own
+        // (fixed-function, not host-CPU) per-frame analysis. `aqStrength`
+        // deliberately left unset (0 = auto) — NVIDIA's own recommended
+        // default rather than a guessed fixed value.
+        config.rcParams.set_enableAQ(1);
         unsafe { config.encodeCodecConfig.h264Config.set_repeatSPSPPS(1) };
     }
 
