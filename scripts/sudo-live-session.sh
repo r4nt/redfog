@@ -144,6 +144,7 @@ if [ -z "${REDFOG_LIVE_SCOPED:-}" ]; then
         --setenv="REDFOG_LIVE_BROKER_RUST_LOG=${REDFOG_LIVE_BROKER_RUST_LOG:-}" \
         --setenv="REDFOG_LIVE_SERVER_RUST_LOG=${REDFOG_LIVE_SERVER_RUST_LOG:-}" \
         --setenv="REDFOG_LIVE_TLS_KEYLOG=${REDFOG_LIVE_TLS_KEYLOG:-}" \
+        --setenv="REDFOG_LOG_MOUSE_EVENTS=${REDFOG_LOG_MOUSE_EVENTS:-}" \
         -- "$SELF" "$@"
 fi
 
@@ -184,6 +185,11 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
     [ -n "${REDFOG_DEBUG_GST_DEBUG:-}" ] && server_env+=("REDFOG_DEBUG_GST_DEBUG=${REDFOG_DEBUG_GST_DEBUG}")
     [ -n "${GST_TRACERS:-}" ] && server_env+=("GST_TRACERS=${GST_TRACERS}")
     [ -n "${GST_DEBUG:-}" ] && server_env+=("GST_DEBUG=${GST_DEBUG}")
+    # Opt-in per-mouse-event INFO logging (session.rs's on_input) --
+    # unconditional on RUST_LOG's own level, so it's visible even without
+    # bumping redfog_moonlight::session to debug (which would also drop a
+    # debug! line per keystroke/mouse-move, a lot more volume).
+    [ -n "${REDFOG_LOG_MOUSE_EVENTS:-}" ] && server_env+=("REDFOG_LOG_MOUSE_EVENTS=${REDFOG_LOG_MOUSE_EVENTS}")
     # Opt-in TLS session key logging (rustls honors SSLKEYLOGFILE directly)
     # -- lets a packet capture of this session's HTTPS traffic be decrypted
     # afterward (e.g. `tshark -o tls.keylog_file:...`). Never set by
@@ -326,6 +332,7 @@ else
     GST_TRACERS="${GST_TRACERS:-}" \
     GST_DEBUG="${GST_DEBUG:-}" \
     SSLKEYLOGFILE="${REDFOG_LIVE_TLS_KEYLOG:-}" \
+    REDFOG_LOG_MOUSE_EVENTS="${REDFOG_LOG_MOUSE_EVENTS:-}" \
     setsid "$REPO_DIR/target/release/redfog-server" > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
 

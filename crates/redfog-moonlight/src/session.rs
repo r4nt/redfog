@@ -887,7 +887,6 @@ impl SessionManager {
         audio_loopback: &AudioLoopback,
         generation: u64,
         fps_cap: Option<u32>,
-        client_key: ClientKey,
         initial_bitrate_kbps: u32,
     ) -> (gstreamer::Pipeline, gstreamer::Pipeline, Option<Arc<redfog_core::CudaDirectEncoderSession>>) {
         // GStreamer's appsink callbacks run on GStreamer's own streaming
@@ -915,7 +914,6 @@ impl SessionManager {
             let handle = handle.clone();
             let this = this.clone();
             let video_stats = video_stats.clone();
-            let client_key = client_key.clone();
             move |data: Vec<u8>, is_key_frame: bool| {
                 tracing::debug!("video encoder produced {} bytes, key_frame={is_key_frame}", data.len());
                 if let Some((fps, kbps)) = video_stats.lock().unwrap().record(data.len()) {
@@ -927,18 +925,16 @@ impl SessionManager {
                 // rebuilt fresh (see this method's caller) well after the
                 // `/launch` that's resuming it already replaced its origin,
                 // and this is what makes the rebuilt pipeline pick that up.
-                // The `generation` check alongside it is `RunningSession::
-                // generation`'s doc comment's whole point: a pipeline whose
-                // session is no longer the active one for this client —
-                // including one that's supposed to be dead but whose
-                // GStreamer-level teardown never actually completed — must
-                // not send at all, not just skip after the fact.
+                // Looked up by `generation`, not `client_key` — see
+                // `session_by_generation`'s doc comment for why a cross-
+                // client takeover makes any `client_key` captured here at
+                // build time permanently stale, and `RunningSession::
+                // generation`'s doc comment for why this also still refuses
+                // to send for a session that's supposed to be dead but whose
+                // GStreamer-level teardown never actually completed.
                 let origin = {
                     let shared = this.shared.lock().unwrap();
-                    let Some(session) = shared.clients.get(&client_key).and_then(|slot| slot.state.session()) else { return };
-                    if session.generation != generation {
-                        return;
-                    }
+                    let Some(session) = session_by_generation(&shared, generation) else { return };
                     session.origin.clone()
                 };
                 let sender = this.video_sender.clone();
@@ -1009,12 +1005,12 @@ impl SessionManager {
         };
 
         let audio_pipeline = redfog_core::make_audio_pipeline(audio_loopback, &audio_client_name, move |packet| {
+            // Looked up by `generation`, not `client_key` — see
+            // `session_by_generation`'s doc comment (same reasoning as the
+            // video callback above).
             let origin = {
                 let shared = this.shared.lock().unwrap();
-                let Some(session) = shared.clients.get(&client_key).and_then(|slot| slot.state.session()) else { return };
-                if session.generation != generation {
-                    return;
-                }
+                let Some(session) = session_by_generation(&shared, generation) else { return };
                 session.origin.clone()
             };
             let sender = this.audio_sender.clone();
@@ -1128,7 +1124,7 @@ impl SessionManager {
             self.config.bitrate_kbps,
         );
         let (video_pipeline, audio_pipeline, cuda_direct_session) =
-            self.build_pipelines(&kind, &compositor, &audio_loopback, generation, fps_cap, origin.client_key.clone(), origin.target_bitrate_kbps);
+            self.build_pipelines(&kind, &compositor, &audio_loopback, generation, fps_cap, origin.target_bitrate_kbps);
         // Must come *after* `build_pipelines`, not before (this used to be
         // the other way around): `SpawnedCompositor::GstWaylandDisplay`'s
         // `input_sink` now looks up its `waylanddisplaysrc` element inside
@@ -2018,6 +2014,25 @@ fn resolve_client_key_by_rikey(shared: &Shared, rikey: [u8; 16]) -> Option<Clien
     shared.clients.iter().find(|(_, slot)| slot.state.session().is_some_and(|s| s.origin.rikey == rikey)).map(|(key, _)| key.clone())
 }
 
+/// Finds whichever `ClientSlot` currently holds the `RunningSession` with
+/// this `generation`, regardless of which `ClientKey` it's attached under
+/// right now. Needed by the video/audio encoder callbacks (built once in
+/// `build_pipelines`, at whichever client originally spawned this session —
+/// see `rebuild_for_resume`'s doc comment for why a takeover never rebuilds
+/// them): a cross-client takeover (`take_active_session_by_username`)
+/// *removes* the old `ClientKey`'s slot from `shared.clients` and re-inserts
+/// under the new client's key, so a callback that looked itself up by the
+/// `ClientKey` it captured at build time would find nothing at all forever
+/// after the first takeover, silently dropping every frame from then on —
+/// confirmed live: encoder kept producing frames and input kept forwarding
+/// correctly, but the client never received another packet post-takeover.
+/// `generation` is what actually stays stable across that (unlike
+/// `client_key`) — minted once at fresh-spawn time and carried through every
+/// later resume/takeover on the same `RunningSession` untouched.
+fn session_by_generation(shared: &Shared, generation: u64) -> Option<&RunningSession> {
+    shared.clients.values().find_map(|slot| slot.state.session().filter(|s| s.generation == generation))
+}
+
 /// Steals whatever's currently *actively attached* (`Launched` or
 /// `Streaming`, under any `ClientKey`) as `SessionType::User(username)` —
 /// used by `handoff_to_user` so a new login as an already-attached username
@@ -2365,8 +2380,22 @@ impl RtspHandler for SessionManager {
 impl ControlEventHandler for SessionManager {
     fn on_input(&self, rikey: [u8; 16], event: InputEvent) {
         let mut shared = self.shared.lock().unwrap();
-        let Some(client_key) = resolve_client_key_by_rikey(&shared, rikey) else { return };
-        let Some(ClientState::Streaming { session }) = shared.clients.get_mut(&client_key).map(|slot| &mut slot.state) else { return };
+        // Both early returns below were previously silent -- a message that
+        // decrypted and parsed fine (ControlServer::serve already matched
+        // its rikey to get here at all) but still couldn't be routed looked
+        // identical to the client never having sent anything, in every log
+        // short of adding a print statement here. Real case this caught:
+        // diagnosing a cross-client session takeover where input appeared
+        // to just vanish post-handoff with zero corroborating evidence
+        // either way.
+        let Some(client_key) = resolve_client_key_by_rikey(&shared, rikey) else {
+            tracing::debug!("on_input: rikey didn't resolve to any live session, dropping {event:?}");
+            return;
+        };
+        let Some(ClientState::Streaming { session }) = shared.clients.get_mut(&client_key).map(|slot| &mut slot.state) else {
+            tracing::debug!("on_input: {client_key:?} resolved but isn't Streaming, dropping {event:?}");
+            return;
+        };
         let fwd = &mut session.input_forwarder;
         match event {
             InputEvent::KeyDown { keycode } => {

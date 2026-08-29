@@ -1179,6 +1179,167 @@ async fn control_channel_survives_resume_then_reconnect() {
     .expect("control_channel_survives_resume_then_reconnect timed out — the control channel never recovered after resume+reconnect");
 }
 
+/// Regression test for a real bug found live: taking a session over from a
+/// *different physical client* (not a same-client reconnect/resume — client
+/// A never disconnects here) left the client that took it over receiving
+/// literally no video/audio ever again, even though the server-side encoder
+/// kept right on producing frames and the taken-over session's mouse/
+/// keyboard input kept forwarding correctly the whole time.
+///
+/// Root cause: `SessionManager::build_pipelines`'s video/audio encoder
+/// callbacks captured whichever `ClientKey` was current when the session was
+/// first spawned, and used it to look their session back up in
+/// `Shared::clients` on every single frame — fine for a same-client resume
+/// (the key never changes), but `take_active_session_by_username` (this
+/// takeover's own code path) *removes* the old client's slot and re-inserts
+/// under the new client's key, without ever rebuilding the pipelines/
+/// callbacks (see `rebuild_for_resume`'s doc comment for why that's
+/// deliberate). The callbacks' stale lookup then silently found nothing and
+/// returned before ever sending, forever, for both video and audio.
+///
+/// Fixed by looking sessions up by `generation` (stable across every future
+/// resume/takeover on the same `RunningSession`) instead of `client_key` —
+/// see `session_by_generation`. The assertion below is the one that would
+/// have failed before that fix: not that the server *encoded* frames after
+/// the takeover (it always did — that's what made this bug so easy to miss
+/// from server-side logs alone), but that client B's own stream actually
+/// *received* some.
+#[cfg(feature = "compositor-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_client_takeover_keeps_video_flowing_to_the_new_client() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
+
+        let server = TestServer::spawn();
+        let http_port = server.http_port;
+        let crypto_backend = Arc::new(RustCryptoBackend);
+
+        // ---- Client A: logs all the way in and stays connected/actively
+        // streaming — never disconnects. A takeover of an *actively attached*
+        // session (not merely backgrounded) is what exercises
+        // `take_active_session_by_username`'s "was_active_takeover" branch,
+        // matching the exact live scenario this bug was found in. ----
+        let identity_a = ServerIdentity::generate().expect("generate client A identity");
+        let identifier_a = ClientIdentifier::from_pem(pem::parse(&identity_a.cert_pem).unwrap());
+        let secret_a = ClientSecret::from_pem(pem::parse(&identity_a.private_key_pem).unwrap());
+        let host_a = MoonlightHost::<TokioHyperClient>::new("127.0.0.1".to_string(), http_port, Some("it-client-a".to_string()))
+            .expect("construct MoonlightHost for client A");
+        let pin_a = PairPin::new_random(&RustCryptoBackend).expect("generate pin for client A");
+        let pin_a_str = pin_a.to_string();
+        let submit_task_a = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            ureq::post(&format!("http://127.0.0.1:{http_port}/submit-pin"))
+                .send_form(&[("uniqueid", "it-client-a"), ("pin", &pin_a_str)])
+                .expect("submit-pin request for client A");
+        });
+        host_a
+            .pair(&identifier_a, &secret_a, "connection-integration-test-a".to_string(), pin_a, RustCryptoBackend)
+            .await
+            .expect("client A pairing must succeed");
+        submit_task_a.await.unwrap();
+
+        let mut settings = default_stream_settings();
+        let server_version = host_a.version().await.expect("server version");
+        let gfe_version = host_a.gfe_version().await.expect("gfe version");
+        let codec_support = host_a.server_codec_mode_support().await.expect("codec support");
+        settings.adjust_for_server(server_version, &gfe_version, codec_support).expect("settings compatible");
+
+        let stream_config_a = host_a
+            .start_stream(1, &settings, AesKey::new_random(&RustCryptoBackend).expect("aes key"), AesIv(1), "")
+            .await
+            .expect("client A launch must succeed");
+        let stream_a = MoonlightStream::connect(stream_config_a, settings.clone(), crypto_backend.clone(), video_capabilities())
+            .await
+            .expect("client A stream must connect");
+        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
+        send_input_until_seen(
+            &server.stdout_lines,
+            &stream_a,
+            ClientInputEvent::MouseMoveAbsolute { x: 640, y: 360, reference_width: 1280, reference_height: 720 },
+            "TESTUX[login]: pointer_moved",
+            Duration::from_secs(10),
+        )
+        .await;
+        send_input_retrying(&stream_a, ClientInputEvent::MouseButton { action: MouseButtonAction::Press, button: MouseButton::Left }).await;
+        send_input_retrying(&stream_a, ClientInputEvent::MouseButton { action: MouseButtonAction::Release, button: MouseButton::Left }).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        send_key(&stream_a, VK_Q, true).await;
+        send_key(&stream_a, VK_Q, false).await;
+        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(45)).await;
+        // Confirm client A's own stream is genuinely alive/streaming before
+        // handing it over — otherwise a "no frames" result below wouldn't
+        // distinguish this bug from "nothing was ever streaming at all".
+        let (baseline_frames, _) = poll_frames_tracking_gaps(&stream_a, tokio::time::sleep(Duration::from_secs(2))).await;
+        assert!(baseline_frames > 0, "client A never received any video before the takeover — nothing to take over");
+
+        // ---- Client B: a completely separate physical client (own identity,
+        // own pairing) logs in as the same placeholder "user" account while
+        // client A is still actively attached — the "taking over already-
+        // active session ... from another client" path, not a plain resume. ----
+        let identity_b = ServerIdentity::generate().expect("generate client B identity");
+        let identifier_b = ClientIdentifier::from_pem(pem::parse(&identity_b.cert_pem).unwrap());
+        let secret_b = ClientSecret::from_pem(pem::parse(&identity_b.private_key_pem).unwrap());
+        let host_b = MoonlightHost::<TokioHyperClient>::new("127.0.0.1".to_string(), http_port, Some("it-client-b".to_string()))
+            .expect("construct MoonlightHost for client B");
+        let pin_b = PairPin::new_random(&RustCryptoBackend).expect("generate pin for client B");
+        let pin_b_str = pin_b.to_string();
+        let submit_task_b = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            ureq::post(&format!("http://127.0.0.1:{http_port}/submit-pin"))
+                .send_form(&[("uniqueid", "it-client-b"), ("pin", &pin_b_str)])
+                .expect("submit-pin request for client B");
+        });
+        host_b
+            .pair(&identifier_b, &secret_b, "connection-integration-test-b".to_string(), pin_b, RustCryptoBackend)
+            .await
+            .expect("client B pairing must succeed");
+        submit_task_b.await.unwrap();
+
+        let login_started_before_b = server.count_stdout("TESTUX[login]: started");
+        let stream_config_b = host_b
+            .start_stream(1, &settings, AesKey::new_random(&RustCryptoBackend).expect("aes key"), AesIv(1), "")
+            .await
+            .expect("client B launch must succeed");
+        let stream_b = MoonlightStream::connect(stream_config_b, settings.clone(), crypto_backend.clone(), video_capabilities())
+            .await
+            .expect("client B stream must connect");
+        server.wait_for_new_stdout("TESTUX[login]: started", login_started_before_b, Duration::from_secs(10)).await;
+        send_input_until_seen(
+            &server.stdout_lines,
+            &stream_b,
+            ClientInputEvent::MouseMoveAbsolute { x: 640, y: 360, reference_width: 1280, reference_height: 720 },
+            "TESTUX[login]: pointer_moved",
+            Duration::from_secs(10),
+        )
+        .await;
+        send_input_retrying(&stream_b, ClientInputEvent::MouseButton { action: MouseButtonAction::Press, button: MouseButton::Left }).await;
+        send_input_retrying(&stream_b, ClientInputEvent::MouseButton { action: MouseButtonAction::Release, button: MouseButton::Left }).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let takeover_before = server.count_stdout("taking over already-active session for user");
+        send_key(&stream_b, VK_Q, true).await;
+        send_key(&stream_b, VK_Q, false).await;
+        server.wait_for_new_stdout("taking over already-active session for user", takeover_before, Duration::from_secs(10)).await;
+
+        // ---- The actual assertion: client B's own stream must actually
+        // *receive* video after the takeover — not just that the server-side
+        // encoder kept producing frames (it always did, even with the bug:
+        // the drop happened at the send step, invisible from server-side
+        // encoder logs alone). ----
+        let (post_takeover_frames, _) = poll_frames_tracking_gaps(&stream_b, tokio::time::sleep(Duration::from_secs(5))).await;
+        assert!(
+            post_takeover_frames > 0,
+            "client B received zero video frames in 5s after taking the session over from client A — \
+             the encoder callbacks are still looking the session up by a stale client_key"
+        );
+
+        drop(stream_a);
+        drop(stream_b);
+    })
+    .await
+    .expect("cross_client_takeover_keeps_video_flowing_to_the_new_client timed out");
+}
+
 /// Reproduces a second live finding, distinct from the control-channel one
 /// above: on a real machine, after a resume hang (see
 /// `SessionManager::handoff_to_user`'s KNOWN LIMITATION doc comment), the
