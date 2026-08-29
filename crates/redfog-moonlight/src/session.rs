@@ -163,6 +163,15 @@ struct SessionOrigin {
     /// `redfog_core::set_encoder_bitrate`'s doc comment.
     target_bitrate_kbps: u32,
     current_bitrate_kbps: u32,
+    /// What this client's own RTSP `ANNOUNCE` actually negotiated (see
+    /// `on_announce`) — carried the same way `target_bitrate_kbps` is, so
+    /// a fresh User-stage spawn (`handoff_to_user`'s `None` branch) picks
+    /// up whatever the Login stage's own `ANNOUNCE` already resolved,
+    /// instead of always cold-starting at `VideoCodec::default()` again.
+    /// Distinct from `RunningSession::codec`, which is "what the encoder
+    /// is actually built for right now" — see `reconcile_video_pipeline`'s
+    /// doc comment for why a takeover needs both.
+    codec: redfog_core::VideoCodec,
 }
 
 impl SessionOrigin {
@@ -181,6 +190,7 @@ impl SessionOrigin {
             stream_start: Instant::now(),
             target_bitrate_kbps: default_bitrate_kbps,
             current_bitrate_kbps: default_bitrate_kbps,
+            codec: redfog_core::VideoCodec::default(),
         }
     }
 }
@@ -208,6 +218,18 @@ struct RunningSession {
     /// `redfog_core::make_encoder_pipeline`'s doc comment for why `None`
     /// (not just a very high number) is kept as a real, distinct option.
     fps: u32,
+    /// The codec this session's *encoder* is actually built for right now —
+    /// distinct from `width`/`height`/`fps` only in that those come from
+    /// `/launch`'s query params while this starts at a cold-start default
+    /// and gets corrected by `on_announce` once the client's RTSP `ANNOUNCE`
+    /// tells us what it actually negotiated (see `SessionManager::
+    /// spawn_session`'s doc comment). `on_announce`'s reconcile step compares
+    /// all four of these against what each new `ANNOUNCE` requests and
+    /// rebuilds the video pipeline (`build_video_pipeline`) whenever any of
+    /// them differ — the same reconciliation, for the same reason, whether
+    /// this is a fresh spawn's first real value or a takeover from a
+    /// different client with different settings.
+    codec: redfog_core::VideoCodec,
     /// `Option` purely so `Drop` (see below) and `discard_running_session`/
     /// `handoff_to_user`'s Login teardown can each take it out via
     /// `Option::take` — a plain field can't be partially moved out of a
@@ -854,61 +876,32 @@ impl SessionManager {
         result.map(|c| (c, username, Some(session_id)))
     }
 
-    /// Builds a fresh encoder/audio pipeline pair around `compositor`'s
-    /// video source and `audio_loopback` — split out of `spawn_session` so
-    /// its packetizer/stream-start lookup logic (see the comment further
-    /// down) is documented and testable in one place. Also used by
-    /// `rebuild_for_resume` (below) to rebuild a backgrounded session's
-    /// pipelines fresh before resuming it.
-    ///
-    /// HISTORY: resuming a backgrounded `Backend::Kwin` session used to just
-    /// `Pause`/un-`Pause` its existing pipelines rather than calling this —
-    /// an earlier attempt to rebuild fresh ones here instead (the same way
-    /// KWin's resize handling rebuilds around a fresh `pipewiresrc`) was
-    /// tried and reverted: confirmed live, tearing the *old* pipeline down
-    /// to `Null` while the session was otherwise still alive crashed the
-    /// `kwin_wayland` compositor process itself (its virtual backend
-    /// exited with `WinitEventLoop(ExitFailure(1))`), not merely the
-    /// GStreamer side. Simply cycling the existing pipeline `Playing ->
-    /// Paused -> Playing` avoided that crash but still left the client
-    /// stuck forever re-requesting an IDR frame that never arrived.
-    ///
-    /// Root-caused since (see `rebuild_for_resume`'s doc comment): reusing
-    /// the same `pipewiresrc`/downstream elements is what's actually
-    /// broken, not fully rebuilding — the earlier crash came from tearing
-    /// the *old* pipeline down synchronously (in the same call that also
-    /// tried to reconnect), not from rebuilding fresh ones as such.
-    /// `rebuild_for_resume` avoids that by never waiting on the old
-    /// pipeline's teardown at all.
-    fn build_pipelines(
+    /// Builds just the video half of a session's pipeline — split out of
+    /// `build_pipelines` so `on_announce`'s reconcile step (see its own doc
+    /// comment) can rebuild *only* this when a client's negotiated
+    /// width/height/fps/bitrate/codec changes, without touching audio at
+    /// all (nothing about audio ever depends on any of those). Takes
+    /// `handle`/`this` from the caller rather than deriving them itself so
+    /// the reconcile path (already holding both, having just removed the
+    /// session from `Shared::clients` to call this without the lock held —
+    /// see `on_announce`) doesn't need `&self` at all for this half.
+    fn build_video_pipeline(
         &self,
         kind: &SessionType,
         compositor: &SpawnedCompositor,
-        audio_loopback: &AudioLoopback,
         generation: u64,
         fps_cap: Option<u32>,
         initial_bitrate_kbps: u32,
-    ) -> (gstreamer::Pipeline, gstreamer::Pipeline, Option<Arc<redfog_core::CudaDirectEncoderSession>>) {
-        // GStreamer's appsink callbacks run on GStreamer's own streaming
-        // threads, not tokio worker threads — `tokio::spawn` would panic
-        // there ("no reactor running"). Capture a `Handle` (valid from any
-        // thread) instead, since we're called from within an async context.
-        let handle = tokio::runtime::Handle::current();
-
+        codec: redfog_core::VideoCodec,
+        handle: tokio::runtime::Handle,
+        this: Arc<Self>,
+    ) -> (gstreamer::Pipeline, Option<Arc<redfog_core::CudaDirectEncoderSession>>) {
         let video_encoder = if matches!(kind, SessionType::Login) {
             redfog_core::VideoEncoder::Software
         } else {
             self.config.video_encoder
         };
-        let this = self.arc_self();
-        // Distinct per generation: `pipewiresrc`/`pipewiresink` share one
-        // underlying PipeWire core/thread-loop across every element in the
-        // process with the same client identity, so reusing one name across
-        // generations means a single wedged (abandoned-on-timeout) pipeline
-        // permanently poisons every later session's video/audio too —
-        // confirmed live via matching mutex addresses across generations.
         let video_client_name = format!("redfog-video-gen-{generation}");
-        let audio_client_name = format!("redfog-audio-gen-{generation}");
         let video_stats = Arc::new(Mutex::new(EncodedFrameStats::new()));
         let on_video_access_unit = {
             let handle = handle.clone();
@@ -917,7 +910,13 @@ impl SessionManager {
             move |data: Vec<u8>, is_key_frame: bool| {
                 tracing::debug!("video encoder produced {} bytes, key_frame={is_key_frame}", data.len());
                 if let Some((fps, kbps)) = video_stats.lock().unwrap().record(data.len()) {
-                    tracing::info!("video: {fps:.1} fps, {kbps:.0} kbps (generation={generation})");
+                    // `kbps` here is *measured* actual output, not the
+                    // configured target — the two can legitimately diverge
+                    // (CBR padding, scene complexity) but should track each
+                    // other; a real mismatch is itself a useful signal.
+                    tracing::info!(
+                        "video: {fps:.1} fps, {kbps:.0} kbps, encoder={video_encoder:?}, codec={codec:?}, target_bitrate={initial_bitrate_kbps}kbps (generation={generation})"
+                    );
                 }
                 // `origin` (packetizer/stream_start/etc) is looked up fresh
                 // from `shared` on every frame, not captured once at build
@@ -975,7 +974,7 @@ impl SessionManager {
         let video_pipeline = if video_encoder == redfog_core::VideoEncoder::NvencDirect
             && matches!(source, redfog_core::VideoSource::KwinNativeDmaBuf { .. })
         {
-            let session = redfog_core::make_cuda_direct_encoder_session(source, initial_bitrate_kbps, on_video_access_unit);
+            let session = redfog_core::make_cuda_direct_encoder_session(source, initial_bitrate_kbps, codec, on_video_access_unit);
             cuda_direct_session = Some(Arc::new(session));
             // `NvencDirect` has no GStreamer pipeline at all — this empty
             // placeholder exists only so the rest of this type's machinery
@@ -992,6 +991,9 @@ impl SessionManager {
             // Login (or any other non-`KwinNativeDmaBuf` source) can't use
             // `NvencDirect` — fall back to regular GStreamer NVENC for it,
             // same as if the server-wide config had been `Nvenc` all along.
+            // Codec choice doesn't apply here: `make_encoder_pipeline` only
+            // ever builds H.264 (Login never negotiates a codec at all —
+            // see `on_announce`'s doc comment).
             let pipeline_encoder =
                 if video_encoder == redfog_core::VideoEncoder::NvencDirect { redfog_core::VideoEncoder::Nvenc } else { video_encoder };
             redfog_core::make_encoder_pipeline(
@@ -1003,6 +1005,62 @@ impl SessionManager {
                 on_video_access_unit,
             )
         };
+
+        (video_pipeline, cuda_direct_session)
+    }
+
+    /// Builds a fresh encoder/audio pipeline pair around `compositor`'s
+    /// video source and `audio_loopback` — split out of `spawn_session` so
+    /// its packetizer/stream-start lookup logic (see the comment further
+    /// down) is documented and testable in one place. Also used by
+    /// `rebuild_for_resume` (below) to rebuild a backgrounded session's
+    /// pipelines fresh before resuming it.
+    ///
+    /// HISTORY: resuming a backgrounded `Backend::Kwin` session used to just
+    /// `Pause`/un-`Pause` its existing pipelines rather than calling this —
+    /// an earlier attempt to rebuild fresh ones here instead (the same way
+    /// KWin's resize handling rebuilds around a fresh `pipewiresrc`) was
+    /// tried and reverted: confirmed live, tearing the *old* pipeline down
+    /// to `Null` while the session was otherwise still alive crashed the
+    /// `kwin_wayland` compositor process itself (its virtual backend
+    /// exited with `WinitEventLoop(ExitFailure(1))`), not merely the
+    /// GStreamer side. Simply cycling the existing pipeline `Playing ->
+    /// Paused -> Playing` avoided that crash but still left the client
+    /// stuck forever re-requesting an IDR frame that never arrived.
+    ///
+    /// Root-caused since (see `rebuild_for_resume`'s doc comment): reusing
+    /// the same `pipewiresrc`/downstream elements is what's actually
+    /// broken, not fully rebuilding — the earlier crash came from tearing
+    /// the *old* pipeline down synchronously (in the same call that also
+    /// tried to reconnect), not from rebuilding fresh ones as such.
+    /// `rebuild_for_resume` avoids that by never waiting on the old
+    /// pipeline's teardown at all.
+    fn build_pipelines(
+        &self,
+        kind: &SessionType,
+        compositor: &SpawnedCompositor,
+        audio_loopback: &AudioLoopback,
+        generation: u64,
+        fps_cap: Option<u32>,
+        initial_bitrate_kbps: u32,
+        codec: redfog_core::VideoCodec,
+    ) -> (gstreamer::Pipeline, gstreamer::Pipeline, Option<Arc<redfog_core::CudaDirectEncoderSession>>) {
+        // GStreamer's appsink callbacks run on GStreamer's own streaming
+        // threads, not tokio worker threads — `tokio::spawn` would panic
+        // there ("no reactor running"). Capture a `Handle` (valid from any
+        // thread) instead, since we're called from within an async context.
+        let handle = tokio::runtime::Handle::current();
+        let this = self.arc_self();
+        // Distinct per generation: `pipewiresrc`/`pipewiresink` share one
+        // underlying PipeWire core/thread-loop across every element in the
+        // process with the same client identity, so reusing one name across
+        // generations means a single wedged (abandoned-on-timeout) pipeline
+        // permanently poisons every later session's video/audio too —
+        // confirmed live via matching mutex addresses across generations.
+        let audio_client_name = format!("redfog-audio-gen-{generation}");
+
+        let (video_pipeline, cuda_direct_session) =
+            self.build_video_pipeline(kind, compositor, generation, fps_cap, initial_bitrate_kbps, codec, handle.clone(), this.clone());
 
         let audio_pipeline = redfog_core::make_audio_pipeline(audio_loopback, &audio_client_name, move |packet| {
             // Looked up by `generation`, not `client_key` — see
@@ -1060,6 +1118,99 @@ impl SessionManager {
         (video_pipeline, audio_pipeline, cuda_direct_session)
     }
 
+    /// Rebuilds `session`'s video pipeline in place if the encoder it's
+    /// *actually* built for (`session.width`/`height`/`fps`/`codec`, plus
+    /// `session.origin.target_bitrate_kbps`) doesn't match the given
+    /// `wanted_*` values — called from `handoff_to_user` right *before*
+    /// `session.origin` is overwritten with the taking-over client's own
+    /// (this reads the *old* origin for the bitrate comparison, so the
+    /// wanted values must come in as explicit arguments, not `session.
+    /// origin` post-overwrite), for both the "takeover" and "resume"
+    /// branches alike.
+    ///
+    /// This — not `on_announce` — is the real fix for a cross-client
+    /// takeover otherwise inheriting whichever client's settings happened
+    /// to be active when this `RunningSession`'s encoder was first built,
+    /// forever: `on_announce` always fires during the *Login* stage,
+    /// before any takeover/resume decision exists, so by the time that
+    /// decision is made (right here) is the earliest point the new
+    /// client's already-negotiated settings can actually be compared
+    /// against what's live. Confirmed live: an earlier version of this
+    /// tried to do the rebuild inside `on_announce` itself and never once
+    /// fired, for exactly that timing reason.
+    ///
+    /// No-op unless `session.cuda_direct_session` is already `Some` — see
+    /// `build_video_pipeline`'s own scoping (Login/non-`NvencDirect` paths
+    /// don't need this: Login never negotiates a codec that matters, and
+    /// the GStreamer paths already live-adjust bitrate).
+    ///
+    /// Synchronous, not `async` — called via `spawn_blocking` from
+    /// `handoff_to_user` since `SpawnedCompositor::resize` blocks (see its
+    /// own doc comment), same reasoning as every other blocking call site
+    /// in this file.
+    fn reconcile_video_pipeline(
+        &self,
+        mut session: RunningSession,
+        wanted_width: u32,
+        wanted_height: u32,
+        wanted_fps: u32,
+        wanted_bitrate_kbps: u32,
+        wanted_codec: redfog_core::VideoCodec,
+    ) -> RunningSession {
+        if session.cuda_direct_session.is_none() {
+            return session;
+        }
+        if session.width == wanted_width
+            && session.height == wanted_height
+            && session.fps == wanted_fps
+            && session.codec == wanted_codec
+            && session.origin.target_bitrate_kbps == wanted_bitrate_kbps
+        {
+            return session;
+        }
+        tracing::info!(
+            "handoff_to_user: negotiated params changed ({}x{}@{}fps {:?}) -> ({wanted_width}x{wanted_height}@{wanted_fps}fps {wanted_codec:?}), rebuilding video pipeline",
+            session.width, session.height, session.fps, session.codec,
+        );
+        if wanted_width != session.width || wanted_height != session.height {
+            let resized = session.compositor.as_ref().is_some_and(|c| c.resize(wanted_width as i32, wanted_height as i32));
+            tracing::info!(
+                "handoff_to_user reconcile: resize to {wanted_width}x{wanted_height} {}",
+                if resized { "applied" } else { "not supported by this compositor backend, resolution unchanged" }
+            );
+        }
+
+        let fps_cap = (wanted_fps > 0).then_some(wanted_fps);
+        let handle = tokio::runtime::Handle::current();
+        let this = self.arc_self();
+        let (video_pipeline, cuda_direct_session) = self.build_video_pipeline(
+            &session.kind,
+            session.compositor.as_ref().expect("Streaming/Launched session always has a compositor"),
+            session.generation,
+            fps_cap,
+            wanted_bitrate_kbps,
+            wanted_codec,
+            handle,
+            this,
+        );
+        // Old `video_pipeline` here is always `CudaDirectEncoderSession`'s
+        // empty placeholder (this whole method is scoped to
+        // `cuda_direct_session.is_some()`) — nothing to tear down. The old
+        // `cuda_direct_session` Arc's `Drop` (shutdown flag + thread join)
+        // runs synchronously here when this replaces its last reference;
+        // unlike GStreamer's `set_state(Null)` (the thing that's hung
+        // before elsewhere in this codebase), its encode loop only ever
+        // sleeps 1ms between checking the shutdown flag, so this is
+        // expected to return promptly.
+        session.video_pipeline = video_pipeline;
+        session.cuda_direct_session = cuda_direct_session;
+        session.width = wanted_width;
+        session.height = wanted_height;
+        session.fps = wanted_fps;
+        session.codec = wanted_codec;
+        session
+    }
+
     /// Rebuilds a backgrounded session's screencast capture and video/audio
     /// pipelines fully fresh before resuming it — a no-op for backends
     /// other than `Backend::Kwin` (see `SpawnedCompositor::
@@ -1100,6 +1251,17 @@ impl SessionManager {
         origin: SessionOrigin,
         selected_session: Option<SelectedSession>,
     ) -> Result<RunningSession, String> {
+        // `origin.codec` — `VideoCodec::default()` (H.264) for a genuinely
+        // fresh `/launch` (nothing has negotiated anything yet), but for
+        // `handoff_to_user`'s fresh-User-stage-spawn branch `origin` is the
+        // *Login* stage's own already-`ANNOUNCE`d one (see `SessionOrigin`'s
+        // doc comment on why this is threaded through the same way as
+        // `target_bitrate_kbps`) — so this already reflects what the client
+        // actually negotiated by the time the real encoder gets built, no
+        // separate reconcile needed for a fresh spawn. A *takeover*/resume
+        // never calls this at all (it reuses the existing `RunningSession`
+        // outright) — see `reconcile_video_pipeline` for that path instead.
+        let codec = origin.codec;
         // Not derived from compositor.socket_name(): for Backend::Kwin that
         // happens to already be unique per stage ("redfog-login-0" /
         // "redfog-user-0"), but for Backend::GstWaylandDisplay it's always
@@ -1124,7 +1286,7 @@ impl SessionManager {
             self.config.bitrate_kbps,
         );
         let (video_pipeline, audio_pipeline, cuda_direct_session) =
-            self.build_pipelines(&kind, &compositor, &audio_loopback, generation, fps_cap, origin.target_bitrate_kbps);
+            self.build_pipelines(&kind, &compositor, &audio_loopback, generation, fps_cap, origin.target_bitrate_kbps, codec);
         // Must come *after* `build_pipelines`, not before (this used to be
         // the other way around): `SpawnedCompositor::GstWaylandDisplay`'s
         // `input_sink` now looks up its `waylanddisplaysrc` element inside
@@ -1138,6 +1300,7 @@ impl SessionManager {
             width,
             height,
             fps,
+            codec,
             compositor: Some(compositor),
             input_forwarder,
             video_pipeline,
@@ -1733,7 +1896,7 @@ impl SessionManager {
             None => (None, false),
         };
         let (user_session, is_resume) = match existing {
-            Some(mut background) => {
+            Some(background) => {
                 if was_active_takeover {
                     tracing::info!("taking over already-active session for user {username} from another client");
                 } else {
@@ -1751,6 +1914,19 @@ impl SessionManager {
                 self.video_sender.drain_pending(background.origin.ping_token);
                 self.audio_sender.drain_pending(background.origin.ping_token);
                 self.control_registry.forget(background.origin.rikey);
+                // Reconcile *before* overwriting `background.origin` below —
+                // this compares against the still-old bitrate/codec, and
+                // `width`/`height`/`fps` (this client's own, from its
+                // Login-stage `/launch`) against `background`'s current
+                // fields. See `reconcile_video_pipeline`'s doc comment for
+                // why this is the actual fix for a takeover otherwise
+                // inheriting whichever client's settings were active when
+                // this session's encoder was first built.
+                let this = self.arc_self();
+                let (wanted_bitrate_kbps, wanted_codec) = (origin.target_bitrate_kbps, origin.codec);
+                let mut background = tokio::task::spawn_blocking(move || this.reconcile_video_pipeline(background, width, height, fps, wanted_bitrate_kbps, wanted_codec))
+                    .await
+                    .map_err(|e| format!("reconcile_video_pipeline task panicked: {e}"))?;
                 // This resume is still a brand-new wire-level RTSP session
                 // from the client's perspective (a fresh `/launch`, fresh
                 // RTP epoch) even though the compositor underneath is old —
@@ -2197,23 +2373,59 @@ fn discard_running_session(mut session: RunningSession) {
 }
 
 impl RtspHandler for SessionManager {
+    /// Reconciles a client's negotiated width/height/fps/bitrate/codec
+    /// against whatever this session's encoder is *actually* currently
+    /// built for, rebuilding it if any differ.
+    ///
+    /// This matters far beyond a fresh `/launch`: a cross-client takeover or
+    /// a same-client resume both reuse the *existing* `RunningSession`
+    /// (`rebuild_for_resume` is a deliberate no-op, and the new client's own
+    /// `origin` swap-in is pure data — see `handoff_to_user`), so without
+    /// this, whichever client's settings happened to be active when the
+    /// encoder was first constructed would stick forever, for every future
+    /// client that ever attaches to that session. Confirmed live: this is
+    /// also why bitrate only ever *looked* live-adjustable before — a fresh
+    /// spawn happens to pick up a just-`ANNOUNCE`d bitrate purely because
+    /// `handoff_to_user` passes `origin.target_bitrate_kbps` into the
+    /// encoder's one-time construction, not because `CudaDirectEncoderSession
+    /// ::set_bitrate` (a logged no-op — `nvidia-video-codec-sdk` 0.4 doesn't
+    /// expose live NVENC reconfiguration) ever actually applied it.
+    ///
+    /// Scoped to `cuda_direct_session.is_some()` (`VideoEncoder::NvencDirect`
+    /// — the only production path) — the GStreamer `Nvenc`/`Software` paths
+    /// already live-adjust bitrate via `redfog_core::set_encoder_bitrate`,
+    /// and Login never negotiates a codec choice that matters, so neither
+    /// needs this rebuild machinery today.
+    /// Pure data update — `ANNOUNCE` always arrives during the *Login*
+    /// stage, before any takeover/resume decision is even made, so
+    /// `client_ip` only ever resolves to a Login session here (Software
+    /// encoder — see `build_video_pipeline`). An earlier version of this
+    /// method tried to rebuild the video pipeline right here when
+    /// width/height/fps/codec/bitrate differed; confirmed live that never
+    /// actually fired for exactly that reason (the User-stage session this
+    /// client is *about* to attach to either doesn't exist yet, for a fresh
+    /// spawn, or belongs to a different client entirely, for a takeover).
+    /// The real reconcile now happens in `handoff_to_user`, the only place
+    /// a takeover/resume decision is actually made — see
+    /// `reconcile_video_pipeline`'s doc comment. This just records what the
+    /// client negotiated so that later code (bitrate/codec flowing through
+    /// `SessionOrigin` into a fresh spawn, or into `reconcile_video_pipeline`
+    /// on a takeover) has it available.
     fn on_announce(&self, params: AnnouncedParams, client_ip: IpAddr) {
-        if let Some(bitrate_kbps) = params.bitrate_kbps {
-            tracing::info!("RTSP ANNOUNCE: client requested bitrate {} kbps", bitrate_kbps);
-            // Apply it to this client's active pipeline encoder immediately
-            // if it exists. `client_ip` is all RTSP carries — see
-            // `resolve_client_key_by_ip`'s doc comment for the resulting
-            // best-effort resolution.
-            let mut shared = self.shared.lock().unwrap();
-            let Some(client_key) = resolve_client_key_by_ip(&shared, client_ip) else { return };
-            if let Some(session) = shared.clients.get_mut(&client_key).and_then(|slot| slot.state.session_mut()) {
-                session.origin.target_bitrate_kbps = bitrate_kbps;
-                session.origin.current_bitrate_kbps = bitrate_kbps;
-                redfog_core::set_encoder_bitrate(&session.video_pipeline, bitrate_kbps);
-                if let Some(cuda_direct_session) = &session.cuda_direct_session {
-                    cuda_direct_session.set_bitrate(bitrate_kbps);
-                }
-            }
+        let mut shared = self.shared.lock().unwrap();
+        let Some(client_key) = resolve_client_key_by_ip(&shared, client_ip) else { return };
+        let Some(session) = shared.clients.get_mut(&client_key).and_then(|slot| slot.state.session_mut()) else { return };
+        let bitrate_kbps = params.bitrate_kbps.unwrap_or(session.origin.target_bitrate_kbps);
+        tracing::info!("RTSP ANNOUNCE: client requested bitrate {bitrate_kbps} kbps, codec {:?}", params.codec);
+        session.origin.target_bitrate_kbps = bitrate_kbps;
+        session.origin.current_bitrate_kbps = bitrate_kbps;
+        session.origin.codec = params.codec;
+        // Still live-applies for the GStreamer `Nvenc`/`Software` paths
+        // (`redfog_core::set_encoder_bitrate`) — unaffected by any of the
+        // above, and unrelated to `NvencDirect`'s reconcile-on-takeover path.
+        redfog_core::set_encoder_bitrate(&session.video_pipeline, bitrate_kbps);
+        if let Some(cuda_direct_session) = &session.cuda_direct_session {
+            cuda_direct_session.set_bitrate(bitrate_kbps);
         }
     }
 

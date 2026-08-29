@@ -27,6 +27,7 @@ use std::thread::JoinHandle;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
     NV_ENC_BUFFER_FORMAT,
     NV_ENC_CODEC_H264_GUID,
+    NV_ENC_CODEC_HEVC_GUID,
     NV_ENC_INPUT_RESOURCE_TYPE,
     NV_ENC_PARAMS_RC_MODE,
     NV_ENC_PIC_TYPE,
@@ -40,6 +41,29 @@ use crate::pipewire_capture::PipewireCapture;
 use crate::vulkan_bridge::{BridgedImage, VulkanBridge};
 
 const GOP_LENGTH: u32 = 300;
+
+/// Which codec NVENC actually produces. Deliberately just the two variants
+/// this GPU generation (Turing) can encode at all — `encode_guids` is
+/// checked live against whichever this resolves to, so an unsupported
+/// choice fails with a clear error rather than silently encoding the wrong
+/// thing. A third `Av1` variant would extend `codec_guid`/the `run()` match
+/// below the same way once it's actually needed on hardware that supports
+/// it (Ada Lovelace+) — not added speculatively now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    Hevc,
+}
+
+impl VideoCodec {
+    fn guid(self) -> nvidia_video_codec_sdk::sys::nvEncodeAPI::GUID {
+        match self {
+            VideoCodec::H264 => NV_ENC_CODEC_H264_GUID,
+            VideoCodec::Hevc => NV_ENC_CODEC_HEVC_GUID,
+        }
+    }
+}
 
 enum RegisteredFrame<'a> {
     Array(RegisteredResource<'a, ImportedArray>),
@@ -95,6 +119,7 @@ impl CudaDirectEncoderSession {
         height: u32,
         fps: u32,
         bitrate_kbps: u32,
+        codec: VideoCodec,
         on_access_unit: impl Fn(Vec<u8>, bool) + Send + Sync + 'static,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -109,6 +134,7 @@ impl CudaDirectEncoderSession {
                 height,
                 fps,
                 bitrate_kbps,
+                codec,
                 &thread_shutdown,
                 &thread_force_keyframe,
                 &on_access_unit,
@@ -152,6 +178,7 @@ fn run(
     height: u32,
     fps: u32,
     bitrate_kbps: u32,
+    codec: VideoCodec,
     shutdown: &AtomicBool,
     force_keyframe: &AtomicBool,
     on_access_unit: &(impl Fn(Vec<u8>, bool) + Send + Sync + 'static),
@@ -178,20 +205,21 @@ fn run(
     let encoder =
         Encoder::initialize_with_cuda(nvenc_cuda_ctx).map_err(|e| format!("Encoder::initialize_with_cuda: {e:?}"))?;
 
+    let codec_guid = codec.guid();
     let encode_guids = encoder.get_encode_guids().map_err(|e| format!("get_encode_guids: {e:?}"))?;
-    if !encode_guids.contains(&NV_ENC_CODEC_H264_GUID) {
-        return Err("NVENC on this machine doesn't support H.264".to_string());
+    if !encode_guids.contains(&codec_guid) {
+        return Err(format!("NVENC on this machine doesn't support {codec:?}"));
     }
     let buffer_format = NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB;
     let input_formats = encoder
-        .get_supported_input_formats(NV_ENC_CODEC_H264_GUID)
+        .get_supported_input_formats(codec_guid)
         .map_err(|e| format!("get_supported_input_formats: {e:?}"))?;
     if !input_formats.contains(&buffer_format) {
-        return Err("NVENC doesn't support ARGB input for H.264 on this machine".to_string());
+        return Err(format!("NVENC doesn't support ARGB input for {codec:?} on this machine"));
     }
 
     let mut preset_config = encoder
-        .get_preset_config(NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY)
+        .get_preset_config(codec_guid, NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY)
         .map_err(|e| format!("get_preset_config: {e:?}"))?;
     {
         let config = &mut preset_config.presetCfg;
@@ -208,10 +236,16 @@ fn run(
         // deliberately left unset (0 = auto) — NVIDIA's own recommended
         // default rather than a guessed fixed value.
         config.rcParams.set_enableAQ(1);
-        unsafe { config.encodeCodecConfig.h264Config.set_repeatSPSPPS(1) };
+        // repeatSPSPPS lives on a codec-specific union member (h264Config vs
+        // hevcConfig) — same field name/semantics on both, just a different
+        // struct.
+        match codec {
+            VideoCodec::H264 => unsafe { config.encodeCodecConfig.h264Config.set_repeatSPSPPS(1) },
+            VideoCodec::Hevc => unsafe { config.encodeCodecConfig.hevcConfig.set_repeatSPSPPS(1) },
+        }
     }
 
-    let mut init_params = EncoderInitParams::new(NV_ENC_CODEC_H264_GUID, width, height);
+    let mut init_params = EncoderInitParams::new(codec_guid, width, height);
     init_params
         .preset_guid(NV_ENC_PRESET_P4_GUID)
         .tuning_info(NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY)

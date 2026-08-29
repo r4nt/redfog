@@ -23,6 +23,15 @@ pub struct AnnouncedParams {
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: Option<u32>,
+    /// The codec the *client* actually picked (from its own supported
+    /// formats intersected with our advertised `ServerCodecModeSupport` —
+    /// see pairing.rs) — not something we choose. Defaults to H.264 if the
+    /// attribute is missing (very old/minimal clients) or names a codec we
+    /// don't support (currently only AV1 — see `redfog_core::VideoCodec`'s
+    /// doc comment for why that's not implemented yet): a client that never
+    /// actually negotiated H.264 support wouldn't have gotten this far in
+    /// the first place, since `ServerCodecModeSupport` always advertises it.
+    pub codec: redfog_core::VideoCodec,
 }
 
 pub trait RtspHandler: Send + Sync {
@@ -266,21 +275,31 @@ impl RtspServer {
         let mut height = self.default_height;
         let mut fps = self.default_fps;
         let mut bitrate_kbps = None;
+        let mut codec = redfog_core::VideoCodec::default();
 
         for line in text.lines() {
-            let Some(rest) = line.strip_prefix("a=x-nv-video[0].") else {
-                continue;
-            };
-            let Some((key, value)) = rest.split_once(':') else {
-                continue;
-            };
-            let value = value.trim();
-            match key {
-                "clientViewportWd" => width = value.parse().unwrap_or(width),
-                "clientViewportHt" => height = value.parse().unwrap_or(height),
-                "maxFPS" => fps = value.parse().unwrap_or(fps),
-                "initialBitrateKbps" => bitrate_kbps = value.parse().ok(),
-                _ => {}
+            if let Some(rest) = line.strip_prefix("a=x-nv-video[0].") {
+                let Some((key, value)) = rest.split_once(':') else { continue };
+                let value = value.trim();
+                match key {
+                    "clientViewportWd" => width = value.parse().unwrap_or(width),
+                    "clientViewportHt" => height = value.parse().unwrap_or(height),
+                    "maxFPS" => fps = value.parse().unwrap_or(fps),
+                    "initialBitrateKbps" => bitrate_kbps = value.parse().ok(),
+                    _ => {}
+                }
+            } else if let Some(value) = line.strip_prefix("a=x-nv-vqos[0].bitStreamFormat:") {
+                // 0 = H.264, 1 = HEVC, 2 = AV1 (confirmed against
+                // moonlight-common-rust's own SDP builder, `sdp/client.rs`:
+                // this is what a real client sets after intersecting our
+                // advertised `ServerCodecModeSupport` with its own decode
+                // capabilities). 2 (AV1) falls back to H.264 rather than
+                // silently mis-selecting an unsupported codec — see
+                // `AnnouncedParams::codec`'s doc comment.
+                codec = match value.trim() {
+                    "1" => redfog_core::VideoCodec::Hevc,
+                    _ => redfog_core::VideoCodec::H264,
+                };
             }
         }
 
@@ -289,6 +308,7 @@ impl RtspServer {
             height,
             fps,
             bitrate_kbps,
+            codec,
         }
     }
 
@@ -374,5 +394,25 @@ mod tests {
         let body = "a=x-nv-video[0].initialBitrateKbps:1500\r\n";
         let params = server().parse_announce(body.as_bytes());
         assert_eq!(params.bitrate_kbps, Some(1500));
+    }
+
+    #[test]
+    fn announce_defaults_to_h264_when_bit_stream_format_is_absent() {
+        let params = server().parse_announce(b"");
+        assert_eq!(params.codec, redfog_core::VideoCodec::H264);
+    }
+
+    #[test]
+    fn announce_parses_hevc_bit_stream_format() {
+        let body = "a=x-nv-vqos[0].bitStreamFormat:1\r\n";
+        let params = server().parse_announce(body.as_bytes());
+        assert_eq!(params.codec, redfog_core::VideoCodec::Hevc);
+    }
+
+    #[test]
+    fn announce_falls_back_to_h264_for_unsupported_av1_bit_stream_format() {
+        let body = "a=x-nv-vqos[0].bitStreamFormat:2\r\n";
+        let params = server().parse_announce(body.as_bytes());
+        assert_eq!(params.codec, redfog_core::VideoCodec::H264);
     }
 }

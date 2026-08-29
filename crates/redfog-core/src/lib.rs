@@ -1464,6 +1464,8 @@ pub fn set_encoder_bitrate(pipeline: &gst::Pipeline, bitrate_kbps: u32) {
 /// dependency just for this one type — mirrors how every other public type
 /// here already came from `session-backend`/`kwin-capture` internally.
 pub use kwin_capture::nvenc_session::CudaDirectEncoderSession;
+/// Same re-export reasoning as `CudaDirectEncoderSession` above.
+pub use kwin_capture::nvenc_session::VideoCodec;
 
 /// [`VideoEncoder::NvencDirect`] counterpart to [`make_encoder_pipeline`] —
 /// same `source`/`bitrate_kbps`/`on_access_unit` shape, but returns a
@@ -1474,12 +1476,13 @@ pub use kwin_capture::nvenc_session::CudaDirectEncoderSession;
 pub fn make_cuda_direct_encoder_session(
     source: VideoSource,
     bitrate_kbps: u32,
+    codec: VideoCodec,
     on_access_unit: impl Fn(Vec<u8>, bool) + Send + Sync + 'static,
 ) -> CudaDirectEncoderSession {
     let VideoSource::KwinNativeDmaBuf { node_id, wayland_socket_path, width, height, fps } = source else {
         panic!("make_cuda_direct_encoder_session only supports VideoSource::KwinNativeDmaBuf");
     };
-    CudaDirectEncoderSession::spawn(node_id, wayland_socket_path, width, height, fps, bitrate_kbps, on_access_unit)
+    CudaDirectEncoderSession::spawn(node_id, wayland_socket_path, width, height, fps, bitrate_kbps, codec, on_access_unit)
 }
 
 /// A per-session virtual audio sink: apps in the compositor session play

@@ -273,6 +273,13 @@ impl PairingServer {
         // moonlight-qt takes that completely literally: it strips even H.264
         // out of its own supported-formats list before ever attempting to
         // stream, so the connection silently dies before RTSP every time.
+        // 0x0100 (256) additionally advertises HEVC (`SCM_HEVC`, confirmed
+        // against moonlight-common-rust's `ServerCodecModeSupport` bitflags)
+        // — real on this hardware, see `redfog_core::VideoCodec`'s doc
+        // comment; `<MaxLumaPixelsHEVC>` below has to be nonzero too, or
+        // clients treat HEVC as unsupported regardless of this bitmask.
+        // `1869449984` matches Sunshine's own hardcoded value for "HEVC
+        // active" (`nvhttp.cpp`) rather than a guessed number.
         // The 4th version component negative marks us "Sunshine-like" to real
         // clients (moonlight-common-rust's `ServerVersion::new`: `server_type
         // = Sunshine` iff this component is negative) — confirmed against
@@ -288,8 +295,8 @@ impl PairingServer {
     <appversion>7.1.431.-1</appversion>
     <GfeVersion>3.23.0.74</GfeVersion>
     <uniqueid>{server_id}</uniqueid>
-    <MaxLumaPixelsHEVC>0</MaxLumaPixelsHEVC>
-    <ServerCodecModeSupport>1</ServerCodecModeSupport>
+    <MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>
+    <ServerCodecModeSupport>257</ServerCodecModeSupport>
     <HttpsPort>{https_port}</HttpsPort>
     <ExternalPort>{http_port}</ExternalPort>
     <mac>00:00:00:00:00:00</mac>
