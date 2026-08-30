@@ -909,15 +909,6 @@ impl SessionManager {
             let video_stats = video_stats.clone();
             move |data: Vec<u8>, is_key_frame: bool| {
                 tracing::debug!("video encoder produced {} bytes, key_frame={is_key_frame}", data.len());
-                if let Some((fps, kbps)) = video_stats.lock().unwrap().record(data.len()) {
-                    // `kbps` here is *measured* actual output, not the
-                    // configured target — the two can legitimately diverge
-                    // (CBR padding, scene complexity) but should track each
-                    // other; a real mismatch is itself a useful signal.
-                    tracing::info!(
-                        "video: {fps:.1} fps, {kbps:.0} kbps, encoder={video_encoder:?}, codec={codec:?}, target_bitrate={initial_bitrate_kbps}kbps (generation={generation})"
-                    );
-                }
                 // `origin` (packetizer/stream_start/etc) is looked up fresh
                 // from `shared` on every frame, not captured once at build
                 // time — a *resumed* background session's pipeline is
@@ -931,11 +922,32 @@ impl SessionManager {
                 // generation`'s doc comment for why this also still refuses
                 // to send for a session that's supposed to be dead but whose
                 // GStreamer-level teardown never actually completed.
-                let origin = {
+                //
+                // `current_codec`/`current_bitrate_kbps` are read from the
+                // same lookup for the stats log below: `codec`/
+                // `initial_bitrate_kbps` (the closure's own captured
+                // arguments) reflect what this pipeline was *built* with,
+                // but `reconcile_video_pipeline`'s same-resolution fast path
+                // (see its doc comment) changes the running encoder's
+                // bitrate/codec via `CudaDirectEncoderSession::reconfigure`
+                // without ever rebuilding this closure — so those captured
+                // values go stale on the very first bitrate-only client
+                // reconnect, while the actual encoder output (`kbps` above)
+                // already reflects the change.
+                let (origin, current_codec, current_bitrate_kbps) = {
                     let shared = this.shared.lock().unwrap();
                     let Some(session) = session_by_generation(&shared, generation) else { return };
-                    session.origin.clone()
+                    (session.origin.clone(), session.codec, session.origin.target_bitrate_kbps)
                 };
+                if let Some((fps, kbps)) = video_stats.lock().unwrap().record(data.len()) {
+                    // `kbps` here is *measured* actual output, not the
+                    // configured target — the two can legitimately diverge
+                    // (CBR padding, scene complexity) but should track each
+                    // other; a real mismatch is itself a useful signal.
+                    tracing::info!(
+                        "video: {fps:.1} fps, {kbps:.0} kbps, encoder={video_encoder:?}, codec={current_codec:?}, target_bitrate={current_bitrate_kbps}kbps (generation={generation})"
+                    );
+                }
                 let sender = this.video_sender.clone();
                 // RTP timestamps use a 90kHz clock (standard for video) —
                 // derived from wall-clock time since streaming started
@@ -1144,6 +1156,16 @@ impl SessionManager {
     /// don't need this: Login never negotiates a codec that matters, and
     /// the GStreamer paths already live-adjust bitrate).
     ///
+    /// Two different outcomes depending on what actually changed: same
+    /// resolution (the common case — a bitrate/fps/codec-only difference)
+    /// reconfigures the existing `CudaDirectEncoderSession` in place via
+    /// `CudaDirectEncoderSession::reconfigure`, leaving its `PipewireCapture`
+    /// connection completely untouched; an actual resolution change still
+    /// resizes the compositor and rebuilds the whole video pipeline (a new
+    /// capture connection is unavoidable there). See `reconfigure`'s own
+    /// doc comment for why that split matters — it's a real leak fix, not
+    /// just an optimization.
+    ///
     /// Synchronous, not `async` — called via `spawn_blocking` from
     /// `handoff_to_user` since `SpawnedCompositor::resize` blocks (see its
     /// own doc comment), same reasoning as every other blocking call site
@@ -1169,9 +1191,33 @@ impl SessionManager {
             return session;
         }
         tracing::info!(
-            "handoff_to_user: negotiated params changed ({}x{}@{}fps {:?} {}kbps) -> ({wanted_width}x{wanted_height}@{wanted_fps}fps {wanted_codec:?} {wanted_bitrate_kbps}kbps), rebuilding video pipeline",
+            "handoff_to_user: negotiated params changed ({}x{}@{}fps {:?} {}kbps) -> ({wanted_width}x{wanted_height}@{wanted_fps}fps {wanted_codec:?} {wanted_bitrate_kbps}kbps)",
             session.width, session.height, session.fps, session.codec, session.origin.target_bitrate_kbps,
         );
+
+        // Same resolution: reconfigure the existing NVENC encoder in place
+        // instead of tearing down and rebuilding the whole video pipeline
+        // (which means a whole new `PipewireCapture`, i.e. a whole new
+        // PipeWire daemon connection). Confirmed live via `ss -xp` that
+        // rebuilding the capture connection on every bitrate-only change —
+        // the common case, e.g. a different client connecting with a
+        // different requested max bitrate — leaked a couple of sockets
+        // every single time (a fresh D-Bus system-bus connection alongside
+        // the PipeWire one, neither from anything in this crate's own EGL/
+        // Vulkan code, both already ruled out separately) — likely PipeWire
+        // itself or wireplumber doing DRM device authorization via `logind`
+        // on every new stream connection. A resolution change still needs a
+        // new capture connection regardless (the compositor's own output
+        // size changed), so only this fast path skips it.
+        if wanted_width == session.width && wanted_height == session.height {
+            if let Some(cuda_direct_session) = &session.cuda_direct_session {
+                cuda_direct_session.reconfigure(wanted_fps, wanted_bitrate_kbps, wanted_codec);
+            }
+            session.fps = wanted_fps;
+            session.codec = wanted_codec;
+            return session;
+        }
+        tracing::info!("handoff_to_user reconcile: resolution also changed, rebuilding the whole video pipeline (new capture connection unavoidable)");
 
         // Drop the *old* `CudaDirectEncoderSession` before building the new
         // one, not after (an earlier version of this code built first) —
@@ -1188,13 +1234,13 @@ impl SessionManager {
         session.cuda_direct_session = None;
         session.video_pipeline = gstreamer::Pipeline::new();
 
-        if wanted_width != session.width || wanted_height != session.height {
-            let resized = session.compositor.as_ref().is_some_and(|c| c.resize(wanted_width as i32, wanted_height as i32));
-            tracing::info!(
-                "handoff_to_user reconcile: resize to {wanted_width}x{wanted_height} {}",
-                if resized { "applied" } else { "not supported by this compositor backend, resolution unchanged" }
-            );
-        }
+        // Reaching here means width/height genuinely differ (the fast path
+        // above already returned otherwise), so this always applies.
+        let resized = session.compositor.as_ref().is_some_and(|c| c.resize(wanted_width as i32, wanted_height as i32));
+        tracing::info!(
+            "handoff_to_user reconcile: resize to {wanted_width}x{wanted_height} {}",
+            if resized { "applied" } else { "not supported by this compositor backend, resolution unchanged" }
+        );
 
         let fps_cap = (wanted_fps > 0).then_some(wanted_fps);
         let handle = tokio::runtime::Handle::current();

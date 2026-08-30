@@ -12,16 +12,22 @@
 //! frames or on request, P otherwise) — the same standard pattern
 //! GStreamer's `nvh264enc`/PTD path replaces, just done by hand.
 //!
-//! Live bitrate changes aren't implemented: `nvidia-video-codec-sdk` 0.4
-//! doesn't expose `NvEncReconfigureEncoder` through its safe API (the
+//! True in-place bitrate changes aren't implemented: `nvidia-video-codec-sdk`
+//! 0.4 doesn't expose `NvEncReconfigureEncoder` through its safe API (the
 //! `Encoder`/`Session` structs' raw pointer field is `pub(crate)`), so
-//! [`CudaDirectEncoderSession::set_bitrate`] is currently a logged no-op.
+//! [`CudaDirectEncoderSession::set_bitrate`] (the high-frequency adaptive-
+//! bitrate hook) is still a logged no-op. [`CudaDirectEncoderSession::
+//! reconfigure`] gets a coarser-grained substitute for the low-frequency,
+//! reconnect-triggered case instead: rebuild the whole NVENC session (a
+//! forced keyframe, same cost as a resolution change) while reusing the
+//! existing `PipewireCapture` connection — see its own doc comment for why
+//! that split matters (a real leak, not just an optimization).
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
@@ -65,6 +71,23 @@ impl VideoCodec {
     }
 }
 
+/// fps/bitrate/codec, requested via [`CudaDirectEncoderSession::reconfigure`]
+/// — deliberately NOT width/height. NVENC (like any hardware encoder) needs
+/// a brand-new session for any of these, same as a resolution change would,
+/// but *unlike* a resolution change, none of them require the underlying
+/// [`PipewireCapture`] connection to change at all — the capture stream
+/// doesn't care what bitrate the encoder downstream of it uses. Reusing the
+/// same capture connection instead of tearing it down and reconnecting is
+/// the entire point: see `run`'s doc comment for the leak this avoids. A
+/// resolution change still goes through the full
+/// [`CudaDirectEncoderSession::spawn`] path (a new capture connection is
+/// unavoidable there — the compositor's own output size changed).
+struct PendingReconfig {
+    fps: u32,
+    bitrate_kbps: u32,
+    codec: VideoCodec,
+}
+
 enum RegisteredFrame<'a> {
     Array(RegisteredResource<'a, ImportedArray>),
     /// `BridgedImage` alongside the NVENC registration (not just the
@@ -97,6 +120,7 @@ impl EncoderInput for RegisteredFrame<'_> {
 pub struct CudaDirectEncoderSession {
     shutdown: Arc<AtomicBool>,
     force_keyframe: Arc<AtomicBool>,
+    reconfig: Arc<Mutex<Option<PendingReconfig>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -124,8 +148,10 @@ impl CudaDirectEncoderSession {
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let force_keyframe = Arc::new(AtomicBool::new(false));
+        let reconfig = Arc::new(Mutex::new(None));
         let thread_shutdown = shutdown.clone();
         let thread_force_keyframe = force_keyframe.clone();
+        let thread_reconfig = reconfig.clone();
         let thread = std::thread::spawn(move || {
             if let Err(e) = run(
                 node_id,
@@ -137,12 +163,13 @@ impl CudaDirectEncoderSession {
                 codec,
                 &thread_shutdown,
                 &thread_force_keyframe,
+                &thread_reconfig,
                 &on_access_unit,
             ) {
                 eprintln!("kwin-capture: CudaDirectEncoderSession thread exiting with error: {e}");
             }
         });
-        Self { shutdown, force_keyframe, thread: Some(thread) }
+        Self { shutdown, force_keyframe, reconfig, thread: Some(thread) }
     }
 
     /// See [`redfog_core::request_keyframe`]'s doc comment — same purpose
@@ -152,12 +179,30 @@ impl CudaDirectEncoderSession {
         self.force_keyframe.store(true, Ordering::SeqCst);
     }
 
-    /// Not implemented yet — see this module's doc comment for why.
+    /// Not implemented yet — see this module's doc comment for why. Kept
+    /// distinct from [`Self::reconfigure`], which *is* implemented: this one
+    /// is the high-frequency adaptive-bitrate hook (`on_loss_stats`, capable
+    /// of firing every loss report), where a full NVENC session rebuild per
+    /// call would mean a fresh forced keyframe (far larger than a P-frame)
+    /// on every small adjustment — not what that mechanism wants.
+    /// `reconfigure` is the coarser, reconnect-triggered path instead, where
+    /// a rebuild (and the one keyframe it costs) is expected and rare.
     pub fn set_bitrate(&self, bitrate_kbps: u32) {
         eprintln!(
             "kwin-capture: CudaDirectEncoderSession::set_bitrate({bitrate_kbps}) ignored — \
              live bitrate reconfiguration isn't supported yet on the CUDA-direct encode path"
         );
+    }
+
+    /// Rebuilds the NVENC encoder in place — new fps/bitrate/codec — while
+    /// leaving the underlying [`PipewireCapture`] connection completely
+    /// untouched. Applied asynchronously, on the background thread's own
+    /// next loop iteration (same "fire and forget" shape as `spawn` itself
+    /// already has) — no resolution change is possible through this path,
+    /// see `PendingReconfig`'s doc comment for why. Overwrites any
+    /// previously-requested-but-not-yet-applied reconfigure.
+    pub fn reconfigure(&self, fps: u32, bitrate_kbps: u32, codec: VideoCodec) {
+        *self.reconfig.lock().unwrap() = Some(PendingReconfig { fps, bitrate_kbps, codec });
     }
 }
 
@@ -170,6 +215,26 @@ impl Drop for CudaDirectEncoderSession {
     }
 }
 
+/// Owns the [`PipewireCapture`] connection for this session's whole
+/// lifetime — created once, reused across every `reconfigure` call — and
+/// drives an inner encoder loop ([`run_encoder`]) that gets torn down and
+/// rebuilt in place whenever a `PendingReconfig` arrives, or exits for good
+/// on `shutdown`.
+///
+/// Splitting it this way (rather than one flat loop that rebuilds
+/// *everything*, capture included, on any parameter change) is what fixes a
+/// real leak: repeatedly reconnecting to the compositor's PipeWire daemon
+/// leaked two sockets every time (a fresh D-Bus system-bus connection plus
+/// the PipeWire connection itself, per `ss -xp` — not from anything in this
+/// crate's own EGL/Vulkan code, both already ruled out and fixed
+/// separately; most likely PipeWire's own client library or wireplumber
+/// doing DRM device authorization via `logind` on every new stream
+/// connection). A bitrate/fps/codec-only change — the common case for
+/// `SessionManager::reconcile_video_pipeline`, e.g. a different client
+/// connecting with a different requested bitrate — never needs a new
+/// capture connection at all; only resolution changes still do (see
+/// `PendingReconfig`'s doc comment), and those already go through a fresh
+/// `CudaDirectEncoderSession::spawn` instead of `reconfigure`.
 #[allow(clippy::too_many_arguments)]
 fn run(
     node_id: u32,
@@ -181,11 +246,57 @@ fn run(
     codec: VideoCodec,
     shutdown: &AtomicBool,
     force_keyframe: &AtomicBool,
+    reconfig: &Mutex<Option<PendingReconfig>>,
     on_access_unit: &(impl Fn(Vec<u8>, bool) + Send + Sync + 'static),
 ) -> Result<(), String> {
     let capture = PipewireCapture::start(node_id, wayland_socket_path, false)
         .map_err(|e| format!("PipewireCapture::start: {e}"))?;
 
+    let mut fps = fps;
+    let mut bitrate_kbps = bitrate_kbps;
+    let mut codec = codec;
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        match run_encoder(&capture, width, height, fps, bitrate_kbps, codec, shutdown, force_keyframe, reconfig, on_access_unit)? {
+            EncoderOutcome::Shutdown => return Ok(()),
+            EncoderOutcome::Reconfigure(new) => {
+                eprintln!("kwin-capture: reconfiguring encoder in place (fps={} bitrate={}kbps codec={:?}) — capture connection untouched", new.fps, new.bitrate_kbps, new.codec);
+                fps = new.fps;
+                bitrate_kbps = new.bitrate_kbps;
+                codec = new.codec;
+            }
+        }
+    }
+}
+
+enum EncoderOutcome {
+    Shutdown,
+    Reconfigure(PendingReconfig),
+}
+
+/// One NVENC session's whole lifetime: builds it fresh, then feeds it
+/// frames from the *already-connected* `capture` until either `shutdown` or
+/// a `reconfig` request ends this particular encoder (not the capture
+/// connection, which outlives every call to this function — see `run`'s
+/// doc comment). All NVENC/CUDA-import state below is local to one call:
+/// returning drops it all, so the caller rebuilding fresh on the next call
+/// is a completely clean start, same as it always was per-`run` before this
+/// was split out — just without paying for a new capture connection too.
+#[allow(clippy::too_many_arguments)]
+fn run_encoder(
+    capture: &PipewireCapture,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+    codec: VideoCodec,
+    shutdown: &AtomicBool,
+    force_keyframe: &AtomicBool,
+    reconfig: &Mutex<Option<PendingReconfig>>,
+    on_access_unit: &(impl Fn(Vec<u8>, bool) + Send + Sync + 'static),
+) -> Result<EncoderOutcome, String> {
     let importer = CudaImporter::new().map_err(|e| format!("CudaImporter::new: {e:?}"))?;
     let use_array_import = importer.dma_buf_array_import_supported().unwrap_or(false);
     eprintln!(
@@ -258,7 +369,13 @@ fn run(
     let mut registered: HashMap<i64, RegisteredFrame<'_>> = HashMap::new();
     let mut frame_index: u64 = 0;
 
-    while !shutdown.load(Ordering::SeqCst) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(EncoderOutcome::Shutdown);
+        }
+        if let Some(new) = reconfig.lock().unwrap().take() {
+            return Ok(EncoderOutcome::Reconfigure(new));
+        }
         let Some(frame) = capture.next_frame() else {
             std::thread::sleep(std::time::Duration::from_millis(1));
             continue;
@@ -371,6 +488,4 @@ fn run(
 
         frame_index += 1;
     }
-
-    Ok(())
 }
