@@ -17,15 +17,18 @@
 //! takes an explicit socket path instead of relying on env vars.
 
 use khronos_egl as egl;
+use std::collections::HashMap;
 use std::ffi::{c_uint, c_void};
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const EGL_PLATFORM_WAYLAND_KHR: egl::Enum = 0x31D8;
 
 /// A DRM fourcc format this GPU/driver stack can export as DMA-BUF, with its
 /// supported modifiers (first entry is the driver's preferred one).
+#[derive(Clone)]
 pub struct DmabufFormat {
     pub drm_fourcc: u32,
     pub modifiers: Vec<i64>,
@@ -33,14 +36,36 @@ pub struct DmabufFormat {
 
 /// Returns an empty list (never an error) if EGL/Wayland DMA-BUF import isn't
 /// available here — callers should treat that as "fall back to MemPtr only".
+///
+/// Cached per `wayland_socket_path` rather than re-queried on every call
+/// (previously: every single `PipewireCapture::start()`, i.e. every video-
+/// pipeline rebuild — see `SessionManager::reconcile_video_pipeline`).
+/// Confirmed live via `ss -xp`: each throwaway EGL/Wayland probe here opened
+/// a fresh D-Bus system-bus connection (`u_str` to `dbus-broker`) and a
+/// fresh PipeWire daemon connection alongside it, neither released by
+/// `eglTerminate` (which only covers what EGL itself allocated — this is a
+/// separate resource, almost certainly Mesa/NVIDIA's own DRM device
+/// authorization via logind, a level below the EGL API surface) — two
+/// sockets leaked on every rebuild that survived the earlier `eglTerminate`
+/// fix. The set of formats/modifiers a GPU driver supports doesn't change
+/// between calls for the same compositor anyway, so caching is correct, not
+/// just a workaround.
 pub fn query_dmabuf_formats(wayland_socket_path: &Path) -> Vec<DmabufFormat> {
-    match try_query(wayland_socket_path) {
+    static CACHE: Mutex<Option<HashMap<PathBuf, Vec<DmabufFormat>>>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap();
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if let Some(cached) = cache.get(wayland_socket_path) {
+        return cached.clone();
+    }
+    let formats = match try_query(wayland_socket_path) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("EGL DMA-BUF modifier query unavailable: {e}");
             Vec::new()
         }
-    }
+    };
+    cache.insert(wayland_socket_path.to_path_buf(), formats.clone());
+    formats
 }
 
 fn try_query(wayland_socket_path: &Path) -> Result<Vec<DmabufFormat>, Box<dyn std::error::Error>> {
@@ -76,6 +101,19 @@ fn try_query(wayland_socket_path: &Path) -> Result<Vec<DmabufFormat>, Box<dyn st
         egl.get_platform_display(EGL_PLATFORM_WAYLAND_KHR, wl_display, &[egl::ATTRIB_NONE])?
     };
     egl.initialize(display)?;
+    // No matching `eglTerminate` existed anywhere below (several early `?`
+    // returns after this point) — every call leaked the display's
+    // underlying GPU driver connection (confirmed live: `/dev/dri/
+    // renderD128` growing by a fixed amount on every `PipewireCapture::
+    // start()`, i.e. every video-pipeline rebuild). Same drop-guard
+    // pattern as `WlGuard` above, for the same reason.
+    struct EglGuard<'a>(&'a egl::DynamicInstance<egl::EGL1_5>, egl::Display);
+    impl Drop for EglGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.terminate(self.1);
+        }
+    }
+    let _egl_guard = EglGuard(&egl, display);
 
     type QueryFormatsFn =
         unsafe extern "C" fn(egl::EGLDisplay, egl::Int, *mut egl::Int, *mut egl::Int) -> egl::Boolean;

@@ -426,6 +426,19 @@ impl PipewireCapture {
 
         mainloop.run();
 
+        // `pw_stream_destroy`/`pw_core_disconnect` (called by `stream`/
+        // `core`'s own `Drop` below, once this function returns) send an
+        // async disconnect notification to the PipeWire daemon — quitting
+        // the loop the instant `shutdown` is noticed doesn't give it any
+        // further chance to actually flush that out or process the
+        // daemon's response before the socket disappears out from under
+        // it. A few more short iterations here, after the flag is already
+        // set but before anything is torn down, lets that happen instead
+        // of leaving it stranded.
+        for _ in 0..5 {
+            mainloop.loop_().iterate(pw::loop_::Timeout::Finite(Duration::from_millis(10)));
+        }
+
         Ok(())
     }
 

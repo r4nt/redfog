@@ -192,11 +192,7 @@ fn run(
         "kwin-capture: CudaDirectEncoderSession using {} import path (CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED={use_array_import})",
         if use_array_import { "direct tiled-array" } else { "Vulkan-bridge linear" }
     );
-    let vulkan_bridge = if use_array_import {
-        None
-    } else {
-        Some(VulkanBridge::new(0).map_err(|e| format!("VulkanBridge::new: {e}"))?)
-    };
+    let vulkan_bridge = if use_array_import { None } else { Some(VulkanBridge::shared()?) };
 
     // A separate cudarc line from `CudaImporter`'s (see cuda_import.rs's doc
     // comment) — both retain the same refcounted primary context for device 0.
@@ -300,7 +296,8 @@ fn run(
                 let linear_size = (frame.width as u64) * (frame.height as u64) * 4;
                 let (bridged, linear_fd) = unsafe {
                     vulkan_bridge
-                        .as_ref()
+                        .unwrap()
+                        .lock()
                         .unwrap()
                         .import_persistent(
                             frame.fd,
@@ -355,7 +352,7 @@ fn run(
         // once — kept simple rather than special-cased.
         if let RegisteredFrame::Linear(_, bridged) = input_resource {
             unsafe {
-                vulkan_bridge.as_ref().unwrap().refresh(bridged).map_err(|e| format!("VulkanBridge::refresh: {e}"))?;
+                vulkan_bridge.unwrap().lock().unwrap().refresh(bridged).map_err(|e| format!("VulkanBridge::refresh: {e}"))?;
             }
         }
         session

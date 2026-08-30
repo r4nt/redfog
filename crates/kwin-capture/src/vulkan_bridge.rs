@@ -33,6 +33,7 @@
 use ash::vk;
 use std::ffi::c_void;
 use std::os::fd::RawFd;
+use std::sync::{Mutex, OnceLock};
 
 pub struct VulkanBridge {
     _entry: ash::Entry,
@@ -115,6 +116,30 @@ impl VulkanBridge {
             queue,
             command_pool,
         })
+    }
+
+    /// Process-wide singleton, not one per `CudaDirectEncoderSession` — the
+    /// previous per-session lifecycle (one `new()`+drop per video-pipeline
+    /// rebuild, see `SessionManager::reconcile_video_pipeline`) leaked two
+    /// fds (`/dev/nvidiactl`, `/dev/dri/renderD128`) on *every single*
+    /// create/destroy cycle. Confirmed via an isolated repro (a bare loop
+    /// of `VulkanBridge::new(0)` + `drop`, nothing else involved — no
+    /// PipeWire, no KWin) that this is NVIDIA's own proprietary Vulkan
+    /// driver not releasing its GPU device connection on `vkDestroyInstance`
+    /// when a process repeatedly creates and destroys `VkInstance`s, not a
+    /// resource we're failing to release ourselves (this type's own `Drop`
+    /// already calls `destroy_command_pool`/`destroy_device`/
+    /// `destroy_instance`, in that order) — so the only real fix is to stop
+    /// doing that repeatedly at all. `Mutex`-wrapped because Vulkan queue
+    /// submission (`import_persistent`/`refresh`, both used from whichever
+    /// thread owns a given `CudaDirectEncoderSession`) requires external
+    /// synchronization the moment more than one thread could touch the same
+    /// queue — a real possibility now that every session sharing this one
+    /// instance might run concurrently (different physical clients, or
+    /// Login and User briefly overlapping mid-handoff).
+    pub fn shared() -> Result<&'static Mutex<VulkanBridge>, String> {
+        static SHARED: OnceLock<Result<Mutex<VulkanBridge>, String>> = OnceLock::new();
+        SHARED.get_or_init(|| VulkanBridge::new(0).map(Mutex::new)).as_ref().map_err(Clone::clone)
     }
 
     fn find_memory_type_index(&self, type_bits: u32, required_props: vk::MemoryPropertyFlags) -> u32 {
