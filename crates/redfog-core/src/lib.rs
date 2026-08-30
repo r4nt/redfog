@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, Child};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
@@ -87,11 +88,16 @@ pub struct CompositorSession {
     pub capture_session: CaptureSession,
     pub pipewire_node_id: u32,
     /// Only used to build [`VideoSource::KwinNativeDmaBuf`]'s appsrc caps —
-    /// see [`CompositorSession::video_source`]. Not kept in sync with
-    /// `capture_session.resize()`; the native path doesn't support live
-    /// resize yet (same limitation `GstWaylandDisplay`/`Login` already have).
-    width: i32,
-    height: i32,
+    /// see [`CompositorSession::video_source`]. Atomics (not plain `i32`)
+    /// because [`Self::resize`] takes `&self` (mirroring
+    /// `CaptureSession::resize`/`SpawnedCompositor::resize`, both `&self`
+    /// too) and must keep these in sync with the real, live compositor size
+    /// — `video_source()` used to keep reporting whatever size this session
+    /// was originally constructed with even after a live resize, which fed
+    /// a stale target width/height into a freshly (re)spawned
+    /// `CudaDirectEncoderSession`; see `Self::resize`'s doc comment.
+    width: AtomicI32,
+    height: AtomicI32,
     fps: u32,
 }
 
@@ -245,8 +251,8 @@ impl CompositorSession {
             VideoSource::KwinNativeDmaBuf {
                 node_id: self.pipewire_node_id,
                 wayland_socket_path: self.socket_path.clone(),
-                width: self.width as u32,
-                height: self.height as u32,
+                width: self.width.load(Ordering::Relaxed) as u32,
+                height: self.height.load(Ordering::Relaxed) as u32,
                 fps: self.fps,
             }
         } else {
@@ -412,10 +418,27 @@ impl CompositorSession {
             kwin_process: child,
             capture_session,
             pipewire_node_id,
-            width,
-            height,
+            width: AtomicI32::new(width),
+            height: AtomicI32::new(height),
             fps,
         })
+    }
+
+    /// Resizes the virtual output and, once the compositor has confirmed it
+    /// (see `CaptureSession::resize`, which blocks until then), records the
+    /// new size so a subsequent `video_source()` call reports it — a
+    /// resolution-change reconnect always rebuilds the whole video pipeline
+    /// (a fresh `CudaDirectEncoderSession`, spawned with whatever
+    /// `video_source()` returns at that point) immediately after calling
+    /// this, and that encoder validates every incoming frame's dimensions
+    /// against the size it was told to expect (see `kwin-capture`'s
+    /// `run_encoder`). Before this existed, that check compared against the
+    /// session's original construction-time size forever, so it rejected
+    /// every correctly-resized frame after any resize.
+    pub fn resize(&self, width: i32, height: i32) {
+        self.capture_session.resize(width, height);
+        self.width.store(width, Ordering::Relaxed);
+        self.height.store(height, Ordering::Relaxed);
     }
 
 

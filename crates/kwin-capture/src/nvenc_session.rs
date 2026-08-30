@@ -384,6 +384,27 @@ fn run_encoder(
             unsafe { libc::close(frame.fd) };
             continue;
         }
+        if frame.width != width || frame.height != height {
+            // A compositor resize (`SessionManager::reconcile_video_pipeline`'s
+            // resolution-change path) is asynchronous: PipeWire can still
+            // deliver a frame or two at the old resolution, or at an
+            // intermediate size from a mid-transition renegotiation, after
+            // this encoder was already spawned for the new target
+            // `width`/`height` above — NVENC's init params are fixed for
+            // this whole `run_encoder` call, so registering a differently-
+            // sized buffer against it fails. That used to be fatal (the
+            // failure propagated out via `?` and ended the whole background
+            // thread, killing video for the rest of the session); dropping
+            // the mismatched frame and waiting for capture to settle on the
+            // resolution this encoder actually expects costs at most a
+            // couple of frames during a resize, which is a non-issue.
+            eprintln!(
+                "kwin-capture: dropping frame at {}x{} — waiting for capture to settle on {width}x{height} after a resolution change",
+                frame.width, frame.height
+            );
+            unsafe { libc::close(frame.fd) };
+            continue;
+        }
 
         if let std::collections::hash_map::Entry::Vacant(entry) = registered.entry(frame.buffer_identity) {
             let resource = if use_array_import {

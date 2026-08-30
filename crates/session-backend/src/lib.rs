@@ -248,7 +248,7 @@ impl SpawnedCompositor {
     pub fn resize(&self, width: i32, height: i32) -> bool {
         match self {
             Self::Kwin(session) => {
-                session.capture_session.resize(width, height);
+                session.resize(width, height);
                 true
             }
             Self::GstWaylandDisplay { .. } | Self::HeadlessLogin { .. } => false,
