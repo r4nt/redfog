@@ -1,6 +1,9 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
+use std::time::Duration;
 use pipewire as pw;
 use pw::spa;
 use spa::pod::Pod;
@@ -40,6 +43,8 @@ pub struct CapturedFrame {
 
 pub struct PipewireCapture {
     frame_rx: Receiver<CapturedFrame>,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PipewireCapture {
@@ -55,17 +60,25 @@ impl PipewireCapture {
     /// needs this and the GL/`glupload` path doesn't).
     pub fn start(target_node_id: u32, wayland_socket_path: PathBuf, prefer_linear: bool) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (frame_tx, frame_rx) = channel::<CapturedFrame>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
 
-        std::thread::spawn(move || {
-            if let Err(e) = Self::run_loop(target_node_id, wayland_socket_path, prefer_linear, frame_tx) {
+        let thread = std::thread::spawn(move || {
+            if let Err(e) = Self::run_loop(target_node_id, wayland_socket_path, prefer_linear, frame_tx, thread_shutdown) {
                 eprintln!("Pipewire background loop failed: {e}");
             }
         });
 
-        Ok(Self { frame_rx })
+        Ok(Self { frame_rx, shutdown, thread: Some(thread) })
     }
 
-    fn run_loop(target_node_id: u32, wayland_socket_path: PathBuf, prefer_linear: bool, frame_tx: std::sync::mpsc::Sender<CapturedFrame>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn run_loop(
+        target_node_id: u32,
+        wayland_socket_path: PathBuf,
+        prefer_linear: bool,
+        frame_tx: std::sync::mpsc::Sender<CapturedFrame>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pw::init();
 
         let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -386,6 +399,31 @@ impl PipewireCapture {
             &mut params,
         )?;
 
+        // Without this, `mainloop.run()` below never returns on its own —
+        // there was previously no way to stop this thread at all short of
+        // the whole process exiting. Harmless as long as a `PipewireCapture`
+        // is only ever created once per process lifetime, but a *rebuild*
+        // (see `SessionManager::reconcile_video_pipeline`) creates a new one
+        // mid-session while the old one's underlying PipeWire connection is
+        // still live: the orphaned thread's `.process()` callback below kept
+        // firing forever, `dup()`-ing a fresh dma-buf fd every tick and
+        // silently leaking it the moment `tx.send()` started failing (this
+        // capture's `frame_rx` — the only receiver — already dropped).
+        // Confirmed live: fd count climbed continuously, one per captured
+        // frame, immediately following the first ever rebuild. A repeating
+        // timer polling the shutdown flag every 50ms (rather than needing to
+        // signal an `EventSource` cross-thread, which `pipewire-rs`'s
+        // `EventSource` isn't `Send` for) is simple and fast enough — this
+        // only needs to notice shutdown promptly, not react to real capture
+        // traffic.
+        let mainloop_for_timer = mainloop.clone();
+        let timer = mainloop.loop_().add_timer(move |_| {
+            if shutdown.load(Ordering::Relaxed) {
+                mainloop_for_timer.quit();
+            }
+        });
+        timer.update_timer(Some(Duration::from_millis(50)), Some(Duration::from_millis(50))).into_result()?;
+
         mainloop.run();
 
         Ok(())
@@ -407,5 +445,14 @@ impl PipewireCapture {
     /// control flow, just how promptly they get to re-check `shutdown`.
     pub fn next_frame(&self) -> Option<CapturedFrame> {
         self.frame_rx.recv_timeout(std::time::Duration::from_millis(200)).ok()
+    }
+}
+
+impl Drop for PipewireCapture {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }

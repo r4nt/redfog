@@ -11,7 +11,7 @@
 //! production can't drift apart the way they briefly did when this file
 //! used to duplicate the whole capture/import/encode loop by hand.
 
-use kwin_capture::nvenc_session::CudaDirectEncoderSession;
+use kwin_capture::nvenc_session::{CudaDirectEncoderSession, VideoCodec};
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
@@ -87,7 +87,7 @@ async fn cuda_direct_nvenc_encode_glxgears_test() {
 
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
     eprintln!("Starting CudaDirectEncoderSession (DMA-BUF -> CUDA -> NVENC, no GStreamer)...");
-    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, WIDTH, HEIGHT, FPS, BITRATE_KBPS, move |data, is_keyframe| {
+    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, WIDTH, HEIGHT, FPS, BITRATE_KBPS, VideoCodec::H264, move |data, is_keyframe| {
         let _ = tx.send((data, is_keyframe));
     });
 

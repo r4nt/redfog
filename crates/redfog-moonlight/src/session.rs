@@ -1169,9 +1169,25 @@ impl SessionManager {
             return session;
         }
         tracing::info!(
-            "handoff_to_user: negotiated params changed ({}x{}@{}fps {:?}) -> ({wanted_width}x{wanted_height}@{wanted_fps}fps {wanted_codec:?}), rebuilding video pipeline",
-            session.width, session.height, session.fps, session.codec,
+            "handoff_to_user: negotiated params changed ({}x{}@{}fps {:?} {}kbps) -> ({wanted_width}x{wanted_height}@{wanted_fps}fps {wanted_codec:?} {wanted_bitrate_kbps}kbps), rebuilding video pipeline",
+            session.width, session.height, session.fps, session.codec, session.origin.target_bitrate_kbps,
         );
+
+        // Drop the *old* `CudaDirectEncoderSession` before building the new
+        // one, not after (an earlier version of this code built first) —
+        // confirmed live: building first left two CUDA contexts and two
+        // `PipewireCapture` connections to the same compositor output node
+        // alive simultaneously for a brief window on every rebuild, which
+        // reliably leaked `/dev/nvidia0` handles (fd count climbing on
+        // every bitrate-triggered reconnect, eventually crashing the
+        // process with EMFILE). `Drop` (shutdown flag + thread join) runs
+        // synchronously here — unlike GStreamer's `set_state(Null)` (the
+        // thing that's hung before elsewhere in this codebase), its encode
+        // loop only ever sleeps 1ms between checking the shutdown flag, so
+        // this is expected to return promptly.
+        session.cuda_direct_session = None;
+        session.video_pipeline = gstreamer::Pipeline::new();
+
         if wanted_width != session.width || wanted_height != session.height {
             let resized = session.compositor.as_ref().is_some_and(|c| c.resize(wanted_width as i32, wanted_height as i32));
             tracing::info!(
@@ -1193,15 +1209,6 @@ impl SessionManager {
             handle,
             this,
         );
-        // Old `video_pipeline` here is always `CudaDirectEncoderSession`'s
-        // empty placeholder (this whole method is scoped to
-        // `cuda_direct_session.is_some()`) — nothing to tear down. The old
-        // `cuda_direct_session` Arc's `Drop` (shutdown flag + thread join)
-        // runs synchronously here when this replaces its last reference;
-        // unlike GStreamer's `set_state(Null)` (the thing that's hung
-        // before elsewhere in this codebase), its encode loop only ever
-        // sleeps 1ms between checking the shutdown flag, so this is
-        // expected to return promptly.
         session.video_pipeline = video_pipeline;
         session.cuda_direct_session = cuda_direct_session;
         session.width = wanted_width;
