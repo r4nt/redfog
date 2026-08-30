@@ -320,6 +320,27 @@ impl RtspServer {
         // clients (having also been told we're "Sunshine-like" via
         // `<appversion>`, see pairing.rs) still fall back to skipping
         // control-channel encryption negotiation entirely.
+        //
+        // `sprop-parameter-sets=AAAAAU` — load-bearing, not decorative: this
+        // exact literal string (base64 for the Annex-B start code
+        // `00 00 00 01`) is how *real* clients actually decide whether a
+        // server supports HEVC at all — confirmed against real
+        // moonlight-common-c (`RtspConnection.c` around L1091) and real
+        // Sunshine (`rtsp.cpp` around L793), both of which gate it on
+        // "HEVC available" and treat its *absence* here as "H.264 only,"
+        // completely independent of `/serverinfo`'s `ServerCodecModeSupport`
+        // bit. Without this line, `/serverinfo` can correctly advertise
+        // SCM_HEVC all it wants — every real client (moonlight-qt linking
+        // moonlight-common-c directly, moonlight-web-stream via its FFI
+        // bindings to the same library) still silently drops HEVC from its
+        // own candidate list before ever sending ANNOUNCE, with no error
+        // shown anywhere. Confirmed NOT to matter for moonlight-common-
+        // rust's own `stream::proto` (pure-Rust) reimplementation, which
+        // parses this same DESCRIBE attribute (`ServerSdp::parse`) but never
+        // actually reads the result for codec selection — HEVC negotiated
+        // correctly in that path even without this line, which is why the
+        // gap wasn't caught by this crate's own dev-dependency-driven
+        // integration tests until tested against real clients.
         format!(
             "v=0\r\n\
              o=redfog 0 0 IN IPv4 0.0.0.0\r\n\
@@ -328,7 +349,8 @@ impl RtspServer {
              a=x-ss-general.encryptionSupported:1\r\n\
              a=x-nv-video[0].videoPort:{video_port}\r\n\
              a=x-nv-general.serverControlPort:{control_port}\r\n\
-             a=x-nv-general.serverAudioPort:{audio_port}\r\n",
+             a=x-nv-general.serverAudioPort:{audio_port}\r\n\
+             sprop-parameter-sets=AAAAAU\r\n",
             video_port = self.video_port,
             control_port = self.control_port,
             audio_port = self.audio_port,

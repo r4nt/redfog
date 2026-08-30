@@ -5,12 +5,39 @@
 //! on older GPUs — see `cuda_import`'s doc comment), and drives NVENC
 //! directly, with no GStreamer involved in the video leg at all.
 //!
-//! Picture-type decision (`enablePTD`) is deliberately left *off* — with it
-//! on, NVIDIA's docs say `NV_ENC_PIC_PARAMS::pictureType` is ignored, which
-//! would make [`CudaDirectEncoderSession::request_keyframe`] a no-op. With
-//! it off, we own the I/P cadence ourselves (an IDR every `gop_length`
-//! frames or on request, P otherwise) — the same standard pattern
-//! GStreamer's `nvh264enc`/PTD path replaces, just done by hand.
+//! Picture-type decision (`enablePTD`) is left *off* for both codecs — we
+//! own the I/P cadence ourselves (an IDR every `gop_length` frames or on
+//! request, P otherwise) — the same standard pattern GStreamer's
+//! `nvh264enc`/PTD path replaces, just done by hand. With PTD off,
+//! [`CudaDirectEncoderSession::request_keyframe`] is a true in-place
+//! operation for both codecs: the *next* captured frame just gets encoded
+//! as `IDR` instead of `P` on the same, already-running session — no
+//! rebuild, ~15ms end to end in practice (dominated by waiting for that
+//! next frame at 60fps), not the 200+ms a full session rebuild costs.
+//!
+//! HEVC needs one thing H.264 doesn't for this to work at all: manually
+//! setting `pictureType = P` used to make NVENC reject the very next
+//! `encode_picture` call outright (`EncodeError { kind: Generic }`, no
+//! further detail) on this GPU/driver — confirmed live this wasn't a
+//! resource/registration bug, and briefly worked around by leaving PTD *on*
+//! for HEVC only (costing `request_keyframe` entirely, and adding real
+//! per-rebuild latency/CPU cost to keyframe recovery). Root-caused properly
+//! by reading NVIDIA's own header docs for `NV_ENC_PIC_PARAMS_HEVC`:
+//! `displayPOCSyntax` ("required to be set if client is handling the
+//! picture type decision") and `refPicFlag` ("ignored if enablePTD is set
+//! to 1" — i.e. it matters precisely when we need it to) were both being
+//! left at their zeroed `EncodePictureParams::default()` value on every
+//! frame, `codec_params: None`. NVENC was very likely rejecting the second
+//! frame's `encode_picture` because its display POC (stuck at a constant
+//! 0) failed a monotonicity check against the DPB state — the manually-
+//! forced *first* IDR frame never triggers that check, only the first
+//! P-frame after it, exactly matching what was observed. Supplying a
+//! per-session POC counter (reset to 0 at every IDR, incremented per P-frame
+//! — `hevc_poc` in the loop below) and `refPicFlag: 1` for HEVC's
+//! `codec_params` fixed it outright: confirmed live surviving 60+
+//! consecutive frames with manual picture typing, no PTD needed after all.
+//! H.264's own per-picture params have no equivalent requirement — `None`
+//! there is correct, not something this fix needed to touch.
 //!
 //! True in-place bitrate changes aren't implemented: `nvidia-video-codec-sdk`
 //! 0.4 doesn't expose `NvEncReconfigureEncoder` through its safe API (the
@@ -36,11 +63,12 @@ use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
     NV_ENC_CODEC_HEVC_GUID,
     NV_ENC_INPUT_RESOURCE_TYPE,
     NV_ENC_PARAMS_RC_MODE,
+    NV_ENC_PIC_PARAMS_HEVC,
     NV_ENC_PIC_TYPE,
     NV_ENC_PRESET_P4_GUID,
     NV_ENC_TUNING_INFO,
 };
-use nvidia_video_codec_sdk::{EncodePictureParams, Encoder, EncoderInitParams, EncoderInput, RegisteredResource};
+use nvidia_video_codec_sdk::{CodecPictureParams, EncodePictureParams, Encoder, EncoderInitParams, EncoderInput, RegisteredResource};
 
 use crate::cuda_import::{CudaImporter, ImportedArray, ImportedLinear};
 use crate::pipewire_capture::PipewireCapture;
@@ -175,6 +203,8 @@ impl CudaDirectEncoderSession {
     /// See [`redfog_core::request_keyframe`]'s doc comment — same purpose
     /// (Moonlight's `RequestIdrFrame`/`InvalidateReferenceFrames`), just a
     /// flag the encode loop checks itself instead of a `GstForceKeyUnitEvent`.
+    /// A true in-place operation for both codecs — see this module's doc
+    /// comment.
     pub fn request_keyframe(&self) {
         self.force_keyframe.store(true, Ordering::SeqCst);
     }
@@ -357,8 +387,11 @@ fn run_encoder(
         .preset_guid(NV_ENC_PRESET_P4_GUID)
         .tuning_info(NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY)
         .framerate(fps, 1)
-        // deliberately not calling enable_picture_type_decision() — see
-        // this module's doc comment for why we manage picture type ourselves.
+        // deliberately not calling enable_picture_type_decision() — see this
+        // module's doc comment for why we manage picture type ourselves for
+        // both codecs, and why HEVC additionally needs displayPOCSyntax/
+        // refPicFlag supplied per frame to do that (H.264's own per-picture
+        // params tolerate defaults fine, hence the codec split below).
         .encode_config(&mut preset_config.presetCfg);
 
     let session = encoder
@@ -368,6 +401,12 @@ fn run_encoder(
 
     let mut registered: HashMap<i64, RegisteredFrame<'_>> = HashMap::new();
     let mut frame_index: u64 = 0;
+    // HEVC-only — see this module's doc comment: NVENC requires a
+    // client-supplied, monotonically-increasing display POC per frame when
+    // handling picture type decisions manually, resetting at every IDR
+    // (standard video-coding convention: an IDR flushes the reference
+    // picture buffer, so POC continuity across one has no meaning).
+    let mut hevc_poc: u32 = 0;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -480,6 +519,11 @@ fn run_encoder(
         let want_keyframe = frame_index % (GOP_LENGTH as u64) == 0 || force_keyframe.swap(false, Ordering::SeqCst);
         let picture_type =
             if want_keyframe { NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR } else { NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_P };
+        if want_keyframe {
+            hevc_poc = 0;
+        } else if codec == VideoCodec::Hevc {
+            hevc_poc += 1;
+        }
 
         let input_resource = registered.get_mut(&frame.buffer_identity).unwrap();
         // Vulkan-bridge path only: re-copy fresh content every frame, not
@@ -493,11 +537,22 @@ fn run_encoder(
                 vulkan_bridge.unwrap().lock().unwrap().refresh(bridged).map_err(|e| format!("VulkanBridge::refresh: {e}"))?;
             }
         }
+        // HEVC-only: NVENC's own docs (`NV_ENC_PIC_PARAMS_HEVC`) say
+        // `displayPOCSyntax` is "required to be set if client is handling
+        // the picture type decision" and `refPicFlag` matters whenever PTD
+        // is off — see this module's doc comment for how omitting these
+        // (an all-zero `codecPicParams`, `displayPOCSyntax` stuck at 0
+        // forever) was the real cause of `encode_picture` rejecting every
+        // manually-typed HEVC P-frame. H.264's own per-picture params have
+        // no such requirement — `None` there is correct, not an oversight.
+        let codec_params = (codec == VideoCodec::Hevc).then(|| {
+            CodecPictureParams::Hevc(NV_ENC_PIC_PARAMS_HEVC { displayPOCSyntax: hevc_poc, refPicFlag: 1, ..Default::default() })
+        });
         session
             .encode_picture(
                 input_resource,
                 &mut bitstream,
-                EncodePictureParams { input_timestamp: frame_index, picture_type, ..Default::default() },
+                EncodePictureParams { input_timestamp: frame_index, picture_type, codec_params },
             )
             .map_err(|e| format!("encode_picture: {e:?}"))?;
 

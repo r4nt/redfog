@@ -2824,3 +2824,167 @@ async fn gst_wayland_display_backend_smoke_test() {
     )
     .await;
 }
+
+/// Diagnostic for a report of two independent real clients (moonlight-qt,
+/// moonlight-web-stream) both falling back to H264 even with HEVC forced on
+/// — this is the same reference client library moonlight-web-stream itself
+/// is built on (`moonlight-common-rust`), so if this test also negotiates
+/// H264 instead of HEVC, that's strong evidence of a real server-side bug
+/// rather than something specific to either real client. Only checks the
+/// RTSP-level negotiation (does the real client's own `negotiated_video_
+/// format` — computed purely from parsing our `/serverinfo`'s
+/// `ServerCodecModeSupport`, per `moonlight-common-rust`'s `proto/mod.rs` —
+/// come out as HEVC), not the actual NVENC encode path (no GPU in this test
+/// environment).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hevc_client_negotiates_hevc_and_login_stage_honors_it() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
+
+    let server = TestServer::spawn();
+
+    let client_identity = ServerIdentity::generate().expect("generate client identity");
+    let client_identifier = ClientIdentifier::from_pem(pem::parse(&client_identity.cert_pem).unwrap());
+    let client_secret = ClientSecret::from_pem(pem::parse(&client_identity.private_key_pem).unwrap());
+
+    let host = MoonlightHost::<TokioHyperClient>::new("127.0.0.1".to_string(), server.http_port, Some("it-client-hevc".to_string()))
+        .expect("construct MoonlightHost");
+
+    let pin = PairPin::new_random(&RustCryptoBackend).expect("generate pin");
+    let pin_str = pin.to_string();
+    let http_port = server.http_port;
+    let submit_task = tokio::task::spawn_blocking(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        ureq::post(&format!("http://127.0.0.1:{http_port}/submit-pin"))
+            .send_form(&[("uniqueid", "it-client-hevc"), ("pin", &pin_str)])
+            .expect("submit-pin request");
+    });
+    host.pair(&client_identifier, &client_secret, "hevc-negotiation-test".to_string(), pin, RustCryptoBackend)
+        .await
+        .expect("pairing must succeed");
+    submit_task.await.unwrap();
+
+    let mut settings = default_stream_settings();
+    // The only difference from `default_stream_settings()`'s H264-only
+    // client — this is what a real client with "Force HEVC" enabled and a
+    // working hardware decoder reports as its own capability.
+    settings.supported_video_formats = VideoFormats::H264 | VideoFormats::H265 | VideoFormats::H265_MAIN10;
+    let server_version = host.version().await.expect("server version");
+    let gfe_version = host.gfe_version().await.expect("gfe version");
+    let codec_support = host.server_codec_mode_support().await.expect("codec support");
+    println!("server_codec_mode_support = {codec_support:?}");
+    settings.adjust_for_server(server_version, &gfe_version, codec_support).expect("settings compatible");
+
+    let stream_config = host
+        .start_stream(1, &settings, AesKey::new_random(&RustCryptoBackend).expect("aes key"), AesIv(1), "")
+        .await
+        .expect("launch must succeed");
+    let crypto_backend = Arc::new(RustCryptoBackend);
+    // Held (not used again) until this function returns — dropping it would
+    // tear down the RTSP session before the assertions below get a chance
+    // to observe it.
+    let _stream = MoonlightStream::connect(stream_config, settings.clone(), crypto_backend.clone(), video_capabilities())
+        .await
+        .expect("stream must connect");
+
+    server.wait_for_stdout("RTSP ANNOUNCE: client requested", Duration::from_secs(20)).await;
+    assert!(
+        server.stdout_contains("codec Hevc"),
+        "client offered HEVC ({codec_support:?}) but server negotiated something else — full log:\n{}",
+        server.stdout_lines.lock().unwrap().join("\n")
+    );
+
+    // Login's own video pipeline is deliberately deferred until here (see
+    // `SessionManager::start_streaming`'s doc comment) precisely so it can
+    // also honor whatever ANNOUNCE just negotiated (via `x265enc`, Login is
+    // always `VideoEncoder::Software`), rather than always sending H.264
+    // regardless of what the client's decoder committed to at ANNOUNCE time.
+    server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline && !server.stdout_contains("encoder=Software") {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        server.stdout_contains("codec=Hevc"),
+        "Login's own pipeline didn't use HEVC even though the client negotiated it — full log:\n{}",
+        server.stdout_lines.lock().unwrap().join("\n")
+    );
+}
+
+/// Regression test for a real, now-fixed bug found while fixing the
+/// Login-stage codec mismatch above: the post-handoff `CudaDirectEncoderSession`
+/// (direct CUDA -> NVENC, no GStreamer — see `nvenc_session.rs`) successfully
+/// registered and encoded the very first (IDR) HEVC frame, then failed
+/// `encode_picture` on the very next (P-)frame with `EncodeError { kind:
+/// Generic, string: None }`. Root-caused (via an isolated, since-deleted fast
+/// repro) to manually setting `pictureType = P` for HEVC specifically — H.264
+/// tolerates manual picture typing fine (`cuda_direct_nvenc.rs`/
+/// `nvenc_reconfigure_reuses_capture.rs` both still pass unmodified), but
+/// HEVC on this GPU/driver doesn't. Fixed by leaving NVENC's own picture-type
+/// decision (`enablePTD`) on for HEVC only — see `nvenc_session.rs`'s module
+/// doc comment for the real cost (`request_keyframe` has no effect for HEVC).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hevc_post_handoff_nvenc_direct_encode_stays_up() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
+
+    let server = TestServer::spawn();
+
+    let client_identity = ServerIdentity::generate().expect("generate client identity");
+    let client_identifier = ClientIdentifier::from_pem(pem::parse(&client_identity.cert_pem).unwrap());
+    let client_secret = ClientSecret::from_pem(pem::parse(&client_identity.private_key_pem).unwrap());
+
+    let host = MoonlightHost::<TokioHyperClient>::new("127.0.0.1".to_string(), server.http_port, Some("it-client-hevc2".to_string()))
+        .expect("construct MoonlightHost");
+
+    let pin = PairPin::new_random(&RustCryptoBackend).expect("generate pin");
+    let pin_str = pin.to_string();
+    let http_port = server.http_port;
+    let submit_task = tokio::task::spawn_blocking(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        ureq::post(&format!("http://127.0.0.1:{http_port}/submit-pin"))
+            .send_form(&[("uniqueid", "it-client-hevc2"), ("pin", &pin_str)])
+            .expect("submit-pin request");
+    });
+    host.pair(&client_identifier, &client_secret, "hevc-posthandoff-test".to_string(), pin, RustCryptoBackend)
+        .await
+        .expect("pairing must succeed");
+    submit_task.await.unwrap();
+
+    let mut settings = default_stream_settings();
+    settings.supported_video_formats = VideoFormats::H264 | VideoFormats::H265 | VideoFormats::H265_MAIN10;
+    let server_version = host.version().await.expect("server version");
+    let gfe_version = host.gfe_version().await.expect("gfe version");
+    let codec_support = host.server_codec_mode_support().await.expect("codec support");
+    settings.adjust_for_server(server_version, &gfe_version, codec_support).expect("settings compatible");
+
+    let stream_config = host
+        .start_stream(1, &settings, AesKey::new_random(&RustCryptoBackend).expect("aes key"), AesIv(1), "")
+        .await
+        .expect("launch must succeed");
+    let crypto_backend = Arc::new(RustCryptoBackend);
+    let stream = MoonlightStream::connect(stream_config, settings.clone(), crypto_backend.clone(), video_capabilities())
+        .await
+        .expect("stream must connect");
+
+    server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
+    send_key(&stream, VK_Q, true).await;
+    send_key(&stream, VK_Q, false).await;
+    server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(45)).await;
+
+    // Checks the *combined* substring, not "codec=Hevc" alone — the Login
+    // stage's own stats line already contains that on its own, and would
+    // make this a false-positive pass regardless of what the post-handoff
+    // NvencDirect pipeline actually does. "encoder=NvencDirect" never
+    // appears in a Login-stage line (Login is always `Software`), so this
+    // combined form can only ever come from a genuine post-handoff line.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline && !server.stdout_contains("encoder=NvencDirect, codec=Hevc") {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        server.stdout_contains("encoder=NvencDirect, codec=Hevc"),
+        "post-handoff NvencDirect pipeline didn't use HEVC even though the client negotiated it — full log:\n{}",
+        server.stdout_lines.lock().unwrap().join("\n")
+    );
+}

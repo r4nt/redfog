@@ -1003,9 +1003,6 @@ impl SessionManager {
             // Login (or any other non-`KwinNativeDmaBuf` source) can't use
             // `NvencDirect` — fall back to regular GStreamer NVENC for it,
             // same as if the server-wide config had been `Nvenc` all along.
-            // Codec choice doesn't apply here: `make_encoder_pipeline` only
-            // ever builds H.264 (Login never negotiates a codec at all —
-            // see `on_announce`'s doc comment).
             let pipeline_encoder =
                 if video_encoder == redfog_core::VideoEncoder::NvencDirect { redfog_core::VideoEncoder::Nvenc } else { video_encoder };
             redfog_core::make_encoder_pipeline(
@@ -1014,6 +1011,7 @@ impl SessionManager {
                 pipeline_encoder,
                 fps_cap,
                 initial_bitrate_kbps,
+                codec,
                 on_video_access_unit,
             )
         };
@@ -1071,8 +1069,17 @@ impl SessionManager {
         // confirmed live via matching mutex addresses across generations.
         let audio_client_name = format!("redfog-audio-gen-{generation}");
 
-        let (video_pipeline, cuda_direct_session) =
-            self.build_video_pipeline(kind, compositor, generation, fps_cap, initial_bitrate_kbps, codec, handle.clone(), this.clone());
+        // Login's own real video pipeline is deliberately NOT built here —
+        // see `start_streaming`'s doc comment for why (RTSP ANNOUNCE, the
+        // only place the negotiated codec becomes known, always arrives
+        // after this point but always before PLAY). This placeholder is
+        // swapped for the real thing right before the Playing-transition,
+        // once `codec` actually means something.
+        let (video_pipeline, cuda_direct_session) = if matches!(kind, SessionType::Login) {
+            (gstreamer::Pipeline::new(), None)
+        } else {
+            self.build_video_pipeline(kind, compositor, generation, fps_cap, initial_bitrate_kbps, codec, handle.clone(), this.clone())
+        };
 
         let audio_pipeline = redfog_core::make_audio_pipeline(audio_loopback, &audio_client_name, move |packet| {
             // Looked up by `generation`, not `client_key` — see
@@ -1151,10 +1158,14 @@ impl SessionManager {
     /// tried to do the rebuild inside `on_announce` itself and never once
     /// fired, for exactly that timing reason.
     ///
-    /// No-op unless `session.cuda_direct_session` is already `Some` — see
-    /// `build_video_pipeline`'s own scoping (Login/non-`NvencDirect` paths
-    /// don't need this: Login never negotiates a codec that matters, and
-    /// the GStreamer paths already live-adjust bitrate).
+    /// No-op unless `session.cuda_direct_session` is already `Some` — the
+    /// GStreamer paths (`Software`/`Nvenc`/`Vulkan`) already live-adjust
+    /// bitrate via `redfog_core::set_encoder_bitrate`, and Login's own
+    /// codec choice is handled by a completely different mechanism
+    /// (`start_streaming` builds its real pipeline for the first time only
+    /// once ANNOUNCE has already negotiated it — see that method's doc
+    /// comment) rather than this reconcile-on-takeover path, which only
+    /// ever applies to an already-running session.
     ///
     /// Two different outcomes depending on what actually changed: same
     /// resolution (the common case — a bitrate/fps/codec-only difference)
@@ -1512,10 +1523,62 @@ impl SessionManager {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             use gstreamer::prelude::*;
+            let mut session = session;
             let generation = session.generation;
             let client_key = session.origin.client_key.clone();
             let start_streaming_start = std::time::Instant::now();
             tracing::info!("start_streaming(generation={generation}, is_resume={is_resume}, kind={:?}): starting", session.kind);
+            // Login's real video pipeline was deliberately left as an empty
+            // placeholder by `build_pipelines` — this is the first point in
+            // a fresh Login session's life where the codec it should
+            // *actually* use is known: RTSP ANNOUNCE (which is what sets
+            // `session.origin.codec`) always arrives after `/launch`
+            // spawned this session (well before the RTSP handshake even
+            // starts) but always before PLAY (this call). `!is_resume` is
+            // exactly "this is that first PLAY" — Login is never
+            // backgrounded/resumed (see this method's own doc comment), so
+            // it can only ever go through `start_streaming` once, and a
+            // User-stage session's own fresh spawn (`handoff_to_user`)
+            // isn't `SessionType::Login` at all, so this never fires for it
+            // (its pipeline was already built correctly, straight from the
+            // Login stage's own already-`ANNOUNCE`d `origin`).
+            if !is_resume && matches!(session.kind, SessionType::Login) {
+                let fps_cap = (session.fps > 0).then_some(session.fps);
+                let handle = tokio::runtime::Handle::current();
+                let this = self.arc_self();
+                let kind = session.kind.clone();
+                let bitrate_kbps = session.origin.target_bitrate_kbps;
+                let codec = session.origin.codec;
+                tracing::info!(
+                    "start_streaming(generation={generation}): building Login's real video pipeline now that ANNOUNCE has negotiated codec={codec:?}"
+                );
+                // Moved into the blocking task and handed back alongside the
+                // built pipeline, rather than borrowed — `build_video_pipeline`
+                // needs `&SpawnedCompositor`, but `session` (which owns it)
+                // can't itself cross into `spawn_blocking`'s `'static` closure
+                // while still being used afterward here.
+                let compositor = session.compositor.take().expect("Login session always has a compositor");
+                let (video_pipeline, cuda_direct_session, compositor) = tokio::task::spawn_blocking(move || {
+                    let (video_pipeline, cuda_direct_session) =
+                        this.build_video_pipeline(&kind, &compositor, generation, fps_cap, bitrate_kbps, codec, handle, this.clone());
+                    (video_pipeline, cuda_direct_session, compositor)
+                })
+                .await
+                .expect("build_video_pipeline task panicked");
+                session.compositor = Some(compositor);
+                session.video_pipeline = video_pipeline;
+                session.cuda_direct_session = cuda_direct_session;
+                // `session.codec` was set back in `spawn_session`, before
+                // ANNOUNCE — stale now that the pipeline above was actually
+                // built against the freshly-negotiated `codec`. Nothing
+                // reads this for the Login stage besides the periodic stats
+                // log inside `build_video_pipeline` (Login is never taken
+                // over/resumed, so `reconcile_video_pipeline`'s own
+                // `session.codec` comparison never sees this value), but
+                // leaving it stale would make that log lie about what's
+                // actually being encoded.
+                session.codec = codec;
+            }
             // Bounded — confirmed via a dedicated integration test (not
             // guesswork) that this can hang even for a session with
             // nothing to do with the known KWin resume hang (a plain
@@ -2447,8 +2510,8 @@ impl RtspHandler for SessionManager {
     /// Scoped to `cuda_direct_session.is_some()` (`VideoEncoder::NvencDirect`
     /// — the only production path) — the GStreamer `Nvenc`/`Software` paths
     /// already live-adjust bitrate via `redfog_core::set_encoder_bitrate`,
-    /// and Login never negotiates a codec choice that matters, so neither
-    /// needs this rebuild machinery today.
+    /// and Login's own codec choice is handled by `start_streaming` instead
+    /// (see its doc comment), not this method.
     /// Pure data update — `ANNOUNCE` always arrives during the *Login*
     /// stage, before any takeover/resume decision is even made, so
     /// `client_ip` only ever resolves to a Login session here (Software
@@ -2458,12 +2521,12 @@ impl RtspHandler for SessionManager {
     /// actually fired for exactly that reason (the User-stage session this
     /// client is *about* to attach to either doesn't exist yet, for a fresh
     /// spawn, or belongs to a different client entirely, for a takeover).
-    /// The real reconcile now happens in `handoff_to_user`, the only place
-    /// a takeover/resume decision is actually made — see
-    /// `reconcile_video_pipeline`'s doc comment. This just records what the
-    /// client negotiated so that later code (bitrate/codec flowing through
-    /// `SessionOrigin` into a fresh spawn, or into `reconcile_video_pipeline`
-    /// on a takeover) has it available.
+    /// The real reconcile for a takeover/resume happens in
+    /// `handoff_to_user` instead — see `reconcile_video_pipeline`'s doc
+    /// comment; the real *first build* for a fresh Login session happens in
+    /// `start_streaming` instead — see its doc comment. This just records
+    /// what the client negotiated so that later code (bitrate/codec flowing
+    /// through `SessionOrigin`) has it available either way.
     fn on_announce(&self, params: AnnouncedParams, client_ip: IpAddr) {
         let mut shared = self.shared.lock().unwrap();
         let Some(client_key) = resolve_client_key_by_ip(&shared, client_ip) else { return };

@@ -149,9 +149,17 @@ pub enum VideoSink {
     /// Raw BGRx frames for local display — [`make_pipeline`]'s only
     /// consumer, the `viewer` debug tool. No encoding at all.
     LocalDisplay,
-    /// H.264-encoded access units for network streaming —
+    /// H.264- or HEVC-encoded access units for network streaming —
     /// [`make_encoder_pipeline`]'s only consumer, the real Moonlight server.
-    Encode { encoder: VideoEncoder, bitrate_kbps: u32 },
+    /// `codec`: the client already committed to this at RTSP ANNOUNCE time
+    /// (it initializes its decoder accordingly right then) — every arm
+    /// below must actually emit that bitstream format, Login stage
+    /// included, or a real client's decoder chokes on a mismatch it has no
+    /// way to recover from mid-connection. `VideoEncoder::Vulkan` has no
+    /// HEVC encoder element to reach for (no `vulkanh265enc` exists), so
+    /// those arms panic on `VideoCodec::Hevc` same as the existing
+    /// never-implemented combinations below.
+    Encode { encoder: VideoEncoder, bitrate_kbps: u32, codec: VideoCodec },
 }
 
 /// Where compositor input events go — implemented differently per backend.
@@ -875,7 +883,7 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
         // avoids the whole class of bug — there's no real reason for this
         // encoder to have a *separate*, narrower ceiling than `bitrate`
         // itself in the first place.
-        (VideoSource::PipeWireNode(node_id), VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps }) => {
+        (VideoSource::PipeWireNode(node_id), VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps, codec }) => {
             format!(
                 "pipewiresrc name=pipewiresrc path={node_id} client-name=\"{client_name}\" \
                              do-timestamp=true keepalive-time={} \
@@ -884,11 +892,8 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
                  ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
                  ! videoconvert \
                  ! video/x-raw,format=I420 \
-                 ! openh264enc name={ENCODER_ELEMENT_NAME} usage-type=screen rate-control=bitrate \
-                               gop-size=300 bitrate={} \
-                 ! video/x-h264,stream-format=byte-stream,alignment=au \
-                 ! appsink name=sink sync=false",
-                2000 / fps, bitrate_kbps * 1000,
+                 ! {}",
+                2000 / fps, software_encoder_element(*codec, *bitrate_kbps),
             )
         }
         // No CPU `videoconvert` here — `nvh264enc`'s sink pad accepts a wide
@@ -923,27 +928,22 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
         // same as the `Software` arm's `videorate` bridges — this arm just
         // doesn't currently have that bridge; not revisited since this path
         // is superseded by `NvencDirect` whenever that's available.
-        (VideoSource::PipeWireNode(node_id), VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps }) => {
+        (VideoSource::PipeWireNode(node_id), VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps, codec }) => {
             format!(
                  "pipewiresrc name=pipewiresrc path={node_id} client-name=\"{client_name}\" \
                              do-timestamp=true keepalive-time={} \
-                 ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
-                             rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
-                 ! video/x-h264,stream-format=byte-stream,alignment=au \
-                 ! appsink name=sink sync=false",
-                2000 / fps,
+                 ! {}",
+                2000 / fps, nvenc_encoder_element(*codec, *bitrate_kbps),
             )
         }
-        (VideoSource::PipeWireNode(node_id), VideoSink::Encode { encoder: VideoEncoder::Vulkan, bitrate_kbps }) => {
+        (VideoSource::PipeWireNode(node_id), VideoSink::Encode { encoder: VideoEncoder::Vulkan, bitrate_kbps, codec }) => {
             format!(
                  "pipewiresrc name=pipewiresrc path={node_id} client-name=\"{client_name}\" \
                              do-timestamp=true keepalive-time={} \
                  ! vulkanupload \
                  ! vulkancolorconvert \
-                 ! vulkanh264enc name={ENCODER_ELEMENT_NAME} idr-period=300 bitrate={bitrate_kbps} \
-                 ! video/x-h264,stream-format=byte-stream,alignment=au \
-                 ! appsink name=sink sync=false",
-                2000 / fps,
+                 ! {}",
+                2000 / fps, vulkan_encoder_element(*codec, *bitrate_kbps),
             )
         }
         // `KwinNativeDmaBuf`'s appsrc — see that variant's doc comment for how
@@ -979,27 +979,24 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
         // capture and GL/encode work onto one core exactly the way the
         // (currently unused) commented-out `queue` in the `PipeWireNode`/
         // `Nvenc` arm above was trying to avoid.
-        (VideoSource::KwinNativeDmaBuf { .. }, VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps }) => {
+        (VideoSource::KwinNativeDmaBuf { .. }, VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps, codec }) => {
             format!(
                  "appsrc name={KWIN_NATIVE_APPSRC_NAME} format=time is-live=true do-timestamp=false \
                   ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
                   ! glupload \
                   ! glcolorconvert \
-                  ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
-                              rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
-                  ! video/x-h264,stream-format=byte-stream,alignment=au \
-                  ! appsink name=sink sync=false"
+                  ! {}",
+                 nvenc_encoder_element(*codec, *bitrate_kbps),
             )
         }
-        (VideoSource::KwinNativeDmaBuf { .. }, VideoSink::Encode { encoder: VideoEncoder::Vulkan, bitrate_kbps }) => {
+        (VideoSource::KwinNativeDmaBuf { .. }, VideoSink::Encode { encoder: VideoEncoder::Vulkan, bitrate_kbps, codec }) => {
             format!(
                  "appsrc name={KWIN_NATIVE_APPSRC_NAME} format=time is-live=true do-timestamp=false \
                   ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
                   ! vulkanupload \
                   ! vulkancolorconvert \
-                  ! vulkanh264enc name={ENCODER_ELEMENT_NAME} idr-period=300 bitrate={bitrate_kbps} \
-                  ! video/x-h264,stream-format=byte-stream,alignment=au \
-                  ! appsink name=sink sync=false"
+                  ! {}",
+                 vulkan_encoder_element(*codec, *bitrate_kbps),
             )
         }
         // Never implemented: `KwinNativeDmaBuf` only exists to feed hardware encoders
@@ -1039,40 +1036,34 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
         // comment). No GL/DMA-BUF path even here: `waylanddisplaysrc` is a
         // comparatively simple/young plugin with no DMA-BUF export of its
         // own (unlike KWin — see the `PipeWireNode`/`Nvenc` arm above).
-        (VideoSource::GstWaylandDisplay { render_node, width, height, fps }, VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps }) => format!(
+        (VideoSource::GstWaylandDisplay { render_node, width, height, fps }, VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps, codec }) => format!(
             "waylanddisplaysrc name=waylanddisplaysrc render-node=\"{render_node}\" \
              ! video/x-raw,width={width},height={height},framerate={fps}/1 \
              ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
              ! identity name={FPS_CAP_ELEMENT_NAME} \
              ! videoconvert \
              ! video/x-raw,format=I420 \
-             ! openh264enc name={ENCODER_ELEMENT_NAME} usage-type=screen rate-control=bitrate \
-                           gop-size=300 bitrate={} \
-             ! video/x-h264,stream-format=byte-stream,alignment=au \
-             ! appsink name=sink sync=false",
-            bitrate_kbps * 1000,
+             ! {}",
+            software_encoder_element(*codec, *bitrate_kbps),
         ),
-        (VideoSource::GstWaylandDisplay { render_node, width, height, fps }, VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps }) => format!(
+        (VideoSource::GstWaylandDisplay { render_node, width, height, fps }, VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps, codec }) => format!(
             "waylanddisplaysrc name=waylanddisplaysrc render-node=\"{render_node}\" \
              ! video/x-raw,width={width},height={height},framerate={fps}/1 \
              ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
              ! identity name={FPS_CAP_ELEMENT_NAME} \
              ! video/x-raw \
-             ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
-                         rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
-             ! video/x-h264,stream-format=byte-stream,alignment=au \
-             ! appsink name=sink sync=false"
+             ! {}",
+            nvenc_encoder_element(*codec, *bitrate_kbps),
         ),
-        (VideoSource::GstWaylandDisplay { render_node, width, height, fps }, VideoSink::Encode { encoder: VideoEncoder::Vulkan, bitrate_kbps }) => format!(
+        (VideoSource::GstWaylandDisplay { render_node, width, height, fps }, VideoSink::Encode { encoder: VideoEncoder::Vulkan, bitrate_kbps, codec }) => format!(
             "waylanddisplaysrc name=waylanddisplaysrc render-node=\"{render_node}\" \
              ! video/x-raw,width={width},height={height},framerate={fps}/1 \
              ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
              ! identity name={FPS_CAP_ELEMENT_NAME} \
              ! vulkanupload \
              ! vulkancolorconvert \
-             ! vulkanh264enc name={ENCODER_ELEMENT_NAME} idr-period=300 bitrate={bitrate_kbps} \
-             ! video/x-h264,stream-format=byte-stream,alignment=au \
-             ! appsink name=sink sync=false"
+             ! {}",
+            vulkan_encoder_element(*codec, *bitrate_kbps),
         ),
         // Login's `appsrc` — see `VideoSource::Login`'s doc comment for how
         // frames actually reach it (a background thread relays them onto a
@@ -1095,40 +1086,119 @@ fn video_pipeline_description(source: &VideoSource, client_name: &str, fps: u32,
         // downstream-description function) broke the Login stage outright
         // (`not-negotiated` on `GstAppSrc:login-appsrc`) before ever
         // reaching the real question of whether KWin/PipeWire has DMA-BUF.
-        (VideoSource::Login { width, height, .. }, VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps }) => format!(
+        (VideoSource::Login { width, height, .. }, VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps, codec }) => format!(
             "appsrc name=login-appsrc format=time is-live=true block=false \
              caps=video/x-raw,format=RGBA,width={width},height={height},framerate=30/1 \
              ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
              ! identity name={FPS_CAP_ELEMENT_NAME} \
              ! videoconvert \
              ! video/x-raw,format=I420 \
-             ! openh264enc name={ENCODER_ELEMENT_NAME} usage-type=screen rate-control=bitrate \
-                           gop-size=300 bitrate={} \
-             ! video/x-h264,stream-format=byte-stream,alignment=au \
-             ! appsink name=sink sync=false",
-            bitrate_kbps * 1000,
+             ! {}",
+            software_encoder_element(*codec, *bitrate_kbps),
         ),
-        (VideoSource::Login { width, height, .. }, VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps }) => format!(
+        (VideoSource::Login { width, height, .. }, VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps, codec }) => format!(
             "appsrc name=login-appsrc format=time is-live=true block=false \
              caps=video/x-raw,format=RGBA,width={width},height={height},framerate=30/1 \
              ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
              ! identity name={FPS_CAP_ELEMENT_NAME} \
              ! video/x-raw \
-             ! nvh264enc name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
-                         rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
-             ! video/x-h264,stream-format=byte-stream,alignment=au \
-             ! appsink name=sink sync=false"
+             ! {}",
+            nvenc_encoder_element(*codec, *bitrate_kbps),
         ),
-        (VideoSource::Login { width, height, .. }, VideoSink::Encode { encoder: VideoEncoder::Vulkan, bitrate_kbps }) => format!(
+        (VideoSource::Login { width, height, .. }, VideoSink::Encode { encoder: VideoEncoder::Vulkan, bitrate_kbps, codec }) => format!(
             "appsrc name=login-appsrc format=time is-live=true block=false \
              caps=video/x-raw,format=RGBA,width={width},height={height},framerate=30/1 \
              ! queue leaky=downstream max-size-buffers=2 max-size-bytes=0 max-size-time=0 \
              ! identity name={FPS_CAP_ELEMENT_NAME} \
              ! vulkanupload \
              ! vulkancolorconvert \
-             ! vulkanh264enc name={ENCODER_ELEMENT_NAME} idr-period=300 bitrate={bitrate_kbps} \
+             ! {}",
+            vulkan_encoder_element(*codec, *bitrate_kbps),
+        ),
+    }
+}
+
+/// Shared by every [`VideoSink::Encode`] arm using [`VideoEncoder::Software`]
+/// — builds the codec-specific encoder element, its output caps, and the
+/// terminal `appsink`, so each call site only has to supply its own
+/// source-specific prefix up to (and including) the raw-video caps.
+/// `openh264enc`'s `bitrate` is bits/sec (hence `* 1000`); `x265enc`'s is
+/// already kbit/sec, like every other encoder here — same mismatch
+/// `set_encoder_bitrate` already special-cases by factory name.
+/// `speed-preset=ultrafast`/`tune=zerolatency`: unlike `openh264enc` (whose
+/// defaults are already tuned for realtime screen content via
+/// `usage-type=screen`), x265's own defaults favor offline quality over
+/// encode latency/CPU cost — left unset, it visibly can't keep up at
+/// realtime framerates on a CPU core the Login stage should barely notice.
+fn software_encoder_element(codec: VideoCodec, bitrate_kbps: u32) -> String {
+    match codec {
+        VideoCodec::H264 => format!(
+            "openh264enc name={ENCODER_ELEMENT_NAME} usage-type=screen rate-control=bitrate \
+                          gop-size=300 bitrate={} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=sink sync=false",
+            bitrate_kbps * 1000,
+        ),
+        // `h265parse config-interval=-1`: unlike `openh264enc` above (whose
+        // output already repeats SPS/PPS before every IDR on its own — same
+        // `openh264enc` internal behavior real Sunshine/Moonlight servers
+        // rely on) and unlike `nvh265enc` below (which has its own
+        // `repeat-sequence-header` property), `x265enc` only ever emits
+        // VPS/SPS/PPS once, at the very start of the stream — every later
+        // IDR frame's slice NAL arrives with no parameter sets alongside it
+        // in the same access unit. A real client's decoder can't decode
+        // *any* IDR without them, so every keyframe after the first looks
+        // like data loss to it — "waiting for IDR frame" forever despite
+        // real, continuously-flowing frames on the wire (confirmed live).
+        // `h265parse` is what real Sunshine-like servers use for exactly
+        // this: multiplexing the parameter sets back into the bytestream at
+        // parse time, independent of what the encoder itself emits.
+        VideoCodec::Hevc => format!(
+            "x265enc name={ENCODER_ELEMENT_NAME} speed-preset=ultrafast tune=zerolatency \
+                     key-int-max=300 bitrate={bitrate_kbps} \
+             ! h265parse config-interval=-1 \
+             ! video/x-h265,stream-format=byte-stream,alignment=au \
+             ! appsink name=sink sync=false"
+        ),
+    }
+}
+
+/// [`VideoEncoder::Nvenc`] counterpart to [`software_encoder_element`] —
+/// `nvh265enc` mirrors `nvh264enc`'s whole property set (confirmed via
+/// `gst-inspect-1.0 nvh265enc`: same `zerolatency`/`tune`/`rc-mode`/
+/// `repeat-sequence-header`/`gop-size`/`bitrate`, `bitrate` already
+/// kbit/sec), so no per-codec property differences to account for beyond
+/// the element/caps names themselves.
+fn nvenc_encoder_element(codec: VideoCodec, bitrate_kbps: u32) -> String {
+    let (element, caps) = match codec {
+        VideoCodec::H264 => ("nvh264enc", "video/x-h264"),
+        VideoCodec::Hevc => ("nvh265enc", "video/x-h265"),
+    };
+    format!(
+        "{element} name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
+                    rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
+         ! {caps},stream-format=byte-stream,alignment=au \
+         ! appsink name=sink sync=false"
+    )
+}
+
+/// [`VideoEncoder::Vulkan`] counterpart to [`software_encoder_element`] —
+/// unlike the other two encoders, there's no HEVC element to reach for at
+/// all (`vulkanh265enc` doesn't exist, confirmed via `gst-inspect-1.0`), so
+/// this panics on `VideoCodec::Hevc` rather than silently falling back to
+/// H.264 and sending a client a bitstream it didn't negotiate — same
+/// "never implemented" treatment `video_pipeline_description` already gives
+/// other unsupported `(source, sink)` combinations.
+fn vulkan_encoder_element(codec: VideoCodec, bitrate_kbps: u32) -> String {
+    match codec {
+        VideoCodec::H264 => format!(
+            "vulkanh264enc name={ENCODER_ELEMENT_NAME} idr-period=300 bitrate={bitrate_kbps} \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
              ! appsink name=sink sync=false"
+        ),
+        VideoCodec::Hevc => panic!(
+            "VideoEncoder::Vulkan has no HEVC encoder element (no vulkanh265enc exists) — \
+             use VideoEncoder::Software or VideoEncoder::Nvenc for HEVC"
         ),
     }
 }
@@ -1378,13 +1448,14 @@ pub fn make_encoder_pipeline<F>(
     encoder: VideoEncoder,
     fps_cap: Option<u32>,
     bitrate_kbps: u32,
+    codec: VideoCodec,
     on_access_unit: F,
 ) -> gst::Pipeline
 where
     F: Fn(Vec<u8>, bool) + Send + Sync + 'static,
 {
     let fps = fps_cap.unwrap_or(60);
-    let full_desc = video_pipeline_description(&source, client_name, fps, &VideoSink::Encode { encoder, bitrate_kbps });
+    let full_desc = video_pipeline_description(&source, client_name, fps, &VideoSink::Encode { encoder, bitrate_kbps, codec });
     // Named/self-contained panic message (not a bare `.expect()`) so a
     // missing/broken encoder plugin says exactly that, rather than a
     // generic "parse failed" with no indication of *which* encoder or
@@ -1687,7 +1758,7 @@ mod tests {
             &VideoSource::GstWaylandDisplay { render_node: "software".to_string(), width: 1280, height: 720, fps: 60 },
             "test-client",
             60,
-            &VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps: 10_000 },
+            &VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps: 10_000, codec: VideoCodec::H264 },
         );
         assert!(gst_wayland_display.contains(&format!("identity name={FPS_CAP_ELEMENT_NAME}")), "pipeline description: {gst_wayland_display}");
         assert!(!gst_wayland_display.contains("videorate"), "pipeline description: {gst_wayland_display}");
@@ -1698,7 +1769,7 @@ mod tests {
             &VideoSource::Login { frame_rx: login_rx, width: 1280, height: 720 },
             "test-client",
             60,
-            &VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps: 10_000 },
+            &VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps: 10_000, codec: VideoCodec::H264 },
         );
         assert!(login.contains(&format!("identity name={FPS_CAP_ELEMENT_NAME}")), "pipeline description: {login}");
         assert!(!login.contains("videorate"), "pipeline description: {login}");
@@ -1724,7 +1795,7 @@ mod tests {
             &VideoSource::Login { frame_rx: login_rx, width: 1280, height: 720 },
             "test-client",
             60,
-            &VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps: 10_000 },
+            &VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps: 10_000, codec: VideoCodec::H264 },
         );
         assert!(!login.contains("DMABuf"), "Login pipeline description: {login}");
         assert!(!login.contains("glupload"), "Login pipeline description: {login}");
@@ -1733,7 +1804,7 @@ mod tests {
             &VideoSource::GstWaylandDisplay { render_node: "software".to_string(), width: 1280, height: 720, fps: 60 },
             "test-client",
             60,
-            &VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps: 10_000 },
+            &VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps: 10_000, codec: VideoCodec::H264 },
         );
         assert!(!gst_wayland_display.contains("DMABuf"), "gst-wayland-display pipeline description: {gst_wayland_display}");
         assert!(!gst_wayland_display.contains("glupload"), "gst-wayland-display pipeline description: {gst_wayland_display}");
@@ -1742,7 +1813,7 @@ mod tests {
             &VideoSource::PipeWireNode(56),
             "test-client",
             120,
-            &VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps: 10_000 },
+            &VideoSink::Encode { encoder: VideoEncoder::Nvenc, bitrate_kbps: 10_000, codec: VideoCodec::H264 },
         );
         assert!(!pipewire.contains("DMABuf"), "PipeWire pipeline description: {pipewire}");
         assert!(!pipewire.contains("glupload"), "PipeWire pipeline description: {pipewire}");
@@ -1777,7 +1848,7 @@ mod tests {
             &VideoSource::PipeWireNode(999_999),
             "parse-check",
             120,
-            &VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps: 10_000 },
+            &VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps: 10_000, codec: VideoCodec::H264 },
         );
         let el = gst::parse_launch(&desc).unwrap_or_else(|e| panic!("pipeline failed to parse: {e}\n{desc}"));
         assert!(el.dynamic_cast::<gst::Pipeline>().is_ok(), "pipeline description: {desc}");
