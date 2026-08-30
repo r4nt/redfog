@@ -454,5 +454,20 @@ impl Drop for PipewireCapture {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        // `join()` returning means the background thread's `.process()`
+        // callback can never fire again — safe to drain exhaustively now,
+        // no race with more frames still arriving. Without this, any
+        // frame(s) captured in the up-to-50ms window between the shutdown
+        // flag being set and the thread's own timer noticing it (see
+        // `run_loop`) sit in this channel forever: `CapturedFrame` has no
+        // `Drop` of its own (its `fd` is normally closed explicitly by
+        // whichever of `nvenc_session::run`'s two branches consumes it), so
+        // simply letting `frame_rx` drop here would silently leak each of
+        // their raw fds — a small, fixed number per rebuild rather than the
+        // unbounded per-frame leak the shutdown mechanism above already
+        // fixed, but a real leak all the same. Confirmed live.
+        while let Ok(frame) = self.frame_rx.try_recv() {
+            unsafe { libc::close(frame.fd) };
+        }
     }
 }
