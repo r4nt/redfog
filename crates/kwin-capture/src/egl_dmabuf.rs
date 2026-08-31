@@ -15,6 +15,13 @@
 //! server handling multiple concurrent user sessions has one Wayland socket per
 //! session, not one per process — same reason `CaptureSession::connect` (lib.rs)
 //! takes an explicit socket path instead of relying on env vars.
+//!
+//! Known incomplete on NVIDIA: `eglQueryDmaBufModifiersEXT` (used here) can
+//! report only `DRM_FORMAT_MOD_LINEAR` for a GPU that actually *does*
+//! support a real, working tiled modifier — confirmed live on a GTX 1070,
+//! where the query never advertises one at all. `pipewire_capture.rs`
+//! falls back to `gbm_modifier_search`'s live brute-force search
+//! specifically when this function's result looks like that.
 
 use khronos_egl as egl;
 use std::collections::HashMap;

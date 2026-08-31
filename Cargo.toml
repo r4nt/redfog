@@ -43,8 +43,9 @@ debug = true
 [patch."https://github.com/MrCreativ3001/moonlight-common-rust"]
 moonlight-common = { path = "vendor/moonlight-common-rust" }
 
-# pam-sys 1.0.0-alpha5 (pulled in transitively by the `pam` crate redfog-broker/
-# redfog-session-init depend on for real PAM auth) pins `bindgen = "0.69"`.
+# pam-sys 1.0.0-alpha5 (pulled in transitively by the `pam` crate redfog-broker
+# depends on, in auth.rs, for real PAM credential authentication) pins
+# `bindgen = "0.69"`.
 # Confirmed live: that combination panics at build time — "a `libclang` shared
 # library is not loaded on this thread" — against this machine's clang/LLVM
 # 22.1.8, a version far newer than bindgen 0.69/clang-sys 1.8.1 was ever tested

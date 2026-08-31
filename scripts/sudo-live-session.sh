@@ -30,20 +30,13 @@
 # above, so prefer installing the package first if you're chasing anything
 # permission- or environment-related.
 #
-# Two things the package deliberately doesn't build/wire up at all are
-# opt-in extras here, in both modes, off by default (each has its own real
-# cost -- an extra git clone + cargo-c build for Sway, real PAM session
-# establishment for PAM_SPAWN -- not worth paying on every quick KWin-only
-# test run):
+# One thing the package deliberately doesn't build/wire up at all is an
+# opt-in extra here, in both modes, off by default (extra git clone +
+# cargo-c build, not worth paying on every quick KWin-only test run):
 #   REDFOG_LIVE_SWAY=1          also builds/wires up the gst-wayland-display
 #                                Sway backend (MIT, cloned into vendor/) --
 #                                without this, only the KDE Plasma/KWin
 #                                session-picker entry actually works.
-#   REDFOG_BROKER_PAM_SPAWN=1   experimental direct fork/PAM/setuid session
-#                                path (crates/redfog-session-init) instead
-#                                of the systemd-run path the package always
-#                                uses -- see design.md's "Privilege
-#                                separation" section and project memory.
 #
 # Ctrl-C stops both processes (and, in package mode, reverts the units to
 # exactly what the package itself installed) and cleans up.
@@ -85,15 +78,10 @@ if [ "$(id -u)" -ne 0 ]; then
     # feel completely broken (input events queue up behind frame writes).
     #
     # Only the binaries actually needed, not `--workspace`: matches exactly
-    # what packaging/arch/PKGBUILD's own build() builds, plus
-    # redfog-session-init when REDFOG_BROKER_PAM_SPAWN is opted into (the
-    # package never builds that one at all -- see session_init_path's doc
-    # comment in redfog-broker for why it still works unpackaged, via
-    # REDFOG_SESSION_INIT_PATH below).
-    build_pkgs=(-p redfog-server -p redfog-broker -p redfog-login -p redfog-pair)
-    if [ -n "${REDFOG_BROKER_PAM_SPAWN:-}" ]; then
-        build_pkgs+=(-p redfog-session-init)
-    fi
+    # what packaging/arch/PKGBUILD's own build() builds. redfog-session-init
+    # is the privilege-drop helper spawn_via_systemd execs into — see its
+    # own doc comment in redfog-broker/src/session.rs.
+    build_pkgs=(-p redfog-server -p redfog-broker -p redfog-login -p redfog-pair -p redfog-session-init)
     echo "building redfog (release): ${build_pkgs[*]}"
     (cd "$REPO_DIR" && cargo build --release "${build_pkgs[@]}")
 
@@ -135,7 +123,6 @@ if [ -z "${REDFOG_LIVE_SCOPED:-}" ]; then
         --setenv="SUDO_USER=$SUDO_USER" \
         --setenv="PATH=$PATH" \
         --setenv="REDFOG_LIVE_SWAY=${REDFOG_LIVE_SWAY:-}" \
-        --setenv="REDFOG_BROKER_PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN:-}" \
         --setenv="GST_TRACERS=${GST_TRACERS:-}" \
         --setenv="GST_DEBUG=${GST_DEBUG:-}" \
         --setenv="REDFOG_VIDEO_ENCODER=${REDFOG_VIDEO_ENCODER:-}" \
@@ -166,9 +153,7 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
     install -Dm755 "$REPO_DIR/target/release/redfog-broker" /usr/bin/redfog-broker
     install -Dm755 "$REPO_DIR/target/release/redfog-login" /usr/bin/redfog-login
     install -Dm755 "$REPO_DIR/target/release/redfog-pair" /usr/bin/redfog-pair
-    if [ -n "${REDFOG_BROKER_PAM_SPAWN:-}" ]; then
-        install -Dm755 "$REPO_DIR/target/release/redfog-session-init" /usr/bin/redfog-session-init
-    fi
+    install -Dm755 "$REPO_DIR/target/release/redfog-session-init" /usr/bin/redfog-session-init
 
     # Ephemeral (/run, not /etc) drop-ins so the debug env vars below never
     # touch the package's own committed units or /etc/redfog/redfog.conf --
@@ -178,7 +163,6 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
     # you may have added yourself for a separate one-off debugging session.
     broker_env=("RUST_LOG=${REDFOG_LIVE_BROKER_RUST_LOG:-redfog_broker=info}")
     server_env=("RUST_LOG=${REDFOG_LIVE_SERVER_RUST_LOG:-redfog_moonlight=info,redfog_server=info,gst_backend=info}")
-    [ -n "${REDFOG_BROKER_PAM_SPAWN:-}" ] && broker_env+=(REDFOG_BROKER_PAM_SPAWN=1 REDFOG_SESSION_INIT_PATH=/usr/bin/redfog-session-init)
     [ -n "${REDFOG_DEBUG_KWIN_LOGGING_RULES:-}" ] && broker_env+=("REDFOG_DEBUG_KWIN_LOGGING_RULES=${REDFOG_DEBUG_KWIN_LOGGING_RULES}")
     [ -n "${REDFOG_LIVE_SWAY:-}" ] && server_env+=("REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR=${PLUGIN_DIR}")
     [ -n "${REDFOG_VIDEO_ENCODER:-}" ] && server_env+=("REDFOG_VIDEO_ENCODER=${REDFOG_VIDEO_ENCODER}")
@@ -229,6 +213,10 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
 
     cleanup() {
         echo "stopping..."
+        # Kills the backgrounded `journalctl -f` from below, if this is
+        # being called while it's still running (the normal Ctrl-C case) --
+        # otherwise it'd survive as an orphan once this script exits.
+        jobs -p | xargs -r kill 2>/dev/null
         # Only stop a unit this script itself brought up -- if it was
         # already running as a real, persistent deployment before this
         # script started, leave it running (just without this session's
@@ -281,7 +269,18 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
     echo ""
     echo "Ctrl-C to stop and revert to exactly what the package itself installed."
     echo ""
-    journalctl -u redfog-broker -u redfog-server -f --since "-1s"
+    # Backgrounded + `wait`ed explicitly, not run directly in the
+    # foreground: confirmed live, bash does not act on a pending trapped
+    # signal (Ctrl-C/SIGTERM) while blocked waiting on a foreground command
+    # — only once that command itself exits. `journalctl -f` never gets the
+    # signal on its own (only this script's own PID does), so it runs
+    # forever and the trap-based cleanup() below never fires, leaking
+    # redfog-broker.service/redfog-server.service (and any active session
+    # unit) indefinitely. `wait "$!"` (the builtin), unlike waiting on a
+    # foreground pipeline directly, *is* documented to return immediately
+    # once a trapped signal arrives, letting cleanup() run right away.
+    journalctl -u redfog-broker -u redfog-server -f --since "-1s" &
+    wait "$!"
 
 # ── Standalone fallback (no package installed) ───────────────────────────
 else
@@ -290,7 +289,6 @@ else
 
     BROKER_LOG="/tmp/redfog-live-broker.log"
     SERVER_LOG="/tmp/redfog-live-server.log"
-    REDFOG_BROKER_PAM_SPAWN="${REDFOG_BROKER_PAM_SPAWN-}"
 
     cleanup() {
         echo "stopping..."
@@ -311,8 +309,7 @@ else
     rm -rf /tmp/redfog-runtime
     rm -f /tmp/redfog-live-broker.sock
 
-    echo "starting redfog-broker (PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN:-<unset, systemd-unit path>}, real PAM auth)..."
-    REDFOG_BROKER_PAM_SPAWN="$REDFOG_BROKER_PAM_SPAWN" \
+    echo "starting redfog-broker..."
     REDFOG_DEBUG_KWIN_LOGGING_RULES="${REDFOG_DEBUG_KWIN_LOGGING_RULES-}" \
     RUST_LOG="${REDFOG_LIVE_BROKER_RUST_LOG:-redfog_broker=info}" \
     setsid "$REPO_DIR/target/release/redfog-broker" > "$BROKER_LOG" 2>&1 &

@@ -1,15 +1,30 @@
-//! Small, dedicated helper: opens a real PAM session for a target user,
-//! drops privileges, then execs into a given command. Exists as a
-//! *separate binary* (rather than logic inlined into `redfog-broker`'s own
-//! `pre_exec` closure) specifically to avoid a classic hazard: PAM calls
-//! (loading `pam_systemd.so`, allocating memory, etc.) are not
-//! async-signal-safe, and running them in a `fork()`ed child of a
-//! multi-threaded process (redfog-broker's own tokio runtime) can silently
-//! deadlock — confirmed live, the broker hung with zero output when this
-//! logic ran directly in its own `pre_exec` closure. A freshly `exec`'d
-//! process is single-threaded from the start, so none of that applies here.
+//! Small, dedicated helper: drops privileges (the correct way: `initgroups`
+//! from `/etc/group`, then `setgid`, then `setuid`), then execs into a given
+//! command. Exists as a *separate binary* (rather than logic inlined into
+//! `redfog-broker`'s own `pre_exec` closure) specifically to avoid a
+//! classic hazard: the syscalls involved were originally paired with real
+//! PAM calls here (`pam_systemd.so`, allocating memory, etc.), which are
+//! not async-signal-safe — running them in a `fork()`ed child of a
+//! multi-threaded process (redfog-broker's own tokio runtime) silently
+//! deadlocked, confirmed live, when this logic ran directly in its own
+//! `pre_exec` closure. A freshly `exec`'d process is single-threaded from
+//! the start, so kept as a separate binary even after PAM itself was
+//! removed from here (see below) — the privilege-drop syscalls alone are
+//! still simplest to reason about pre-`exec`, not post-`fork`.
 //!
 //! Usage: `redfog-session-init <username> -- <command> [args...]`
+//!
+//! Used to optionally open a real PAM session first (`pam_systemd.so`,
+//! registering a genuine logind session) — removed after confirming live
+//! that doing so moves the whole process tree into its own separate
+//! `pam_systemd`-created `session-N.scope`, *outside* whatever systemd
+//! unit/cgroup the caller spawned it in. That broke the caller's own
+//! cgroup-based cleanup: `terminate()`'s unit-stop only ever reached this
+//! process itself (before its own `exec()` below), while `kwin_wayland`
+//! (already reparented into the escaped scope) leaked forever, every
+//! single session end. Nothing that calls this binary actually needed the
+//! real PAM session for its own sake — just the correct privilege drop —
+//! so it's gone rather than worked around.
 //!
 //! The broker is responsible for clearing `FD_CLOEXEC` on any file
 //! descriptor it wants to survive through to `<command>` *before* spawning
@@ -20,11 +35,6 @@
 
 use std::ffi::CString;
 use std::os::unix::process::CommandExt;
-
-/// Dedicated PAM service name — see redfog-broker's session.rs for why
-/// this isn't "system-auth" (real credential check already happened
-/// earlier, separately) or "systemd-user" (systemd's own internal use).
-const PAM_SESSION_SERVICE: &str = "redfog-session";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,11 +50,6 @@ fn main() {
         eprintln!("redfog-session-init: {e}");
         std::process::exit(1);
     });
-
-    if let Err(e) = open_pam_session(username) {
-        eprintln!("redfog-session-init: {e}");
-        std::process::exit(1);
-    }
 
     // initgroups populates the target user's REAL supplementary groups
     // (video, audio, input, etc.) from /etc/group — without this, the
@@ -93,26 +98,4 @@ fn resolve_user(username: &str) -> Result<(u32, u32), String> {
     let uid: u32 = uid.parse().map_err(|e| format!("invalid uid in getent passwd {username} output: {e}"))?;
     let gid: u32 = gid.parse().map_err(|e| format!("invalid gid in getent passwd {username} output: {e}"))?;
     Ok((uid, gid))
-}
-
-/// Opens (and deliberately never closes — see redfog-broker's session.rs
-/// for the known limitation this shares) a real PAM session: registers a
-/// genuine logind session (via `pam_systemd.so` in `/etc/pam.d/redfog-session`),
-/// unlike a plain systemd `User=` uid switch. `auth`/`account` are
-/// `pam_permit.so` in that service file — no real credential check
-/// happens here, that already happened earlier via a separate PAM
-/// interaction; this call exists only to open the session.
-fn open_pam_session(username: &str) -> Result<(), String> {
-    let mut client = pam::Client::with_password(PAM_SESSION_SERVICE).map_err(|e| format!("pam init failed: {e}"))?;
-    client.conversation_mut().set_credentials(username, "");
-    client
-        .authenticate()
-        .map_err(|e| format!("pam authenticate (session-only, pam_permit.so) failed: {e}"))?;
-    client.open_session().map_err(|e| format!("pam open_session failed: {e}"))?;
-    // This process is about to exec() into the real session command
-    // anyway, discarding this Client either way — std::mem::forget just
-    // skips Client's own Drop (which would try close_session()) rather
-    // than let it attempt a pointless one immediately before that happens.
-    std::mem::forget(client);
-    Ok(())
 }

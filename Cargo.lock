@@ -4408,7 +4408,6 @@ name = "redfog-session-init"
 version = "0.1.0"
 dependencies = [
  "nix",
- "pam",
 ]
 
 [[package]]

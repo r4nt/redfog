@@ -169,16 +169,14 @@ enum ActiveSession {
     DirectChild { child: Child },
     /// A session wrapped in its own transient systemd scope
     /// (`systemd-run --scope --collect --unit=<unit_name>`) — used by
-    /// `spawn_via_pam`, `spawn_fake_pam` (its sudo-free test stand-in), and
-    /// `spawn_payload`. All three spawn a process that either forks a real
-    /// child of its own (`dbus-run-session` forking `kwin_wayland`, since
-    /// it needs to stay alive to manage the D-Bus daemon's lifecycle — not
-    /// exec-chained) or could plausibly do so (`spawn_payload`'s
-    /// caller-provided `argv`) — a plain `terminate()` that only kills the
-    /// top-level tracked PID would leave that forked descendant orphaned
-    /// and running forever. Confirmed live: after a log-out, `kwin_wayland`
-    /// was still alive with `PPid=1`, still holding its PipeWire/DRM
-    /// connection, degrading every session spawned after it.
+    /// `spawn_payload`, whose caller-provided `argv` could itself be (or
+    /// spawn) a process that forks its own real children rather than
+    /// exec-chaining — a plain `terminate()` that only kills the top-level
+    /// tracked PID would leave any such forked descendant orphaned and
+    /// running forever. Confirmed live once already (a different spawn
+    /// path, since removed): after a log-out, `kwin_wayland` was still
+    /// alive with `PPid=1`, still holding its PipeWire/DRM connection,
+    /// degrading every session spawned after it.
     ///
     /// A bare process group (an earlier fix attempt, `.process_group(0)` +
     /// a negative-PID `kill()`) is not quite enough on its own: any
@@ -191,14 +189,15 @@ enum ActiveSession {
     /// (which execs directly into the target command via the *same* PID —
     /// registering the scope for its own already-running PID before
     /// exec'ing, not an extra fork) purely so it can be `wait()`ed/reaped
-    /// once the scope's been killed. `user_scope` records whether this was
-    /// registered with `systemd-run --user` (`spawn_fake_pam`) or the
-    /// system manager (`spawn_via_pam`/`spawn_payload`) — `terminate()`
-    /// must query the *same* manager instance the scope was created in, or
-    /// `systemctl kill` reports "not loaded" against the wrong one
-    /// (confirmed: this was the actual bug on the first attempt at this
-    /// fix — `run_systemctl` always queried the system manager).
-    Scoped { child: Child, unit_name: String, user_scope: bool },
+    /// once the scope's been killed. Always registered against the
+    /// *system* manager (`systemd-run`, no `--user`) — `terminate()`'s own
+    /// `logind_session_id_for` check additionally handles the case where
+    /// the tracked process ends up migrated into a *different* cgroup than
+    /// the one it was registered in (e.g. a real PAM session opening and
+    /// creating its own `session-N.scope` — confirmed live this happens
+    /// and silently garbage-collects the original scope out from under a
+    /// naive `systemctl kill` on `unit_name` alone).
+    Scoped { child: Child, unit_name: String },
 }
 
 pub struct SessionManager {
@@ -219,37 +218,8 @@ impl SessionManager {
         socket_name: &str,
         payload: &[String],
     ) -> Result<String, String> {
-        // Checked *before* `REDFOG_BROKER_FAKE_SPAWN` deliberately: a test
-        // that wants this mode sets both (the latter comes from
-        // `broker_spawn_mode_env`'s own non-root default, which a test
-        // can't easily suppress without also losing its root-detection
-        // logic) — this one needs to win when both are present. Test-only,
-        // reproduces `spawn_via_pam`'s exact process-tree shape (broker ->
-        // `dbus-run-session` -> real `kwin_wayland`, the latter forked, not
-        // exec-chained) without needing real root/PAM/setuid — see
-        // `spawn_fake_pam`'s own doc comment for why this is enough to test
-        // the orphaned-grandchild class of bug `terminate()`'s process-group
-        // kill fixes, sudo-free.
-        if std::env::var_os("REDFOG_BROKER_FAKE_PAM_SPAWN").is_some() {
-            return self.spawn_fake_pam(session_id, width, height, socket_name, payload).await;
-        }
-
         if std::env::var_os("REDFOG_BROKER_FAKE_SPAWN").is_some() {
             return self.spawn_fake(session_id, width, height, socket_name, payload).await;
-        }
-
-        // Experimental alternative to spawn_via_systemd — see spawn_via_pam's
-        // doc comment. Not the default yet: real PAM session support here is
-        // new and hasn't seen the same mileage the systemd path has.
-        if std::env::var_os("REDFOG_BROKER_PAM_SPAWN").is_some() {
-            let username = match std::env::var("REDFOG_BROKER_FORCE_SPAWN_USER") {
-                Ok(forced) => {
-                    tracing::warn!("REDFOG_BROKER_FORCE_SPAWN_USER set — spawning as {forced} instead of requested {username}");
-                    forced
-                }
-                Err(_) => username.to_string(),
-            };
-            return self.spawn_via_pam(session_id, &username, width, height, socket_name, payload).await;
         }
 
         // For integration testing: spawn as whatever user is actually
@@ -324,7 +294,7 @@ impl SessionManager {
             }
         }
         // Deliberately *not* its own process group, unlike
-        // `spawn_via_pam`/`spawn_payload`: this is the test-only,
+        // `spawn_payload`: this is the test-only,
         // sudo-free path, and the integration test's own `BrokerProcess`
         // Drop impl kills its whole tree (broker -> this direct child)
         // by the *broker's* process group — giving this child its own
@@ -349,129 +319,6 @@ impl SessionManager {
         }
 
         self.active.lock().unwrap().insert(session_id.to_string(), ActiveSession::DirectChild { child });
-        Ok(wayland_socket_path)
-    }
-
-    /// Test-only, sudo-free stand-in for `spawn_via_pam` that reproduces
-    /// its *process-tree shape* — broker tracks `dbus-run-session`, which
-    /// itself *forks* `kwin_wayland` as a real child (not exec-chained) —
-    /// and its pre-bound-Wayland-socket-fd handoff, without any of the
-    /// parts that genuinely need root (`pam::Client` session open,
-    /// `setuid`/`setgid`/`initgroups`, `chown`/`setfacl` cross-user
-    /// grants). The bug class this exists to test (`terminate()` only
-    /// killing the top-level tracked PID, orphaning `kwin_wayland` forever
-    /// after a log-out — confirmed live) is purely about that process
-    /// nesting, not about privilege escalation, so this is enough to
-    /// reproduce and verify the fix for it without needing
-    /// `sudo -E cargo test`. Registers as `ActiveSession::Scoped` — the
-    /// same variant, same `terminate()` code path, `spawn_via_pam` uses,
-    /// not a parallel reimplementation of it — using `--user` (this user's
-    /// own systemd instance) rather than the system manager, since this
-    /// path deliberately never needs root.
-    async fn spawn_fake_pam(&self, session_id: &str, width: u32, height: u32, socket_name: &str, payload: &[String]) -> Result<String, String> {
-        tracing::warn!(
-            "REDFOG_BROKER_FAKE_PAM_SPAWN set — spawning kwin_wayland via a dbus-run-session wrapper, inside its own `systemd-run --user \
-             --scope`, as the broker's own user, mimicking spawn_via_pam's process-tree shape (no real PAM/setuid) for testing"
-        );
-
-        let runtime_dir = format!("{}/session-{session_id}", default_runtime_dir());
-        let wayland_socket_path = format!("{runtime_dir}/{socket_name}");
-        std::fs::create_dir_all(&runtime_dir).map_err(|e| format!("failed to create {runtime_dir}: {e}"))?;
-        let _ = std::fs::remove_file(&wayland_socket_path);
-
-        // Same pre-bound-fd handoff `spawn_via_pam` uses (see its own
-        // comment) — exercises the exact mechanism the real path relies on,
-        // so this also verifies the fd actually survives the
-        // `systemd-run`/`env`/`dbus-run-session` exec chain, not just that
-        // the process *tree shape* matches.
-        let listener = std::os::unix::net::UnixListener::bind(&wayland_socket_path).map_err(|e| format!("failed to bind {wayland_socket_path}: {e}"))?;
-        let wayland_fd = std::os::unix::io::AsRawFd::as_raw_fd(&listener);
-        let flags = unsafe { libc::fcntl(wayland_fd, libc::F_GETFD) };
-        if flags == -1 {
-            return Err(format!("fcntl F_GETFD on {wayland_fd} failed: {}", std::io::Error::last_os_error()));
-        }
-        if unsafe { libc::fcntl(wayland_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
-            return Err(format!("fcntl F_SETFD on {wayland_fd} failed: {}", std::io::Error::last_os_error()));
-        }
-
-        let kwin_path = which_kwin_wayland().unwrap_or_else(|| "kwin_wayland".to_string());
-        let pipewire_socket_path = format!("{}/pipewire-0", default_runtime_dir());
-        // See `spawn_fake`'s equivalent comment: must be `default_runtime_dir()`,
-        // not this session's own private `runtime_dir`.
-        let pulse_socket_path = pulse_socket_path();
-        let unit_name = format!("redfog-fake-pam-session-{}-{session_id}", std::process::id());
-
-        // `systemd-run --user --scope` needs the *real* `XDG_RUNTIME_DIR`
-        // (to find this user's own systemd/D-Bus instance) — deliberately
-        // not overridden here, unlike `spawn_via_pam`'s system-manager case
-        // (which doesn't care). The env vars `kwin_wayland` itself needs —
-        // including a *different* `XDG_RUNTIME_DIR` — are instead applied
-        // via the `env` utility to just the inner command, after
-        // `systemd-run`'s own exec.
-        let mut cmd = tokio::process::Command::new("systemd-run");
-        cmd.arg("--user")
-            .arg("--scope")
-            .arg("--collect")
-            .arg(format!("--unit={unit_name}"))
-            .arg("--")
-            .arg("env")
-            .arg("KWIN_PLATFORM=virtual")
-            .arg("KWIN_WAYLAND_NO_PERMISSION_CHECKS=1")
-            .arg(format!("XDG_RUNTIME_DIR={runtime_dir}"))
-            .arg(format!("PIPEWIRE_REMOTE={pipewire_socket_path}"))
-            .arg(format!("PULSE_SERVER=unix:{pulse_socket_path}"))
-            .arg("LIBGL_ALWAYS_SOFTWARE=1")
-            // No `--` here: this `env` (GNU coreutils 9.11) doesn't treat
-            // it as an option terminator between the `NAME=VALUE`
-            // assignments and the command — it tried to `execvp("--", ...)`
-            // literally and failed with "No such file or directory".
-            // Unambiguous without it anyway, since `NAME=VALUE` assignments
-            // don't look like a command.
-            .arg("dbus-run-session")
-            .arg("--")
-            .arg(&kwin_path)
-            .arg("--virtual")
-            .arg("--width")
-            .arg(width.to_string())
-            .arg("--height")
-            .arg(height.to_string())
-            .arg("--scale")
-            .arg("1")
-            .arg("--no-lockscreen")
-            .arg("--wayland-fd")
-            .arg(wayland_fd.to_string())
-            .arg("--socket")
-            .arg(socket_name)
-            .arg("--xwayland");
-        if !payload.is_empty() {
-            cmd.arg("--exit-with-session");
-            cmd.arg(&payload[0]);
-            if payload.len() > 1 {
-                cmd.arg("--");
-                for arg in &payload[1..] {
-                    cmd.arg(arg);
-                }
-            }
-        }
-        let child = cmd
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("failed to spawn systemd-run: {e}"))?;
-        // The child inherited its own copy of the listener's fd across
-        // fork(); our copy can close now without affecting that.
-        drop(listener);
-
-        let socket_path_buf = PathBuf::from(&wayland_socket_path);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !socket_path_buf.exists() {
-            if std::time::Instant::now() > deadline {
-                return Err(format!("KWin Wayland socket {wayland_socket_path} failed to appear"));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        }
-
-        self.active.lock().unwrap().insert(session_id.to_string(), ActiveSession::Scoped { child, unit_name, user_scope: true });
         Ok(wayland_socket_path)
     }
 
@@ -595,20 +442,73 @@ impl SessionManager {
         // `redfog-server`'s own `ensure_private_dbus_session()` already
         // wraps its *entire* process tree — but this systemd unit is a
         // separate process tree that never goes through that.
+        let session_init_path = session_init_path()?;
+        // `redfog-session-init <username> -- <command>...` (see its own doc
+        // comment): does the *correct* uid/gid/supplementary-group drop
+        // (initgroups from /etc/group, then setgid, then setuid) before
+        // exec'ing into the real payload. Used here instead of this unit's
+        // own `User=` (removed below) specifically so `bwrap`, further out
+        // in this same exec chain, runs as real root rather than already
+        // privilege-dropped — see gpu_sandbox_argv_prefix's doc comment for
+        // why that distinction matters (running bwrap unprivileged forces it
+        // into a user namespace, which remaps ownership of anything not the
+        // calling uid, e.g. root-owned `/tmp/.X11-unix` — confirmed live,
+        // this broke Xwayland with "not owned by root or us" on every
+        // single spawn once GPU-sandboxing started actually restricting
+        // /dev/dri instead of being a no-op). Deliberately does *not* open a
+        // real PAM session (redfog-session-init no longer has that code at
+        // all — see its own doc comment for why: it moves the whole process
+        // tree into its own separate `pam_systemd`-created scope, breaking
+        // this unit's cgroup-based termination) — the bwrap-as-root fix
+        // never depended on a PAM session in the first place.
         let mut exec_start = format!(
-            "dbus-run-session -- {kwin_path} --virtual --width {width} --height {height} --scale 1 \
-             --no-lockscreen --wayland-fd 3 --socket {socket_name} --xwayland"
+            "{} {username} -- dbus-run-session -- {kwin_path} --virtual --width {width} --height {height} --scale 1 \
+             --no-lockscreen --wayland-fd 3 --socket {socket_name} --xwayland",
+            session_init_path.display()
         );
         if !payload.is_empty() {
             let session_script_path = write_session_script(&runtime_dir, socket_name, &pipewire_socket_path, &pulse_socket_path, payload)?;
             exec_start.push_str(&format!(" --exit-with-session {session_script_path}"));
         }
-        let home_dir = home_dir_for(username).await?;
+        // See gpu_sandbox_argv_prefix's doc comment. Prepended last, so it
+        // wraps everything above (including redfog-session-init and
+        // --exit-with-session) — with `User=` removed below, this unit's
+        // ExecStart runs as real root, so bwrap here does its mount-namespace
+        // setup without ever needing an unprivileged user namespace,
+        // avoiding the identity-remap problem entirely rather than working
+        // around its symptoms.
+        if let Some(prefix) = gpu_sandbox_argv_prefix() {
+            exec_start = format!("{} {exec_start}", prefix.join(" "));
+        }
+        let (_uid, _gid, home_dir, shell) = resolve_user(username).await?;
+        // No `User=` here (unlike before) — see exec_start's own comment:
+        // this unit now runs as root throughout, with redfog-session-init
+        // (inside the ExecStart chain) doing the actual privilege drop. No
+        // PAM session opened at all, so the entire process tree stays
+        // inside this unit's own cgroup, and a plain `systemctl stop`
+        // reliably kills all of it, the same as before this unit ever
+        // involved redfog-session-init at all.
+        //
+        // Explicit HOME/USER/LOGNAME/SHELL below, unlike before: systemd's
+        // own `User=` directive used to set these automatically (an NSS
+        // lookup for the target user), for free, before the process ever
+        // started. `setuid()`/`setgid()` (what redfog-session-init does
+        // instead) only ever change process credentials, never environment
+        // variables — without these, every KDE/Qt app in the session
+        // inherited whatever HOME/SHELL this unit started with as root
+        // (unset, in practice), confirmed live twice: every app tried to
+        // read/write config under a literal `/.config/...` instead of the
+        // real home directory, and konsole couldn't find `""` as a shell
+        // and silently fell back to a default instead of the target user's
+        // real one.
         let mut service_unit = format!(
             "[Service]\n\
              Type=simple\n\
-             User={username}\n\
              WorkingDirectory={home_dir}\n\
+             Environment=HOME={home_dir}\n\
+             Environment=SHELL={shell}\n\
+             Environment=USER={username}\n\
+             Environment=LOGNAME={username}\n\
              Environment=XDG_RUNTIME_DIR={runtime_dir}\n\
              Environment=PIPEWIRE_REMOTE={pipewire_socket_path}\n\
              Environment=PULSE_SERVER=unix:{pulse_socket_path}\n\
@@ -624,7 +524,12 @@ impl SessionManager {
              Environment=XDG_CONFIG_DIRS=/etc/xdg\n\
              Environment=XDG_MENU_PREFIX=plasma-\n"
         );
-        // Same temporary debugging aid as `spawn_via_pam` — see its comment.
+        // TEMPORARY debugging aid: kwin_wayland's own logging is otherwise
+        // silent about most of what it does. `kwin_screencast` is the
+        // relevant Qt logging category for its PipeWire/DMA-BUF producer
+        // (found via `strings` on the installed screencast.so — this repo
+        // has no KWin source to grep). Output lands wherever this unit's
+        // own journal goes, not the server's.
         if let Ok(rules) = std::env::var("REDFOG_DEBUG_KWIN_LOGGING_RULES") {
             service_unit.push_str(&format!("Environment=QT_LOGGING_RULES={rules}\n"));
         }
@@ -675,258 +580,12 @@ impl SessionManager {
         Ok(wayland_socket_path)
     }
 
-    /// Experimental alternative to `spawn_via_systemd`: instead of
-    /// generating/loading templated systemd units and delegating the
-    /// privilege drop and Wayland-socket handoff to systemd, the broker
-    /// does both itself — binding the Wayland socket directly (as root,
-    /// before dropping privilege, so the fd is inherited straight across
-    /// `fork`+`exec` with no path-based permission check ever needed on it
-    /// at all — eliminating that whole class of ACL bug by construction),
-    /// opening a real PAM session (unlike the systemd path, which only ever
-    /// authenticates, never calls `pam_open_session`), and dropping to the
-    /// target uid/gid manually. See design.md / project memory for the
-    /// comparison against the systemd-unit path this was modeled to
-    /// simplify on (inspired by `idea.md` in the repo root).
-    ///
-    /// Gated behind `REDFOG_BROKER_PAM_SPAWN` rather than being the default:
-    /// this is new and hasn't seen the mileage the systemd path has yet.
-    ///
-    /// Wrapped in its own transient systemd scope (`systemd-run --scope`,
-    /// see `ActiveSession::Scoped`'s doc comment) rather than tracking the
-    /// spawned process directly: this process (`redfog-session-init`)
-    /// `exec()`s into `dbus-run-session`, which then *forks* `kwin_wayland`
-    /// as an actual child rather than exec-replacing itself (it needs to
-    /// stay alive to manage the D-Bus daemon's lifecycle) — so a plain
-    /// `terminate()` that only kills the top-level tracked PID leaves
-    /// `kwin_wayland` (and everything under it: Xwayland, the whole
-    /// desktop) orphaned and running forever. Confirmed live: after a
-    /// log-out, `kwin_wayland` was still alive with `PPid=1`, still holding
-    /// the PipeWire/DRM connection, degrading every session spawned after
-    /// it. A plain process group (an earlier fix attempt) isn't quite
-    /// enough either — any descendant that calls `setsid()`/`setpgid()`
-    /// itself (not unusual for a display/session-managing process) escapes
-    /// it — a cgroup can't be escaped without explicit privileged action,
-    /// so the scope is what `terminate()` actually kills.
-    ///
-    /// KNOWN LIMITATIONS (acceptable for this experimental flag, not for
-    /// production):
-    /// - The opened PAM session is never explicitly closed (no live process
-    ///   remains after `execve()` to call `pam_close_session()` — systemd's
-    ///   own `PAMName=` keeps a small "(sd-pam)" placeholder process alive
-    ///   for exactly this reason; this doesn't yet do that). Logind should
-    ///   still reclaim it once every process in the session exits.
-    async fn spawn_via_pam(
-        &self,
-        session_id: &str,
-        username: &str,
-        width: u32,
-        height: u32,
-        socket_name: &str,
-        payload: &[String],
-    ) -> Result<String, String> {
-        let spawn_start = std::time::Instant::now();
-        tracing::info!("spawn_via_pam({session_id}, {username}): starting");
-        let home_dir = home_dir_for(username).await?;
-
-        let runtime_dir = format!("{}/session-{session_id}", default_runtime_dir());
-        let wayland_socket_path = format!("{runtime_dir}/{socket_name}");
-        std::fs::create_dir_all(&runtime_dir).map_err(|e| format!("failed to create {runtime_dir}: {e}"))?;
-        // Same reasoning as spawn_via_systemd's chown: this directory is
-        // used as the target user's own XDG_RUNTIME_DIR, and e.g. Xwayland
-        // needs to create files directly in it.
-        match tokio::process::Command::new("chown").args([username, &runtime_dir]).output().await {
-            Ok(output) if output.status.success() => tracing::info!("chowned {runtime_dir} to {username}"),
-            Ok(output) => {
-                return Err(format!(
-                    "chown {runtime_dir} to {username} exited with {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            Err(e) => return Err(format!("failed to run chown on {runtime_dir}: {e}")),
-        }
-
-        let _ = std::fs::remove_file(&wayland_socket_path);
-        let listener = std::os::unix::net::UnixListener::bind(&wayland_socket_path)
-            .map_err(|e| format!("failed to bind {wayland_socket_path}: {e}"))?;
-        let wayland_fd = std::os::unix::io::AsRawFd::as_raw_fd(&listener);
-
-        let pipewire_socket_path = format!("{}/pipewire-0", default_runtime_dir());
-        // Same reasoning as pipewire_socket_path: pipewire-pulse also runs
-        // under redfog-server's own identity, in its runtime dir — not
-        // this session's private `runtime_dir`.
-        let pulse_socket_path = pulse_socket_path();
-        // The pre-bound fd handoff only helps *KWin itself* (which inherits
-        // it directly via fork+exec, following FD_CLOEXEC being cleared
-        // above) — it does nothing for any *other* client that connects to
-        // this same socket by path instead, which is exactly what KWin's
-        // own --exit-with-session child does (a separate process KWin
-        // itself spawns via QProcess, looking up WAYLAND_DISPLAY/
-        // XDG_RUNTIME_DIR and connect()ing like any normal Wayland client)
-        // — confirmed live: without this grant, that child crashed with
-        // the exact same WaylandError(Connection(NoCompositor)) the
-        // systemd path hit before its own equivalent fix. PipeWire's
-        // socket needs the same kind of grant for the same reason (KWin
-        // connects to it by path too, no fd handoff for that one at all).
-        for (path, perm, what) in [
-            (default_runtime_dir(), "x", "traverse"),
-            (pipewire_socket_path.clone(), "rw", "connect to"),
-            (wayland_socket_path.clone(), "rw", "connect to"),
-            (format!("{}/pulse", default_runtime_dir()), "x", "traverse"),
-            (pulse_socket_path.clone(), "rw", "connect to"),
-        ] {
-            match tokio::process::Command::new("setfacl").args(["-m", &format!("u:{username}:{perm}"), &path]).output().await {
-                Ok(output) if output.status.success() => tracing::info!("granted {username} {what} access on {path}"),
-                Ok(output) => tracing::warn!(
-                    "setfacl granting {username} {what} access on {path} exited with {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-                Err(e) => tracing::warn!("failed to run setfacl granting {username} {what} access on {path}: {e}"),
-            }
-        }
-        // See `redfog_server_user`'s doc comment / `spawn_via_systemd`'s
-        // equivalent grants: `redfog-server`'s own `CaptureSession::connect`
-        // is a *third* identity (distinct from both the broker/root and
-        // `username`) that needs the same traverse/connect access.
-        if let Some(server_user) = redfog_server_user() {
-            for (path, perm, what) in [(default_runtime_dir(), "x", "traverse"), (wayland_socket_path.clone(), "rw", "connect to")] {
-                match tokio::process::Command::new("setfacl").args(["-m", &format!("u:{server_user}:{perm}"), &path]).output().await {
-                    Ok(output) if output.status.success() => tracing::info!("granted {server_user} {what} access on {path}"),
-                    Ok(output) => tracing::warn!(
-                        "setfacl granting {server_user} {what} access on {path} exited with {}: {}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr)
-                    ),
-                    Err(e) => tracing::warn!("failed to run setfacl granting {server_user} {what} access on {path}: {e}"),
-                }
-            }
-        }
-
-        let kwin_path = which_kwin_wayland().unwrap_or_else(|| "kwin_wayland".to_string());
-        // Clearing FD_CLOEXEC here, directly in the broker's own
-        // already-running process (not inside a fork), is safe — the
-        // hazard is specifically about calling into non-async-signal-safe
-        // code (like PAM below) *after* fork() in a multi-threaded
-        // process, not about this single, simple syscall.
-        let flags = unsafe { libc::fcntl(wayland_fd, libc::F_GETFD) };
-        if flags == -1 {
-            return Err(format!("fcntl F_GETFD on {wayland_fd} failed: {}", std::io::Error::last_os_error()));
-        }
-        if unsafe { libc::fcntl(wayland_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
-            return Err(format!("fcntl F_SETFD on {wayland_fd} failed: {}", std::io::Error::last_os_error()));
-        }
-
-        ensure_pam_session_service()?;
-        let session_init_path = session_init_path()?;
-        let unit_name = format!("redfog-pam-session-{}-{session_id}", std::process::id());
-        // `systemd-run --scope --collect --unit=<unit_name> -- <argv...>`
-        // execs `<argv...>` directly in place of `systemd-run` itself (no
-        // extra fork — the scope is registered for `systemd-run`'s own,
-        // already-running PID before it execs), talking to the *system*
-        // manager (no `--user`, unlike `spawn_fake_pam`'s test-only
-        // stand-in) — fine for `systemd-run`'s own environment needs since
-        // the broker already runs as root here. See `ActiveSession::Scoped`
-        // for why a scope beats a plain process group.
-        let mut cmd = tokio::process::Command::new("systemd-run");
-        cmd.arg("--scope")
-            .arg("--collect")
-            .arg(format!("--unit={unit_name}"))
-            .arg("--")
-            .arg(&session_init_path)
-            .arg(username)
-            .arg("--")
-            .arg("dbus-run-session")
-            .arg("--")
-            .arg(&kwin_path)
-            .arg("--virtual")
-            .arg("--width")
-            .arg(width.to_string())
-            .arg("--height")
-            .arg(height.to_string())
-            .arg("--scale")
-            .arg("1")
-            .arg("--no-lockscreen")
-            .arg("--wayland-fd")
-            .arg(wayland_fd.to_string())
-            .arg("--socket")
-            .arg(socket_name)
-            .arg("--xwayland");
-        if !payload.is_empty() {
-            let session_script_path = write_session_script(&runtime_dir, socket_name, &pipewire_socket_path, &pulse_socket_path, payload)?;
-            cmd.arg("--exit-with-session").arg(session_script_path);
-        }
-
-        // Deliberately env_clear()+explicit envs, not inherited from the
-        // broker's own environment — same set as spawn_via_systemd's
-        // Environment= lines, just built directly rather than templated
-        // into a unit file string. Fine to set directly on this outer
-        // `systemd-run` invocation (rather than needing `env`-wrapping the
-        // inner command, like `spawn_fake_pam` does): talking to the
-        // *system* manager doesn't depend on any of these, unlike
-        // `systemd-run --user`, which needs the real `XDG_RUNTIME_DIR` to
-        // find the user's own bus.
-        cmd.env_clear()
-            .env("HOME", &home_dir)
-            .env("USER", username)
-            .env("LOGNAME", username)
-            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin")
-            .env("XDG_RUNTIME_DIR", &runtime_dir)
-            .env("PIPEWIRE_REMOTE", &pipewire_socket_path)
-            .env("PULSE_SERVER", &format!("unix:{pulse_socket_path}"))
-            .env("KWIN_PLATFORM", "virtual")
-            .env("KWIN_WAYLAND_NO_PERMISSION_CHECKS", "1")
-            .env("LIBGL_ALWAYS_SOFTWARE", "1")
-            .env("XDG_SESSION_TYPE", "wayland")
-            .env("XDG_CURRENT_DESKTOP", "KDE")
-            .env("DESKTOP_SESSION", "plasma")
-            .env("KDE_FULL_SESSION", "true")
-            .env("KDE_SESSION_VERSION", "6")
-            .env("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
-            .env("XDG_CONFIG_DIRS", "/etc/xdg")
-            .env("XDG_MENU_PREFIX", "plasma-");
-        // TEMPORARY debugging aid for the "resume works but video updates
-        // are severely throttled" investigation — env_clear() above means
-        // this doesn't reach kwin_wayland unless re-added explicitly, same
-        // as every other var above it. `kwin_screencast`/`kwin_platform_
-        // virtual` are the relevant Qt logging categories (found via
-        // `strings` on the installed screencast.so/libkwin.so — this repo
-        // has no KWin source to grep). Output lands in the broker's own
-        // log (this command inherits the broker's stdout/stderr, see
-        // below), not the server's. Remove once that investigation
-        // concludes.
-        if let Ok(rules) = std::env::var("REDFOG_DEBUG_KWIN_LOGGING_RULES") {
-            cmd.env("QT_LOGGING_RULES", rules);
-        }
-        cmd.current_dir(&home_dir)
-            // Inherits the broker's own stdout/stderr, same as spawn_fake —
-            // the integration test captures the broker's piped output, so
-            // this is what actually makes this session's output visible to
-            // it at all (unlike the systemd path, there's no journald unit
-            // to follow here).
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-
-        let child = cmd.spawn().map_err(|e| format!("failed to spawn systemd-run: {e}"))?;
-        // The child inherited its own copy of the listener's fd across
-        // fork(); our copy can close now without affecting that.
-        drop(listener);
-
-        tracing::info!(
-            "spawn_via_pam({session_id}, {username}): spawned pid={:?}, unit={unit_name}.scope, returning after {:?}",
-            child.id(),
-            spawn_start.elapsed()
-        );
-        self.active.lock().unwrap().insert(session_id.to_string(), ActiveSession::Scoped { child, unit_name, user_scope: false });
-        Ok(wayland_socket_path)
-    }
-
     /// Grants `username` access to a socket/runtime dir the *caller*
     /// already created and owns (e.g. redfog-moonlight embedding a
     /// `gst-wayland-display` pipeline directly in its own process), then
-    /// spawns `argv` (with `env` applied) as that user pointed at it — the
-    /// "just grant + spawn" counterpart to `spawn_via_pam`'s "create
-    /// everything, including the compositor, then spawn". See
+    /// spawns `argv` (with `env` applied) as that user pointed at it —
+    /// unlike `spawn_via_systemd`, which creates the whole compositor
+    /// runtime dir/socket itself, this one's caller already owns both. See
     /// `BrokerRequest::SpawnPayload`'s doc comment for the broader picture.
     pub async fn spawn_payload(
         &self,
@@ -937,10 +596,10 @@ impl SessionManager {
         argv: &[String],
         env: &[(String, String)],
     ) -> Result<(), String> {
-        let (_uid, _gid, home_dir) = resolve_user(username).await?;
+        let (_uid, _gid, home_dir, _shell) = resolve_user(username).await?;
 
-        // Unlike spawn_via_pam's runtime dir (which the broker creates and
-        // chowns fully to the target user), this one is owned by the
+        // Unlike spawn_via_systemd's runtime dir (which the broker creates
+        // and chowns fully to the target user), this one is owned by the
         // caller and needs to *stay* that way — grant access instead of
         // transferring ownership. A default ACL (`-d`) is required too,
         // since the payload itself creates new files/sockets directly
@@ -963,16 +622,14 @@ impl SessionManager {
             }
         }
 
-        ensure_pam_session_service()?;
         let session_init_path = session_init_path()?;
         let unit_name = format!("redfog-payload-session-{}-{session_id}", std::process::id());
-        // Scope-wrapped for the same reason `spawn_via_pam` is (see
-        // `ActiveSession::Scoped`'s doc comment): the caller-provided
-        // `argv` may itself be (or spawn) a wrapper process with its own
-        // forked children, and `terminate()` needs to be able to kill the
-        // *whole* tree — including anything that calls `setsid()`/
-        // `setpgid()` along the way, which a plain process group can't
-        // reach but a cgroup can't be escaped from.
+        // Scope-wrapped (see `ActiveSession::Scoped`'s doc comment): the
+        // caller-provided `argv` may itself be (or spawn) a wrapper process
+        // with its own forked children, and `terminate()` needs to be able
+        // to kill the *whole* tree — including anything that calls
+        // `setsid()`/`setpgid()` along the way, which a plain process group
+        // can't reach but a cgroup can't be escaped from.
         let mut cmd = tokio::process::Command::new("systemd-run");
         cmd.arg("--scope").arg("--collect").arg(format!("--unit={unit_name}")).arg("--").arg(&session_init_path).arg(username).arg("--").args(argv);
         cmd.env_clear()
@@ -988,7 +645,7 @@ impl SessionManager {
         }
 
         let child = cmd.spawn().map_err(|e| format!("failed to spawn systemd-run: {e}"))?;
-        self.active.lock().unwrap().insert(session_id.to_string(), ActiveSession::Scoped { child, unit_name, user_scope: false });
+        self.active.lock().unwrap().insert(session_id.to_string(), ActiveSession::Scoped { child, unit_name });
         Ok(())
     }
 
@@ -1053,11 +710,11 @@ impl SessionManager {
     /// Backing implementation for `BrokerRequest::ReadUserSessionConfig` —
     /// see its doc comment for why only the broker can do this (root reads
     /// past normal `700` home-directory permissions; `resolve_user` is the
-    /// same helper `spawn_via_pam`/`spawn_payload` already use). `Ok(None)`
+    /// same helper `spawn_payload`/`home_dir_for` already use). `Ok(None)`
     /// for a missing file is the expected, common case (most users won't
     /// have created one), not an error.
     pub async fn read_user_session_config(&self, username: &str) -> Result<Option<redfog_broker_protocol::UserSessionConfig>, String> {
-        let (_uid, _gid, home_dir) = resolve_user(username).await?;
+        let (_uid, _gid, home_dir, _shell) = resolve_user(username).await?;
         let path = std::path::Path::new(&home_dir).join(".config/redfog/session.toml");
         let contents = match tokio::fs::read_to_string(&path).await {
             Ok(contents) => contents,
@@ -1085,29 +742,31 @@ impl SessionManager {
                 // so a plain single-PID kill is already correct here.
                 let _ = child.kill().await;
             }
-            ActiveSession::Scoped { mut child, unit_name, user_scope } => {
-                // `pam_open_session` (via `pam_systemd.so`, in
-                // `spawn_via_pam`'s real case) registers a genuine logind
-                // session for the target user and migrates the calling
-                // process's *cgroup* into that session's own
+            ActiveSession::Scoped { mut child, unit_name } => {
+                // `pam_open_session` (via `pam_systemd.so`, when the
+                // spawned process opens a real PAM session) registers a
+                // genuine logind session for the target user and migrates
+                // the calling process's *cgroup* into that session's own
                 // `session-<id>.scope` — independently of, and escaping,
                 // whatever cgroup `systemd-run --scope` originally placed
                 // it in. Confirmed live: `loginctl session-status <id>`
                 // showed the *entire* spawned tree (kwin_wayland,
                 // plasmashell, portals, ...) under a fresh logind session,
-                // while the custom `redfog-pam-session-*.scope` unit this
-                // process was launched in had already been silently
-                // garbage-collected (nothing left in it to track) —
-                // killing that scope was a no-op, and `child.wait()`
-                // below then hung forever waiting for a process nothing
-                // had actually signaled. Check the *current* cgroup at
-                // kill time and prefer `loginctl kill-session` if a real
-                // logind session is what actually contains it now.
+                // while the custom scope unit this process was launched in
+                // had already been silently garbage-collected (nothing
+                // left in it to track) — killing that scope was a no-op,
+                // and `child.wait()` below then hung forever waiting for a
+                // process nothing had actually signaled. Check the
+                // *current* cgroup at kill time and prefer
+                // `loginctl kill-session` if a real logind session is what
+                // actually contains it now — defensive against this
+                // regardless of whether anything on this particular path
+                // currently opens a PAM session at all.
                 let pid = child.id();
                 let logind_session = pid.and_then(logind_session_id_for);
                 tracing::info!(
-                    "terminate({session_id}): tracked pid={pid:?}, unit={unit_name}.scope (user_scope={user_scope}), \
-                     current cgroup shows logind session={logind_session:?}"
+                    "terminate({session_id}): tracked pid={pid:?}, unit={unit_name}.scope, current cgroup shows logind \
+                     session={logind_session:?}"
                 );
                 if let Some(session_id) = &logind_session {
                     let result = run_loginctl(&["kill-session", session_id, "--signal=SIGKILL", "--kill-whom=all"]).await;
@@ -1119,17 +778,10 @@ impl SessionManager {
                     // process-group kill (an earlier fix attempt) isn't
                     // reliably enough on its own (a descendant calling
                     // `setsid()`/`setpgid()` escapes it; nothing escapes
-                    // a cgroup). `--user` must match how the scope was
-                    // *created* (`user_scope`) — querying the wrong
-                    // manager instance reports "not loaded" even though
-                    // the scope is very much alive in the other one
-                    // (confirmed: a real bug on an earlier attempt).
-                    let mut args = vec!["kill", "--kill-who=all", "--signal=SIGKILL"];
-                    if user_scope {
-                        args.insert(0, "--user");
-                    }
+                    // a cgroup). Always the *system* manager — nothing
+                    // registers one of these scopes with `--user` anymore.
                     let unit = format!("{unit_name}.scope");
-                    args.push(&unit);
+                    let args = vec!["kill", "--kill-who=all", "--signal=SIGKILL", &unit];
                     let result = run_systemctl(&args).await;
                     tracing::info!("terminate: systemctl {args:?} -> {result:?}");
                 }
@@ -1271,21 +923,17 @@ fn current_username() -> Result<String, String> {
     std::env::var("USER").map_err(|e| e.to_string())
 }
 
-/// Looks up `username`'s home directory via NSS (`getent passwd`), rather
-/// than assuming `/home/{username}` or relying on systemd's `%h` specifier
-/// — confirmed live that `%h` in a *system* unit's `WorkingDirectory=`
-/// resolves against the service manager's own context (root), not
-/// `User=`, landing new sessions in `/root` instead of the target user's
-/// actual home.
-async fn home_dir_for(username: &str) -> Result<String, String> {
-    Ok(resolve_user(username).await?.2)
-}
-
-/// Looks up `username`'s uid/gid/home directory via NSS (`getent passwd`) —
-/// used by `spawn_via_pam`'s direct `setuid`/`setgid` privilege drop, which
-/// (unlike `spawn_via_systemd`'s `User=` directive) has to resolve these
-/// itself rather than letting systemd do it.
-async fn resolve_user(username: &str) -> Result<(u32, u32, String), String> {
+/// Looks up `username`'s uid/gid/home directory/shell via NSS (`getent
+/// passwd`), rather than assuming `/home/{username}` or relying on
+/// systemd's `%h` specifier for the home directory — confirmed live that
+/// `%h` in a *system* unit's `WorkingDirectory=` resolves against the
+/// service manager's own context (root), not the target user, landing new
+/// sessions in `/root` instead of the target user's actual home. Used by
+/// `spawn_via_systemd` and `spawn_payload`. Note `redfog-session-init` (the
+/// actual privilege-dropping helper both of those exec into) does this
+/// same NSS lookup independently, itself, since it runs as a separate
+/// process with no access to this async fn.
+async fn resolve_user(username: &str) -> Result<(u32, u32, String, String), String> {
     let output = tokio::process::Command::new("getent")
         .args(["passwd", username])
         .output()
@@ -1296,7 +944,7 @@ async fn resolve_user(username: &str) -> Result<(u32, u32, String), String> {
     }
     let line = String::from_utf8_lossy(&output.stdout);
     let fields: Vec<&str> = line.trim().split(':').collect();
-    let (Some(uid), Some(gid), Some(home)) = (fields.get(2), fields.get(3), fields.get(5)) else {
+    let (Some(uid), Some(gid), Some(home), Some(shell)) = (fields.get(2), fields.get(3), fields.get(5), fields.get(6)) else {
         return Err(format!("could not parse getent passwd {username} output: {line:?}"));
     };
     if home.is_empty() {
@@ -1304,7 +952,7 @@ async fn resolve_user(username: &str) -> Result<(u32, u32, String), String> {
     }
     let uid: u32 = uid.parse().map_err(|e| format!("invalid uid in getent passwd {username} output: {e}"))?;
     let gid: u32 = gid.parse().map_err(|e| format!("invalid gid in getent passwd {username} output: {e}"))?;
-    Ok((uid, gid, home.to_string()))
+    Ok((uid, gid, home.to_string(), shell.to_string()))
 }
 
 /// `--exit-with-session` takes exactly *one* value, which KWin itself
@@ -1352,40 +1000,6 @@ fn write_session_script(runtime_dir: &str, socket_name: &str, pipewire_socket_pa
     Ok(session_script_path)
 }
 
-/// Dedicated PAM service name for `spawn_via_pam`'s session-only PAM
-/// interaction — deliberately *not* reusing "system-auth" (the real
-/// credential check already happened earlier, via a separate
-/// `pam::Client` in `auth.rs`, before `spawn_via_pam` is ever called) or
-/// `"systemd-user"` (that name is systemd's own, for its own internal use).
-/// `auth`/`account` are `pam_permit.so` (unconditionally succeed — no
-/// password to check here, this Client only exists to open a session), and
-/// `session` includes `pam_systemd.so` for real logind session
-/// registration. Modeled directly on `/etc/pam.d/sddm-greeter` (same
-/// "used only to open a session, not to authenticate" shape) and confirmed
-/// against how Chrome Remote Desktop's own `chrome-remote-desktop@.service`
-/// unit uses `PAMName=` for the same kind of purpose.
-const PAM_SESSION_SERVICE: &str = "redfog-session";
-
-/// Writes `/etc/pam.d/redfog-session` if it doesn't already exist. A
-/// one-time, static system config file (unlike the per-session systemd
-/// units this path replaces) — safe to check/create on every call.
-fn ensure_pam_session_service() -> Result<(), String> {
-    let path = format!("/etc/pam.d/{PAM_SESSION_SERVICE}");
-    if std::path::Path::new(&path).exists() {
-        return Ok(());
-    }
-    tracing::info!("creating {path} (one-time PAM service config for spawn_via_pam)");
-    std::fs::write(
-        &path,
-        "#%PAM-1.0\n\
-         auth        required    pam_permit.so\n\
-         account     required    pam_permit.so\n\
-         password    required    pam_deny.so\n\
-         session     required    pam_systemd.so\n",
-    )
-    .map_err(|e| format!("failed to write {path}: {e}"))
-}
-
 /// Locates the `redfog-session-init` helper binary alongside the broker's
 /// own executable (same workspace target dir) — an env var override exists
 /// for the same reason `REDFOG_KWIN_WAYLAND_PATH` does, for tests/non-standard
@@ -1401,6 +1015,210 @@ fn session_init_path() -> Result<PathBuf, String> {
 
 fn which_kwin_wayland() -> Option<String> {
     std::env::var("REDFOG_KWIN_WAYLAND_PATH").ok()
+}
+
+/// KWin's `--virtual` backend (what every redfog session spawns) has no
+/// GPU-selection logic in any released version: `findRenderDevice()`
+/// (`src/backends/virtual/virtual_backend.cpp`) just takes libdrm's first
+/// enumerated DRM device, with zero vendor/preference filtering. On a
+/// hybrid Intel+NVIDIA machine this can silently pick the iGPU instead of
+/// the GPU redfog's CUDA/NVENC/Vulkan-bridge encode path is built around —
+/// confirmed live on a GTX 1070 + iGPU test machine: OOM at 1080p, garbled
+/// video at 720p, both traced to the wrong physical GPU rendering KWin's
+/// own scene, not a redfog bug. Upstream's real fix (`KWIN_RENDER_NODES`
+/// env var, via a new `GpuManager` class) isn't in any released KWin
+/// version yet (landed 2026-07-09, after v6.7.3 was tagged).
+///
+/// Until that ships, this works around it unconditionally: every spawn
+/// hides `/dev/dri` down to a single, deliberately-chosen render node via
+/// `bwrap`, before KWin ever gets a chance to enumerate anything — the
+/// exact approach validated manually via
+/// `scripts/test-drm-device-sandboxing.sh` on the affected machine. Always
+/// narrowing to exactly one node, rather than only doing this on machines
+/// that look ambiguous, is deliberate: one code path, one rule, regardless
+/// of how many GPUs happen to be installed — a machine with a single GPU
+/// just narrows down to the only node that was ever there. Callers should
+/// prepend the returned argv to whatever they'd otherwise exec: `--bind /
+/// /` + `--dev-bind /dev /dev` mirror the entire real filesystem and device
+/// tree first (so nothing *else* about the session — `sudo`, process
+/// visibility, `/dev/input`, arbitrary paths — changes), `--tmpfs /dev/dri`
+/// then blanks out just that one directory, and the final `--dev-bind`
+/// re-adds only the node `select_gpu_render_node` chose. No namespace
+/// unsharing beyond the mount namespace `bwrap` always creates.
+///
+/// Returns `None` (skip sandboxing, behave exactly as before) only when
+/// there's truly nothing to narrow to (no `/dev/dri` render nodes at all —
+/// a machine with no GPU) or when `bwrap` itself isn't installed (logged,
+/// not fatal — see its own check below).
+fn gpu_sandbox_argv_prefix() -> Option<Vec<String>> {
+    let node = select_gpu_render_node()?;
+
+    let bwrap_available =
+        std::process::Command::new("bwrap").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+    if !bwrap_available {
+        tracing::warn!(
+            "would sandbox /dev/dri down to {node} for KWin, but `bwrap` isn't installed -- skipping (install bubblewrap to enable it; KWin will \
+             see every render node on this machine and may pick the wrong one)"
+        );
+        return None;
+    }
+
+    let extra = related_dri_nodes(&node);
+
+    let sibling_desc = match (&extra.card_node, extra.by_path_links.len()) {
+        (None, 0) => String::new(),
+        (Some(card), 0) => format!(" (plus {card})"),
+        (None, n) => format!(" (plus {n} by-path symlink(s))"),
+        (Some(card), n) => format!(" (plus {card} and {n} by-path symlink(s))"),
+    };
+    tracing::info!("sandboxing /dev/dri down to {node}{sibling_desc} for KWin");
+
+    let mut argv = vec![
+        "bwrap".to_string(),
+        "--bind".to_string(),
+        "/".to_string(),
+        "/".to_string(),
+        "--dev-bind".to_string(),
+        "/dev".to_string(),
+        "/dev".to_string(),
+        "--tmpfs".to_string(),
+        "/dev/dri".to_string(),
+        "--dev-bind".to_string(),
+        node.clone(),
+        node,
+    ];
+    if let Some(card_node) = extra.card_node {
+        argv.push("--dev-bind".to_string());
+        argv.push(card_node.clone());
+        argv.push(card_node);
+    }
+    if !extra.by_path_links.is_empty() {
+        argv.push("--dir".to_string());
+        argv.push("/dev/dri/by-path".to_string());
+        for (link_path, target) in extra.by_path_links {
+            argv.push("--symlink".to_string());
+            argv.push(target);
+            argv.push(link_path);
+        }
+    }
+    argv.push("--".to_string());
+    Some(argv)
+}
+
+/// Sibling device nodes for the same physical GPU as `render_node`, besides
+/// the render node itself: the "primary"/KMS node (`/dev/dri/cardN`) and any
+/// `/dev/dri/by-path/*` symlinks pointing at either one. `select_gpu_render_node`
+/// only ever needs the render node itself (confirmed against KWin's own
+/// `findRenderDevice()` — `src/backends/virtual/virtual_backend.cpp` — which
+/// never opens a primary/card node for a normal, non-`vgem` PCI device, since
+/// a headless `--virtual` backend never does real KMS/mode-setting), but
+/// nothing rules out some *other* part of the process tree (Xwayland, a
+/// future feature) wanting the sibling node or a by-path symlink for the
+/// exact same physical GPU we've already decided to expose — there's no
+/// isolation benefit to hiding those too (we're only trying to hide the
+/// *other* GPU), so include them rather than find out the hard way, the way
+/// `renderD129`'s sibling-Intel-node warning got found the hard way.
+struct RelatedDriNodes {
+    card_node: Option<String>,
+    by_path_links: Vec<(String, String)>, // (link path under /dev/dri/by-path, symlink target as originally stored)
+}
+
+fn related_dri_nodes(render_node: &str) -> RelatedDriNodes {
+    let render_name = render_node.rsplit('/').next().unwrap_or(render_node);
+
+    let card_node = std::fs::read_dir(format!("/sys/class/drm/{render_name}/device/drm"))
+        .ok()
+        .and_then(|entries| {
+            entries.flatten().find_map(|e| {
+                let name = e.file_name();
+                let name = name.to_str()?;
+                name.starts_with("card").then(|| format!("/dev/dri/{name}"))
+            })
+        });
+    let card_name = card_node.as_deref().map(|p| p.rsplit('/').next().unwrap_or(p).to_string());
+
+    let mut by_path_links = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/dev/dri/by-path") {
+        for entry in entries.flatten() {
+            let Ok(target) = std::fs::read_link(entry.path()) else { continue };
+            let target_name = target.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if target_name == render_name || Some(target_name) == card_name.as_deref() {
+                by_path_links.push((entry.path().to_string_lossy().into_owned(), target.to_string_lossy().into_owned()));
+            }
+        }
+    }
+
+    RelatedDriNodes { card_node, by_path_links }
+}
+
+/// Picks which `/dev/dri/renderD*` node KWin's `--virtual` backend should
+/// be allowed to see (see `gpu_sandbox_argv_prefix`'s doc comment for why
+/// this matters at all). Two sources, checked in order:
+///
+/// 1. `REDFOG_GPU_RENDER_NODES` — a colon-separated, priority-ordered list
+///    of render-node paths (e.g.
+///    `/dev/dri/renderD128:/dev/dri/renderD129`). The first entry that
+///    actually exists on this machine wins. Deliberately *not* "expose all
+///    of them" — bind order doesn't control which one KWin's own libdrm
+///    enumeration picks first (that's sysfs/PCI-topology order, outside our
+///    control), so exposing more than one wouldn't actually let this
+///    variable determine the outcome; narrowing to exactly one is the only
+///    way to make the choice deterministic. Render-node paths were picked
+///    over e.g. PCI bus IDs as the identifier here because they need no
+///    extra resolution step and this function's own `tracing::info!` (or
+///    `scripts/test-drm-device-sandboxing.sh`) already prints the
+///    vendor<->path mapping needed to fill this in.
+/// 2. Auto-detection: every render node's PCI vendor is read from
+///    `/sys/class/drm/<node>/device/vendor`, ranked NVIDIA > AMD > anything
+///    unrecognized > Intel (integrated graphics is the least-preferred
+///    fallback, not excluded outright — a machine with only an iGPU still
+///    needs *a* node picked), and the highest-ranked one wins (ties broken
+///    by path, for determinism). NVIDIA is ranked first because it's the
+///    only vendor redfog's CUDA/NVENC/Vulkan-bridge pipeline currently
+///    supports.
+///
+/// Returns `None` only when `/dev/dri` has no render nodes at all.
+fn select_gpu_render_node() -> Option<String> {
+    fn vendor_rank(vendor_hex: &str) -> u8 {
+        match vendor_hex {
+            "0x10de" => 0, // NVIDIA -- the only vendor redfog's encode pipeline currently supports
+            "0x1002" => 1, // AMD
+            "0x8086" => 3, // Intel -- deprioritized, but still picked if it's the only node present
+            _ => 2,        // unrecognized -- treat as a dedicated GPU until proven otherwise
+        }
+    }
+
+    let dri_entries = std::fs::read_dir("/dev/dri").ok()?;
+    let mut nodes: Vec<(String, String)> = Vec::new(); // (path, lowercased vendor hex, e.g. "0x10de")
+    for entry in dri_entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("renderD") {
+            continue;
+        }
+        let vendor = std::fs::read_to_string(format!("/sys/class/drm/{name}/device/vendor"))
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        nodes.push((format!("/dev/dri/{name}"), vendor));
+    }
+    if nodes.is_empty() {
+        return None;
+    }
+
+    if let Ok(configured) = std::env::var("REDFOG_GPU_RENDER_NODES") {
+        let priority: Vec<&str> = configured.split(':').filter(|s| !s.is_empty()).collect();
+        if let Some(chosen) = priority.iter().find(|candidate| nodes.iter().any(|(path, _)| path == *candidate)) {
+            return Some((*chosen).to_string());
+        }
+        tracing::warn!(
+            "REDFOG_GPU_RENDER_NODES={configured:?} set but none of those paths exist on this machine (found: {:?}) -- falling back to \
+             auto-detection",
+            nodes.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    nodes.sort_by(|(path_a, vendor_a), (path_b, vendor_b)| vendor_rank(vendor_a).cmp(&vendor_rank(vendor_b)).then_with(|| path_a.cmp(path_b)));
+    Some(nodes.into_iter().next().unwrap().0)
 }
 
 fn default_runtime_dir() -> String {

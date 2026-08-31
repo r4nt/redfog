@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 # Dumps the actual, live environment of the running kwin_wayland/plasmashell
-# processes (whichever session-spawn path is currently active), filtered to
-# the vars that matter for KSycoca app resolution (XDG_DATA_DIRS etc.).
+# processes, filtered to the vars that matter for KSycoca app resolution
+# (XDG_DATA_DIRS etc.).
 #
 # Run directly (no need to wrap in sudo yourself — it shells out to sudo
 # per-process, since /proc/<pid>/environ of another uid's process needs it):
 #
 #   bash scripts/dump-session-env.sh
-#
-# Run it once against the systemd path and once against the PAM path
-# (REDFOG_BROKER_PAM_SPAWN) and diff the two outputs.
 
 set -uo pipefail
 

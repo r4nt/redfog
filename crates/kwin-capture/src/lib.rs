@@ -5,6 +5,7 @@ use std::sync::{mpsc, Arc};
 
 pub mod cuda_import;
 pub mod egl_dmabuf;
+pub mod gbm_modifier_search;
 pub mod nvenc_session;
 pub mod pipewire_capture;
 pub mod vulkan_bridge;

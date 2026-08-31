@@ -330,7 +330,7 @@ impl PipewireCapture {
 
         for &(fourcc, spa_format) in FORMAT_MAP {
             let Some(info) = dmabuf_formats.iter().find(|f| f.drm_fourcc == fourcc) else { continue };
-            let modifiers: Vec<i64> = if prefer_linear {
+            let mut modifiers: Vec<i64> = if prefer_linear {
                 // Restrict to LINEAR only — skip this format entirely (fall
                 // through to the MemPtr fallback below) if the driver doesn't
                 // offer it as an alternative at all.
@@ -338,6 +338,20 @@ impl PipewireCapture {
             } else {
                 info.modifiers.clone()
             };
+            // NVIDIA's eglQueryDmaBufModifiersEXT (what `dmabuf_formats`
+            // came from) is known to sometimes never advertise a real,
+            // working tiled modifier at all, offering only LINEAR — which
+            // NVIDIA's own GBM backend can never actually allocate a
+            // renderable buffer with anyway (confirmed live, a general
+            // NVIDIA limitation, not GPU-specific — see
+            // gbm_modifier_search's own doc comment for the full story).
+            // If that's genuinely all the EGL query gave us, fall back to
+            // a live GBM-based search for one it forgot to mention.
+            if !prefer_linear && modifiers == [DRM_FORMAT_MOD_LINEAR] {
+                if let Some(tiled) = crate::gbm_modifier_search::find_working_tiled_modifier(fourcc, 1920, 1080) {
+                    modifiers.insert(0, tiled as i64);
+                }
+            }
             if modifiers.is_empty() {
                 continue;
             }

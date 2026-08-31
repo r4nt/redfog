@@ -58,6 +58,24 @@ against a real client).
 
 ## Known active gaps (pre-existing, not new)
 
+- [ ] `connection_integration.rs`'s `log_out_actually_kills_the_real_compositor_process`
+      and `real_pam_spawn_login_after_log_out_recovers_from_a_resume_hang`
+      are now testing dead code paths after `spawn_via_pam`/`spawn_fake_pam`
+      were removed (see "Recently fixed" below) — both still compile (the
+      env vars they set, `REDFOG_BROKER_FAKE_PAM_SPAWN`/
+      `REDFOG_BROKER_PAM_SPAWN`, are now no-op runtime strings, not
+      compile-time references) but no longer exercise what their names/doc
+      comments claim; the second one's own comment asserting
+      `REDFOG_BROKER_PAM_SPAWN=1` is "the *real* production spawn path" is
+      now confirmed false (`spawn_via_systemd` always was). The underlying
+      thing they protect against — orphaned `kwin_wayland` surviving
+      session end — is exactly the bug class this whole redfog-session-init
+      saga was about, so worth adapting to target `spawn_via_systemd`
+      properly (re-verify `find_broker_grandchild_kwin_wayland_pid`'s
+      process-tree-shape assumptions against the `bwrap`→
+      `redfog-session-init`→`dbus-run-session`→`kwin_wayland` chain) rather
+      than just deleting them — deferred until the live bwrap fix itself is
+      confirmed working end to end.
 - [ ] `connection_integration` test failures: `login_after_log_out_recovers_
       from_a_resume_hang`, `video_port_recovers_after_a_resume_hang`,
       `video_throttles_after_resume_under_input_driven_damage` all
@@ -136,6 +154,34 @@ against a real client).
       runs this. Not urgent for solo dev iteration.
 
 ## Recently fixed (2026-08-31, for context — not TODO items)
+
+- **NVIDIA screencast DMA-BUF negotiation always falling back to `MemPtr`/software
+  encoding on a GTX 1070** (2026-09-01) — root-caused all the way down, then fixed.
+  `eglQueryDmaBufModifiersEXT` (`egl_dmabuf.rs`) only ever reported
+  `DRM_FORMAT_MOD_LINEAR` for every format on this GPU — but confirmed live
+  (via a new standalone tool, `scripts/test-screencast-dmabuf-roundtrip.sh`,
+  that reproduces KWin's own `ScreenCastStream::testCreateDmaBuf` outside
+  KWin entirely) that NVIDIA's GBM backend can *never* actually allocate a
+  renderable buffer with the LINEAR modifier at all — a general NVIDIA
+  limitation, reproduced identically on a working RTX 2080, where it simply
+  doesn't matter because that GPU's driver *also* offers a real, working
+  tiled modifier as a second option. The GTX 1070 never got one, so KWin's
+  negotiation always failed, forcing `Software` encoding. A second tool
+  (`scripts/test-screencast-dmabuf-modifier-search.sh`) brute-forced
+  NVIDIA's undocumented block-linear modifier encoding
+  (`DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D` — the "page kind" field is
+  explicitly documented as GPU-model-internal, derived by the driver, no
+  public table) directly against the real hardware and found a genuinely
+  working tiled modifier on *both* GPUs (Turing: `g=2,s=1,k=6`; Pascal:
+  `g=0,s=1,k=254`) that the EGL query itself never advertised on either.
+  Now wired into the real pipeline: `kwin-capture/src/gbm_modifier_search.rs`
+  (new module, live GBM+EGL FFI, cached per format/resolution) runs this
+  search automatically whenever `query_dmabuf_formats` returns only
+  `LINEAR`, and `pipewire_capture.rs` includes whatever it finds in the
+  modifier list offered to KWin. Confirmed live on the real RTX 2080 (the
+  Rust port finds the same class of modifier the validated standalone C
+  tool did) — not yet confirmed against the real GTX 1070 session end to
+  end (only the standalone tools were run there so far).
 
 - **HEVC working end to end** (negotiation, Login-stage codec selection,
   and the real per-session NVENC encode path) — four independent,
@@ -227,6 +273,45 @@ against a real client).
   case its underlying leak/bug gets root-caused and the fast path is
   worth reinstating for its socket-leak-avoidance benefit — see the gap
   below) but nothing calls it from the live code path anymore.
+
+- **KWin's `--virtual` backend picking the wrong GPU on hybrid iGPU+NVIDIA
+  machines** — now worked around via a `bwrap` sandbox, applied
+  unconditionally on every spawn (`gpu_sandbox_argv_prefix` +
+  `select_gpu_render_node` in `redfog-broker/src/session.rs`, wired into
+  both `spawn_via_systemd` and `spawn_via_pam`). Root-caused on a GTX 1070 +
+  iGPU test machine (1080p OOM, garbled 720p video): KWin's
+  `findRenderDevice()` (`src/backends/virtual/virtual_backend.cpp`) has no
+  GPU-selection logic in any released version — it just takes libdrm's
+  first enumerated DRM device, sometimes the iGPU. Upstream's real fix
+  (`KWIN_RENDER_NODES` env var via a new `GpuManager` class) isn't in any
+  released KWin version yet (landed 2026-07-09, after v6.7.3 was tagged —
+  confirmed via `git tag --contains`/`git merge-base` against the local
+  KWin source checkout). Every spawn now hides `/dev/dri` down to exactly
+  one render node before KWin ever enumerates it — deliberately not
+  conditional on "does this machine look ambiguous": one code path
+  regardless of GPU count, via `--bind / /` + `--dev-bind /dev /dev`
+  (mirror everything) + `--tmpfs /dev/dri` + one `--dev-bind` for the
+  chosen node — no namespace unsharing beyond mount, so `sudo`/process
+  visibility/everything else stays normal. The node is chosen by
+  `select_gpu_render_node`: `REDFOG_GPU_RENDER_NODES` (colon-separated,
+  priority-ordered render-node paths, e.g.
+  `/dev/dri/renderD128:/dev/dri/renderD129` — first one that exists on this
+  machine wins) if set, else auto-detected by PCI vendor read from
+  `/sys/class/drm/<node>/device/vendor`, ranked NVIDIA > AMD > unrecognized
+  > Intel (falls through to Intel only if it's the sole node — an
+  iGPU-only machine still gets *a* node picked, not none). `spawn_via_pam`
+  runs `bwrap` as root (systemd-run's scope execs it directly);
+  `spawn_via_systemd` runs it as the already privilege-dropped target user,
+  relying on unprivileged user namespaces
+  (`kernel.unprivileged_userns_clone=1`, the Arch/CachyOS default — same
+  mechanism Flatpak's sandbox uses). `bubblewrap` is now a hard `depends` in
+  `packaging/arch/PKGBUILD` (not optional — every spawn goes through it);
+  code still degrades gracefully (logs a warning, skips sandboxing) if it's
+  missing at runtime rather than failing the spawn outright. Validated
+  manually via `scripts/test-drm-device-sandboxing.sh` on the affected
+  machine before wiring it into the real spawn paths; not yet re-confirmed
+  live with this wired-in version specifically (the manual bwrap invocation
+  it mirrors was confirmed working).
 
 ## Fixed 2026-07-18 (older, for context — not TODO items)
 

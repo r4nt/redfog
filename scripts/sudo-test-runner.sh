@@ -11,11 +11,6 @@
 #   touch /tmp/redfog-test-trigger
 # Then check /tmp/redfog-test-done (appears once the run finishes) and
 # /tmp/redfog-test-output.log for the result.
-#
-# REDFOG_BROKER_PAM_SPAWN: defaults to 1, using the direct fork/PAM/setuid
-# session path (crates/redfog-session-init) instead of generating systemd
-# units. Set to empty/0 in your own environment before invoking (sudo -E
-# preserves it) to test the systemd-unit path instead.
 
 set -uo pipefail
 
@@ -23,11 +18,10 @@ TRIGGER_FILE="/tmp/redfog-test-trigger"
 DONE_FILE="/tmp/redfog-test-done"
 LOG_FILE="/tmp/redfog-test-output.log"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REDFOG_BROKER_PAM_SPAWN="${REDFOG_BROKER_PAM_SPAWN-1}"
 
 : "${SUDO_USER:?must be run via sudo, not as a raw root login — the broker needs \$SUDO_USER to know which non-root user to target}"
 
-echo "redfog test runner started (SUDO_USER=$SUDO_USER, PAM_SPAWN=${REDFOG_BROKER_PAM_SPAWN:-<unset, systemd-unit path>})"
+echo "redfog test runner started (SUDO_USER=$SUDO_USER)"
 echo "  waiting for trigger: touch $TRIGGER_FILE"
 echo "  output logged to:    $LOG_FILE"
 echo "  done marker:         $DONE_FILE (removed when a run starts, created when it finishes)"
@@ -46,17 +40,15 @@ rm -f "$TRIGGER_FILE" "$DONE_FILE"
 # `run-tests.sh`'s old `--user` attempt, this never depended on logind/
 # lingering in the first place):
 #
-#   - REDFOG_BROKER_PAM_SPAWN=1 (this script's own default) and the
-#     systemd-unit path (REDFOG_BROKER_PAM_SPAWN=0) both spawn kwin_wayland
-#     wrapped in their *own*, separately-named `systemd-run --scope`
-#     (redfog-session-*) -- that scope is *not* nested under this one
-#     (systemd-run places a new scope under the default slice unless told
-#     otherwise, regardless of the caller's own cgroup) and doesn't die just
-#     because the broker that created it does; PDEATHSIG can't reach it,
-#     only an explicit `systemctl kill` can. The sweep after each run (and
-#     in the trap) handles that, independent of whether
-#     BrokerProcess::drop's own equivalent (Rust-side) ever got a chance to
-#     run.
+#   - The broker spawns kwin_wayland wrapped in its *own*, separately-named
+#     `systemd-run --scope` (redfog-session-*) -- that scope is *not* nested
+#     under this one (systemd-run places a new scope under the default
+#     slice unless told otherwise, regardless of the caller's own cgroup)
+#     and doesn't die just because the broker that created it does;
+#     PDEATHSIG can't reach it, only an explicit `systemctl kill` can. The
+#     sweep after each run (and in the trap) handles that, independent of
+#     whether BrokerProcess::drop's own equivalent (Rust-side) ever got a
+#     chance to run.
 #   - This script is a long-lived trigger loop, not a one-shot run: if *it*
 #     gets interrupted (Ctrl-C/SIGTERM) while a run is still in flight, the
 #     trap's explicit `systemctl stop` is what tears down that in-flight
@@ -84,7 +76,7 @@ while true; do
             echo "=== $(date -Iseconds): running test ==="
         } > "$LOG_FILE"
         CURRENT_TEST_UNIT="redfog-test-$$-$RANDOM"
-        (cd "$REPO_DIR" && REDFOG_DEBUG_PIPEWIRE_LOG=1 REDFOG_BROKER_PAM_SPAWN="$REDFOG_BROKER_PAM_SPAWN" \
+        (cd "$REPO_DIR" && REDFOG_DEBUG_PIPEWIRE_LOG=1 \
             systemd-run --scope --collect --unit="$CURRENT_TEST_UNIT" -- timeout 120 cargo test -p redfog-moonlight --test connection_integration -- --nocapture) >> "$LOG_FILE" 2>&1
         echo "EXIT_CODE: $?" >> "$LOG_FILE"
         cleanup_current_test_unit
