@@ -502,30 +502,81 @@ struct SelectedSession {
 struct EncodedFrameStats {
     window_start: Instant,
     frames: u32,
-    bytes: u64,
+    /// Raw encoder output — before packetization/FEC.
+    encoded_bytes: u64,
+    /// What actually goes on the wire — every shard's full on-wire size,
+    /// including FEC parity shards and the fixed-size zero-padding real
+    /// depacketizers require. Always `>= encoded_bytes`; the gap is video
+    /// FEC's real bandwidth cost (see `video.rs`'s `configured_fec_percentage`
+    /// doc comment) plus fixed per-shard header/padding overhead.
+    wire_bytes: u64,
 }
 
 impl EncodedFrameStats {
     const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
     fn new() -> Self {
-        Self { window_start: Instant::now(), frames: 0, bytes: 0 }
+        Self { window_start: Instant::now(), frames: 0, encoded_bytes: 0, wire_bytes: 0 }
     }
 
-    /// Returns `Some((fps, kbps))` once `REPORT_INTERVAL` has elapsed since
-    /// the window started, resetting it; `None` otherwise.
-    fn record(&mut self, frame_bytes: usize) -> Option<(f64, f64)> {
+    /// Returns `Some((fps, encoded_kbps, wire_kbps))` once `REPORT_INTERVAL`
+    /// has elapsed since the window started, resetting it; `None` otherwise.
+    fn record(&mut self, encoded_bytes: usize, wire_bytes: usize) -> Option<(f64, f64, f64)> {
         self.frames += 1;
-        self.bytes += frame_bytes as u64;
+        self.encoded_bytes += encoded_bytes as u64;
+        self.wire_bytes += wire_bytes as u64;
         let elapsed = self.window_start.elapsed();
         if elapsed < Self::REPORT_INTERVAL {
             return None;
         }
         let secs = elapsed.as_secs_f64();
         let fps = self.frames as f64 / secs;
-        let kbps = (self.bytes as f64 * 8.0 / 1000.0) / secs;
+        let encoded_kbps = (self.encoded_bytes as f64 * 8.0 / 1000.0) / secs;
+        let wire_kbps = (self.wire_bytes as f64 * 8.0 / 1000.0) / secs;
         *self = Self::new();
-        Some((fps, kbps))
+        Some((fps, encoded_kbps, wire_kbps))
+    }
+}
+
+/// Tracks end-to-end video latency — from `pipewiresrc`/`PipewireCapture`
+/// handing over a captured frame to that frame's packetized shards actually
+/// being handed to the UDP socket (encode + FEC + packetize + the async
+/// send itself) — over a rolling window, reporting avg/max at INFO on the
+/// same cadence as `EncodedFrameStats`. Separate struct/lock from
+/// `EncodedFrameStats`, not a shared one: recorded from inside the spawned
+/// send task (after `send_shards` actually completes), a different
+/// execution context than where `EncodedFrameStats::record` runs
+/// (synchronously, in the encoder callback, before the send is even
+/// spawned) — sharing one lock/window between the two would mean whichever
+/// context happens to finish last decides when the window resets, silently
+/// dropping or double-counting samples from the other.
+struct LatencyStats {
+    window_start: Instant,
+    count: u32,
+    sum: Duration,
+    max: Duration,
+}
+
+impl LatencyStats {
+    const REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self { window_start: Instant::now(), count: 0, sum: Duration::ZERO, max: Duration::ZERO }
+    }
+
+    /// Returns `Some((avg_ms, max_ms))` once `REPORT_INTERVAL` has elapsed
+    /// since the window started, resetting it; `None` otherwise.
+    fn record(&mut self, latency: Duration) -> Option<(f64, f64)> {
+        self.count += 1;
+        self.sum += latency;
+        self.max = self.max.max(latency);
+        if self.window_start.elapsed() < Self::REPORT_INTERVAL {
+            return None;
+        }
+        let avg_ms = self.sum.as_secs_f64() * 1000.0 / self.count as f64;
+        let max_ms = self.max.as_secs_f64() * 1000.0;
+        *self = Self::new();
+        Some((avg_ms, max_ms))
     }
 }
 
@@ -903,11 +954,13 @@ impl SessionManager {
         };
         let video_client_name = format!("redfog-video-gen-{generation}");
         let video_stats = Arc::new(Mutex::new(EncodedFrameStats::new()));
+        let video_latency_stats = Arc::new(Mutex::new(LatencyStats::new()));
         let on_video_access_unit = {
             let handle = handle.clone();
             let this = this.clone();
             let video_stats = video_stats.clone();
-            move |data: Vec<u8>, is_key_frame: bool| {
+            let video_latency_stats = video_latency_stats.clone();
+            move |data: Vec<u8>, is_key_frame: bool, capture_instant: std::time::Instant| {
                 tracing::debug!("video encoder produced {} bytes, key_frame={is_key_frame}", data.len());
                 // INFO-level (unlike the debug! line above) specifically for
                 // keyframes: this is what actually answers "did the client's
@@ -952,15 +1005,6 @@ impl SessionManager {
                     let Some(session) = session_by_generation(&shared, generation) else { return };
                     (session.origin.clone(), session.codec, session.origin.target_bitrate_kbps)
                 };
-                if let Some((fps, kbps)) = video_stats.lock().unwrap().record(data.len()) {
-                    // `kbps` here is *measured* actual output, not the
-                    // configured target — the two can legitimately diverge
-                    // (CBR padding, scene complexity) but should track each
-                    // other; a real mismatch is itself a useful signal.
-                    tracing::info!(
-                        "video: {fps:.1} fps, {kbps:.0} kbps, encoder={video_encoder:?}, codec={current_codec:?}, target_bitrate={current_bitrate_kbps}kbps (generation={generation})"
-                    );
-                }
                 let sender = this.video_sender.clone();
                 // RTP timestamps use a 90kHz clock (standard for video) —
                 // derived from wall-clock time since streaming started
@@ -969,7 +1013,22 @@ impl SessionManager {
                 let rtp_timestamp = (origin.stream_start.elapsed().as_secs_f64() * 90_000.0) as u32;
                 let shards = origin.video_packetizer.lock().unwrap().packetize(&data, is_key_frame, rtp_timestamp);
                 let shard_count = shards.len();
+                let wire_bytes: usize = shards.iter().map(|shard| shard.len()).sum();
+                if let Some((fps, encoded_kbps, wire_kbps)) = video_stats.lock().unwrap().record(data.len(), wire_bytes) {
+                    // `encoded_kbps` is *measured* raw encoder output, not the
+                    // configured target — the two can legitimately diverge
+                    // (CBR padding, scene complexity) but should track each
+                    // other; a real mismatch is itself a useful signal.
+                    // `wire_kbps` is what actually goes out over UDP,
+                    // including FEC parity shards and fixed-size shard
+                    // padding — the gap between the two is real FEC/framing
+                    // overhead, not measurement noise.
+                    tracing::info!(
+                        "video: {fps:.1} fps, {encoded_kbps:.0} kbps encoded / {wire_kbps:.0} kbps wire, encoder={video_encoder:?}, codec={current_codec:?}, target_bitrate={current_bitrate_kbps}kbps (generation={generation})"
+                    );
+                }
                 let ping_token = origin.ping_token;
+                let video_latency_stats = video_latency_stats.clone();
                 handle.spawn(async move {
                     // Bounded, not a bare `.await` — a task holding this
                     // `sender` clone forever (if `send_shards` itself never
@@ -984,6 +1043,14 @@ impl SessionManager {
                         Ok(Ok(())) => {
                             if is_key_frame {
                                 tracing::info!("video: sent keyframe ({shard_count} shards) for generation={generation}");
+                            }
+                            // End-to-end: capture_instant is when
+                            // pipewiresrc/PipewireCapture handed over this
+                            // frame; this is the moment its shards actually
+                            // left via UDP — the true end-to-end span, not
+                            // just encode time.
+                            if let Some((avg_ms, max_ms)) = video_latency_stats.lock().unwrap().record(capture_instant.elapsed()) {
+                                tracing::info!("video: latency avg={avg_ms:.1}ms max={max_ms:.1}ms (capture -> sent, generation={generation})");
                             }
                         }
                         Ok(Err(e)) => tracing::warn!("video send failed: {e}"),

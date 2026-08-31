@@ -1452,7 +1452,15 @@ pub fn make_encoder_pipeline<F>(
     on_access_unit: F,
 ) -> gst::Pipeline
 where
-    F: Fn(Vec<u8>, bool) + Send + Sync + 'static,
+    // Third argument: roughly when this access unit's frame was captured
+    // (captured at the top of the appsink callback below, right when the
+    // sample was pulled) -- lets the caller measure real end-to-end
+    // latency (capture -> encode -> packetize -> actually sent), not just
+    // encode time. Not the *true* pipewiresrc capture instant (that would
+    // need translating the buffer's own pipeline-clock PTS against wall
+    // time), but close: there's no queue element between source and
+    // appsink in these pipelines, so internal transit time is minimal.
+    F: Fn(Vec<u8>, bool, std::time::Instant) + Send + Sync + 'static,
 {
     let fps = fps_cap.unwrap_or(60);
     let full_desc = video_pipeline_description(&source, client_name, fps, &VideoSink::Encode { encoder, bitrate_kbps, codec });
@@ -1499,11 +1507,12 @@ where
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
+                let capture_instant = std::time::Instant::now();
                 let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                 let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                 let is_keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-                on_access_unit(map.to_vec(), is_keyframe);
+                on_access_unit(map.to_vec(), is_keyframe, capture_instant);
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
@@ -1571,7 +1580,7 @@ pub fn make_cuda_direct_encoder_session(
     source: VideoSource,
     bitrate_kbps: u32,
     codec: VideoCodec,
-    on_access_unit: impl Fn(Vec<u8>, bool) + Send + Sync + 'static,
+    on_access_unit: impl Fn(Vec<u8>, bool, std::time::Instant) + Send + Sync + 'static,
 ) -> CudaDirectEncoderSession {
     let VideoSource::KwinNativeDmaBuf { node_id, wayland_socket_path, width, height, fps } = source else {
         panic!("make_cuda_direct_encoder_session only supports VideoSource::KwinNativeDmaBuf");

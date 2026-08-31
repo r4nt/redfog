@@ -172,7 +172,11 @@ impl CudaDirectEncoderSession {
         fps: u32,
         bitrate_kbps: u32,
         codec: VideoCodec,
-        on_access_unit: impl Fn(Vec<u8>, bool) + Send + Sync + 'static,
+        // Third argument: when `capture.next_frame()` returned the frame
+        // this access unit was encoded from -- lets the caller measure real
+        // end-to-end latency (capture -> encode -> packetize -> actually
+        // sent), not just encode time.
+        on_access_unit: impl Fn(Vec<u8>, bool, std::time::Instant) + Send + Sync + 'static,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let force_keyframe = Arc::new(AtomicBool::new(false));
@@ -277,7 +281,7 @@ fn run(
     shutdown: &AtomicBool,
     force_keyframe: &AtomicBool,
     reconfig: &Mutex<Option<PendingReconfig>>,
-    on_access_unit: &(impl Fn(Vec<u8>, bool) + Send + Sync + 'static),
+    on_access_unit: &(impl Fn(Vec<u8>, bool, std::time::Instant) + Send + Sync + 'static),
 ) -> Result<(), String> {
     let capture = PipewireCapture::start(node_id, wayland_socket_path, false)
         .map_err(|e| format!("PipewireCapture::start: {e}"))?;
@@ -325,7 +329,7 @@ fn run_encoder(
     shutdown: &AtomicBool,
     force_keyframe: &AtomicBool,
     reconfig: &Mutex<Option<PendingReconfig>>,
-    on_access_unit: &(impl Fn(Vec<u8>, bool) + Send + Sync + 'static),
+    on_access_unit: &(impl Fn(Vec<u8>, bool, std::time::Instant) + Send + Sync + 'static),
 ) -> Result<EncoderOutcome, String> {
     let importer = CudaImporter::new().map_err(|e| format!("CudaImporter::new: {e:?}"))?;
     let use_array_import = importer.dma_buf_array_import_supported().unwrap_or(false);
@@ -419,6 +423,10 @@ fn run_encoder(
             std::thread::sleep(std::time::Duration::from_millis(1));
             continue;
         };
+        // Captured as early as possible after `next_frame()` returns — the
+        // "capture" end of the end-to-end (capture -> encode -> packetize
+        // -> actually sent) latency the caller measures.
+        let capture_instant = std::time::Instant::now();
         if !frame.is_dma_buf {
             unsafe { libc::close(frame.fd) };
             continue;
@@ -559,7 +567,7 @@ fn run_encoder(
         {
             let locked = bitstream.lock().map_err(|e| format!("bitstream lock: {e:?}"))?;
             let is_keyframe = locked.picture_type() == NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR;
-            on_access_unit(locked.data().to_vec(), is_keyframe);
+            on_access_unit(locked.data().to_vec(), is_keyframe, capture_instant);
         }
 
         frame_index += 1;

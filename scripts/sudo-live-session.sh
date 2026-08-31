@@ -186,6 +186,11 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
     # `fec_enabled` field doc comment. Set to isolate whether a client's
     # audio trouble comes from the FEC packets' sequence-number reuse.
     [ -n "${REDFOG_DISABLE_AUDIO_FEC:-}" ] && server_env+=("REDFOG_DISABLE_AUDIO_FEC=${REDFOG_DISABLE_AUDIO_FEC}")
+    # Tuning knob for video.rs's VideoPacketizer -- see
+    # `configured_fec_percentage`'s doc comment. Set to compare
+    # bitrate/CPU overhead at different FEC percentages live (0 disables
+    # video FEC entirely, for a zero-overhead baseline).
+    [ -n "${REDFOG_VIDEO_FEC_PERCENTAGE:-}" ] && server_env+=("REDFOG_VIDEO_FEC_PERCENTAGE=${REDFOG_VIDEO_FEC_PERCENTAGE}")
     [ -n "${REDFOG_DEBUG_GST_DEBUG:-}" ] && server_env+=("REDFOG_DEBUG_GST_DEBUG=${REDFOG_DEBUG_GST_DEBUG}")
     [ -n "${GST_TRACERS:-}" ] && server_env+=("GST_TRACERS=${GST_TRACERS}")
     [ -n "${GST_DEBUG:-}" ] && server_env+=("GST_DEBUG=${GST_DEBUG}")

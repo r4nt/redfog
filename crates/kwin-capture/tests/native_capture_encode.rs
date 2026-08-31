@@ -72,7 +72,7 @@ async fn native_capture_produces_encoded_h264() {
         None,
         5000,
         redfog_core::VideoCodec::H264,
-        move |data, is_keyframe| {
+        move |data, is_keyframe, _capture_instant| {
             let _ = tx.send((data, is_keyframe));
         },
     );

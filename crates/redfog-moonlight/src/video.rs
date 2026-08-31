@@ -3,13 +3,23 @@
 //! Moonlight's video wire format: each shard is `RTP header(12) ++
 //! padding(4) ++ NvVideoPacket header(16) ++ payload`, where the payload
 //! stream is logically `[8-byte VideoFrameHeader] ++ [H.264 Annex-B access
-//! unit]` split into fixed-size chunks. Real Sunshine/moonshine additionally
-//! wrap this in Reed-Solomon FEC parity shards and optional AES-GCM
-//! encryption; this iteration sends redundancy=0 (no parity shards) and no
-//! video encryption (matches moonshine's own conditionally-set
-//! `EncryptionFlags::Video` bit), which is a valid degenerate case of the
-//! same wire format, not a different one — a client that supports FEC at
-//! all supports 0 parity shards.
+//! unit]` split into fixed-size chunks. Every access unit is its own
+//! Reed-Solomon FEC block: its data shards (already fixed-size, since real
+//! depacketizers reject any packet whose length doesn't match the
+//! negotiated packet size) get `FEC_PERCENTAGE`-worth of parity shards
+//! appended (floored at `MIN_REQUIRED_FEC_PACKETS`, matching the value we
+//! already advertise in RTSP ANNOUNCE's SDP,
+//! `x-nv-vqos[0].fec.minRequiredFecPackets`) — unlike audio's FEC, this
+//! uses the *standard* Reed-Solomon matrix (`fec_rs::ReedSolomon::new` with
+//! no custom parity matrix), confirmed against moonlight-common-rust's own
+//! `create_video_reed_solomon`. No video encryption (matches moonshine's
+//! own conditionally-set `EncryptionFlags::Video` bit).
+//!
+//! Only ever generates a single FEC block per frame (no
+//! `VideoMultiFecBlocks` splitting for frames needing more than
+//! `MAX_SHARDS_PER_FEC_BLOCK` shards) — matches moonlight-common-rust's own
+//! reference payloader, which has the identical limitation (its own
+//! `generate_fec_block` doc comment: `// TODO: multi fec blocks?`).
 //!
 //! Layout derived from reading a known-working implementation's wire code
 //! (not vendored), see the plan doc for context.
@@ -34,6 +44,47 @@ const RTP_FLAG_CONTAINS_PIC_DATA: u8 = 0x1;
 const RTP_FLAG_END_OF_FRAME: u8 = 0x2;
 const RTP_FLAG_START_OF_FRAME: u8 = 0x4;
 
+/// Default target FEC overhead as a percentage of data shards — a plain
+/// server-side policy choice (real Sunshine's own default), not something
+/// the client negotiates. Overridable per-launch via
+/// `REDFOG_VIDEO_FEC_PERCENTAGE` (see `configured_fec_percentage`) for
+/// live bitrate/CPU-overhead experimentation — `0` disables video FEC
+/// entirely (bypassing `MIN_REQUIRED_FEC_PACKETS` too, for a true
+/// zero-overhead baseline to compare against). `MIN_REQUIRED_FEC_PACKETS`
+/// matches the value already advertised in RTSP ANNOUNCE's SDP
+/// (`x-nv-vqos[0].fec.minRequiredFecPackets:2`) — small/low-bitrate frames
+/// with too few data shards for the configured percentage alone to reach
+/// this floor get their `fec_percentage` recomputed upward to match,
+/// exactly like moonlight-common-rust's reference payloader.
+const DEFAULT_FEC_PERCENTAGE: usize = 20;
+const MIN_REQUIRED_FEC_PACKETS: usize = 2;
+
+/// Reads `REDFOG_VIDEO_FEC_PERCENTAGE` once (see `DEFAULT_FEC_PERCENTAGE`'s
+/// doc comment) — an absent, empty (see `sudo-live-session.sh`'s own env-
+/// passthrough note on why a *present but empty* value must be treated the
+/// same as unset), or unparseable value all fall back to the default
+/// rather than erroring, since this is a debugging/tuning knob, not a
+/// required setting.
+fn configured_fec_percentage() -> usize {
+    std::env::var("REDFOG_VIDEO_FEC_PERCENTAGE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_FEC_PERCENTAGE)
+}
+/// A single `VideoMultiFecBlocks` block can hold at most this many shards
+/// (data + parity together) — see `wolf`'s `fec.hpp`, referenced in
+/// moonlight-common-rust's own `packet.rs`.
+const MAX_SHARDS_PER_FEC_BLOCK: usize = 255;
+
+/// Packs `VideoFecInfo`'s three fields into the `fec_info` word — bit
+/// layout confirmed against moonlight-common-rust's `VideoFecInfo::
+/// serialize` (`packet.rs`): `data_shards_total` at bits 22..32,
+/// `shard_index` at bits 12..22, `fec_percentage` at bits 4..12.
+fn encode_fec_info(data_shards_total: u32, shard_index: u32, fec_percentage: u32) -> u32 {
+    (shard_index << 12) | (data_shards_total << 22) | (fec_percentage << 4)
+}
+
 /// Turns encoded H.264 access units into Moonlight-framed UDP shards.
 /// Pure/sync — the caller (an async task, or a sync GStreamer callback
 /// forwarding into a channel) decides how packets actually get sent.
@@ -46,6 +97,10 @@ pub struct VideoPacketizer {
     /// real bytes end to end (client received/ACKed them) but never
     /// displayed anything beyond (if that) the very first frame.
     frame_number: u32,
+    /// See `configured_fec_percentage`'s doc comment. Read once at
+    /// construction, not per-frame — this is a launch-time tuning knob, not
+    /// something that changes mid-session.
+    fec_percentage: usize,
 }
 
 impl Default for VideoPacketizer {
@@ -60,7 +115,7 @@ impl VideoPacketizer {
         // moonlight-common-rust's own `VideoPayloader` ("Frame Index Starts
         // at 1!"). 0 may be treated as a sentinel/invalid value by strict
         // depacketizers.
-        Self { sequence_number: 0, frame_number: 1 }
+        Self { sequence_number: 0, frame_number: 1, fec_percentage: configured_fec_percentage() }
     }
 
     /// The frame number that will be assigned to the *next* `packetize()`
@@ -95,7 +150,36 @@ impl VideoPacketizer {
         frame_header[4..8].copy_from_slice(&(last_shard_size as u32).to_le_bytes());
 
         let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size).max(1);
-        let mut packets = Vec::with_capacity(nr_data_shards);
+
+        // Real Sunshine/GFE policy: self.fec_percentage of data shards,
+        // floored at MIN_REQUIRED_FEC_PACKETS (recomputing the *advertised*
+        // percentage upward to match when the floor kicks in — real
+        // depacketizers trust this field, not a client-side recomputation,
+        // so it must reflect what was actually generated) — except an
+        // explicitly-configured 0 disables FEC entirely, bypassing the
+        // floor too, for a true zero-overhead baseline (see
+        // `configured_fec_percentage`'s doc comment). Otherwise capped so a
+        // single FEC block never exceeds MAX_SHARDS_PER_FEC_BLOCK total
+        // shards — see this module's doc comment for why frames needing
+        // more than that just get less redundancy rather than a second
+        // block.
+        let (mut nr_parity_shards, mut fec_percentage) = if self.fec_percentage == 0 {
+            (0, 0)
+        } else {
+            ((nr_data_shards * self.fec_percentage).div_ceil(100), self.fec_percentage)
+        };
+        if nr_parity_shards > 0 && nr_parity_shards < MIN_REQUIRED_FEC_PACKETS {
+            nr_parity_shards = MIN_REQUIRED_FEC_PACKETS;
+            fec_percentage = (100 * nr_parity_shards) / nr_data_shards;
+        }
+        nr_parity_shards = nr_parity_shards.min(MAX_SHARDS_PER_FEC_BLOCK.saturating_sub(nr_data_shards));
+
+        let mut packets = Vec::with_capacity(nr_data_shards + nr_parity_shards);
+        // Only populated when nr_parity_shards > 0 — the data shards'
+        // payload bytes, fed to Reed-Solomon as-is (already fixed-size and
+        // zero-padded, matching what real depacketizers reconstruct
+        // against).
+        let mut data_shard_payloads: Vec<Vec<u8>> = Vec::with_capacity(if nr_parity_shards > 0 { nr_data_shards } else { 0 });
 
         for shard_index in 0..nr_data_shards {
             let payload_start = shard_index * requested_shard_payload_size;
@@ -104,11 +188,11 @@ impl VideoPacketizer {
             // much real data the last shard actually holds — real
             // depacketizers (confirmed via moonlight-common-rust's
             // `VideoDepayloader::handle_packet`) reject any packet whose
-            // length doesn't match the negotiated packet size outright, and
-            // with 0 FEC redundancy a single dropped shard means the frame
-            // can never reconstruct. The last shard's short real length is
-            // instead communicated via `last_payload_len` in the frame
-            // header; the rest of its payload here stays zero-padded.
+            // length doesn't match the negotiated packet size outright.
+            // Necessary for FEC too: Reed-Solomon requires every shard in a
+            // block to be the same length. The last shard's short real
+            // length is instead communicated via `last_payload_len` in the
+            // frame header; the rest of its payload here stays zero-padded.
             let mut shard = vec![0u8; PAYLOAD_OFFSET + requested_shard_payload_size];
 
             write_rtp_header(&mut shard, self.sequence_number as u16, rtp_timestamp);
@@ -120,9 +204,7 @@ impl VideoPacketizer {
             if shard_index == nr_data_shards - 1 {
                 flags |= RTP_FLAG_END_OF_FRAME;
             }
-            // fec_info encodes (shard_index | nr_data_shards << 10 | fec_percentage << 20);
-            // with redundancy=0 the fec_percentage term is always 0.
-            let fec_info = (shard_index as u32) << 12 | (nr_data_shards as u32) << 22;
+            let fec_info = encode_fec_info(nr_data_shards as u32, shard_index as u32, fec_percentage as u32);
             write_nv_video_packet(
                 &mut shard[NV_PACKET_OFFSET..NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE],
                 self.sequence_number << 8,
@@ -140,7 +222,46 @@ impl VideoPacketizer {
             );
 
             self.sequence_number = self.sequence_number.wrapping_add(1);
+            if nr_parity_shards > 0 {
+                data_shard_payloads.push(shard[PAYLOAD_OFFSET..].to_vec());
+            }
             packets.push(shard);
+        }
+
+        if nr_parity_shards > 0 {
+            // Standard Reed-Solomon matrix — unlike audio's, no custom
+            // parity matrix needed here, confirmed against
+            // moonlight-common-rust's own `create_video_reed_solomon`.
+            let reed_solomon = fec_rs::ReedSolomon::new(nr_data_shards, nr_parity_shards)
+                .expect("nr_data_shards/nr_parity_shards are always > 0 and their sum is capped at MAX_SHARDS_PER_FEC_BLOCK");
+            let mut parity_payloads: Vec<Vec<u8>> = (0..nr_parity_shards).map(|_| vec![0u8; requested_shard_payload_size]).collect();
+            reed_solomon
+                .encode_sep(&data_shard_payloads, &mut parity_payloads)
+                .expect("uniform-length data shards, parity count matches ReedSolomon::new");
+
+            for (parity_index, parity_payload) in parity_payloads.into_iter().enumerate() {
+                let mut shard = vec![0u8; PAYLOAD_OFFSET + requested_shard_payload_size];
+
+                // FEC packets carry timestamp 0, not `rtp_timestamp` — matches
+                // moonlight-common-rust's reference payloader.
+                write_rtp_header(&mut shard, self.sequence_number as u16, 0);
+
+                let shard_index = nr_data_shards + parity_index;
+                // No START_OF_FRAME/END_OF_FRAME on FEC packets — matches the
+                // reference (`VideoHeaderFlags::CONTAINS_VIDEO_DATA` alone).
+                let fec_info = encode_fec_info(nr_data_shards as u32, shard_index as u32, fec_percentage as u32);
+                write_nv_video_packet(
+                    &mut shard[NV_PACKET_OFFSET..NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE],
+                    self.sequence_number << 8,
+                    frame_number,
+                    RTP_FLAG_CONTAINS_PIC_DATA,
+                    fec_info,
+                );
+                shard[PAYLOAD_OFFSET..].copy_from_slice(&parity_payload);
+
+                self.sequence_number = self.sequence_number.wrapping_add(1);
+                packets.push(shard);
+            }
         }
 
         packets
@@ -247,7 +368,9 @@ mod tests {
         let mut packetizer = VideoPacketizer::new();
         let encoded = vec![0xAB; 100]; // well under one shard's payload capacity
         let shards = packetizer.packetize(&encoded, true, 1000);
-        assert_eq!(shards.len(), 1);
+        // 1 data shard + MIN_REQUIRED_FEC_PACKETS parity shards (20% of 1 rounds
+        // down to 0, so the floor applies).
+        assert_eq!(shards.len(), 1 + MIN_REQUIRED_FEC_PACKETS);
 
         let shard = &shards[0];
         // Every shard is the same fixed size regardless of real payload length
@@ -259,15 +382,23 @@ mod tests {
 
         // frame_type byte inside the VideoFrameHeader (start of payload) should say "keyframe".
         assert_eq!(shard[PAYLOAD_OFFSET + 3], 2);
+
+        // FEC (parity) shards: CONTAINS_PIC_DATA only, no START/END-OF-FRAME.
+        for fec_shard in &shards[1..] {
+            let flags = fec_shard[NV_PACKET_OFFSET + 8];
+            assert_eq!(flags, RTP_FLAG_CONTAINS_PIC_DATA);
+        }
     }
 
     #[test]
     fn multi_shard_frame_splits_correctly_and_increments_sequence() {
         let mut packetizer = VideoPacketizer::new();
         let payload_capacity = REQUESTED_PACKET_SIZE - NV_VIDEO_PACKET_SIZE;
-        let encoded = vec![0xCD; payload_capacity * 2 + 10]; // spans 3 shards
+        let encoded = vec![0xCD; payload_capacity * 2 + 10]; // spans 3 data shards
         let shards = packetizer.packetize(&encoded, false, 2000);
-        assert_eq!(shards.len(), 3);
+        // 3 data shards + MIN_REQUIRED_FEC_PACKETS parity shards (20% of 3
+        // rounds up to 1, below the floor).
+        assert_eq!(shards.len(), 3 + MIN_REQUIRED_FEC_PACKETS);
 
         let flags = |i: usize| shards[i][NV_PACKET_OFFSET + 8];
         assert_eq!(flags(0) & RTP_FLAG_START_OF_FRAME, RTP_FLAG_START_OF_FRAME);
@@ -309,12 +440,37 @@ mod tests {
         let shards1 = packetizer.packetize(&[0u8; 10], true, 0);
         let shards2 = packetizer.packetize(&[0u8; 10], false, 0);
         let seq = |shards: &[Vec<u8>], i: usize| u16::from_be_bytes([shards[i][2], shards[i][3]]);
-        assert_eq!(seq(&shards2, 0), seq(&shards1, 0) + 1);
+        // shards1's own data + FEC shards all consume sequence numbers before
+        // shards2 starts.
+        assert_eq!(seq(&shards2, 0), seq(&shards1, 0) + shards1.len() as u16);
 
         let frame_index = |shards: &[Vec<u8>], i: usize| {
             u32::from_le_bytes(shards[i][NV_PACKET_OFFSET + 4..NV_PACKET_OFFSET + 8].try_into().unwrap())
         };
         assert_eq!(frame_index(&shards1, 0), 1);
         assert_eq!(frame_index(&shards2, 0), 2);
+    }
+
+    /// Drops a data shard and reconstructs it from the parity shards using
+    /// the *standard* Reed-Solomon matrix (unlike audio's, video needs no
+    /// custom parity matrix — see this module's doc comment) — proves the
+    /// generated parity shards are actually usable for recovery, not just
+    /// correctly shaped on the wire.
+    #[test]
+    fn fec_parity_shards_reconstruct_a_dropped_data_shard() {
+        let mut packetizer = VideoPacketizer::new();
+        let payload_capacity = REQUESTED_PACKET_SIZE - NV_VIDEO_PACKET_SIZE;
+        let encoded = vec![0xEFu8; payload_capacity * 2 + 10]; // 3 data shards
+        let shards = packetizer.packetize(&encoded, true, 5000);
+        let nr_data_shards = 3;
+        let nr_parity_shards = shards.len() - nr_data_shards;
+        assert_eq!(nr_parity_shards, MIN_REQUIRED_FEC_PACKETS);
+
+        let mut rs_shards: Vec<Option<Vec<u8>>> = shards.iter().map(|shard| Some(shard[PAYLOAD_OFFSET..].to_vec())).collect();
+        let dropped = rs_shards[1].take().expect("shard was present before dropping");
+
+        let reed_solomon = fec_rs::ReedSolomon::new(nr_data_shards, nr_parity_shards).expect("valid Reed-Solomon configuration");
+        reed_solomon.reconstruct_data(&mut rs_shards).expect("reconstruct dropped data shard from parity shards");
+        assert_eq!(rs_shards[1].as_deref(), Some(dropped.as_slice()));
     }
 }

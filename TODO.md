@@ -5,16 +5,13 @@ redfog, as of 2026-08-31 (after getting HEVC fully working end to end).
 Grounded in the current code, not just the original plan doc, which is
 stale in places (e.g. it didn't anticipate needing FEC).
 
-## Priority: network robustness (no video FEC)
+## Priority: network robustness
 
-Audio FEC is done (see "Recently fixed" below). Video
-(`redfog-moonlight/src/video.rs`) still sends `redundancy=0` — zero
-forward-error-correction, so a dropped video packet is a visible glitch
-until the next keyframe. Docker-bridge dev testing won't surface this
-(essentially lossless), but a real network (WiFi, LTE) will.
-
-- [ ] Implement FEC for video (`NV_VIDEO_PACKET` FEC header + parity
-      shards).
+Audio and video FEC are both implemented and confirmed live now (see
+"Recently fixed" below) — neither has specifically been tested against
+real induced packet loss yet (confirmed not to break anything with FEC
+active, not yet confirmed to actually recover a dropped shard end to end
+against a real client).
 
 ## Cross-repo: moonlight-web-stream (~/src/moonlight-web-stream)
 
@@ -182,9 +179,25 @@ until the next keyframe. Docker-bridge dev testing won't surface this
   Opus (`redfog-core`'s audio pipeline now sets `bitrate-type=cbr` —
   Reed-Solomon needs every shard in a group to be the same length, which
   the default constrained-VBR doesn't guarantee). Confirmed correct via a
-  round-trip reconstruction test and live against moonlight-qt with real
-  packet loss. Video FEC (`NV_VIDEO_PACKET` FEC header) is still
-  unimplemented.
+  round-trip reconstruction test, and confirmed live against moonlight-qt
+  (clean audio, no regressions) — not yet tested against real induced
+  packet loss specifically.
+
+- **Video FEC implemented** (`redfog-moonlight/src/video.rs`) — every
+  encoded access unit is its own Reed-Solomon FEC block: `FEC_PERCENTAGE`
+  (20%) of its data shards' worth of parity shards, floored at
+  `MIN_REQUIRED_FEC_PACKETS` (2, matching the value already advertised in
+  RTSP ANNOUNCE's SDP). Unlike audio, uses the *standard* Reed-Solomon
+  matrix (confirmed against moonlight-common-rust's own
+  `create_video_reed_solomon` — no custom parity matrix needed for
+  video). Single FEC block per frame only, same limitation
+  moonlight-common-rust's own reference payloader has (no
+  `VideoMultiFecBlocks` splitting for frames needing more than 255 total
+  shards). Confirmed correct via a Reed-Solomon reconstruction round-trip
+  test, and confirmed live — real playback verified working with FEC
+  active. Not yet specifically tested against real induced packet loss
+  (i.e. confirmed not to *break* anything, not yet confirmed to actually
+  *recover* a dropped shard end to end against a real client).
 
 - **`CudaDirectEncoderSession::reconfigure`'s same-resolution fast path
   disabled — was silently breaking moonlight-web-stream's HEVC decode on
