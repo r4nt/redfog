@@ -58,11 +58,23 @@ obviously than audio's hard stall.
       all. Not started; flagging for later, possibly as an actual
       contribution to that project rather than redfog itself.
 
+## By design (not a bug — noted here so it doesn't get re-flagged)
+
+- A User-stage session that just disconnects (network drop, client
+  closing the app) is *backgrounded*, not torn down — its compositor
+  keeps running in `Playing` state indefinitely so a reconnect is instant
+  instead of a slow respawn. `TerminateSession` only fires from an
+  explicit "Log Out" in the login UI (`SessionManager::handle_log_out`);
+  a reboot also ends it, obviously. Verified live: reconnecting
+  repeatedly as the same user reuses the exact same compositor process
+  every time (`handoff_to_user` looks it up in `background_sessions` by
+  username first) — it does not accumulate one per reconnect. What stays
+  alive is one compositor per real user account that's ever connected and
+  not explicitly logged out, which is the intended behavior (persistent
+  sessions, like a real desktop), not a leak.
+
 ## Known active gaps (pre-existing, not new)
 
-- [ ] `TerminateSession` is never called anywhere — abandoned sessions
-      (network drop, client crash) leak rather than getting cleanly torn
-      down. Real resource leak on long-running deployments.
 - [ ] `connection_integration` test failures: `login_after_log_out_recovers_
       from_a_resume_hang`, `video_port_recovers_after_a_resume_hang`,
       `video_throttles_after_resume_under_input_driven_damage` all
