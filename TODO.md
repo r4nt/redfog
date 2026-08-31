@@ -5,28 +5,14 @@ redfog, as of 2026-08-31 (after getting HEVC fully working end to end).
 Grounded in the current code, not just the original plan doc, which is
 stale in places (e.g. it didn't anticipate needing FEC).
 
-## Priority: network robustness (no FEC)
+## Priority: network robustness (no video FEC)
 
-Both audio (`redfog-moonlight/src/audio.rs`) and video
-(`redfog-moonlight/src/video.rs`) send `redundancy=0` — zero
-forward-error-correction. Confirmed live: audio has *zero* tolerance for
-packet loss with no FEC — a single dropped packet is a permanent,
-unrecoverable gap until the client's skip-logic kicks in, producing an
-audible stutter. This didn't show up during dev testing because the
-Docker bridge used for testing is essentially lossless, but the actual
-point of this project is streaming to a real device over a real network
-(WiFi, a phone on LTE, etc.), where loss is normal and expected.
+Audio FEC is done (see "Recently fixed" below). Video
+(`redfog-moonlight/src/video.rs`) still sends `redundancy=0` — zero
+forward-error-correction, so a dropped video packet is a visible glitch
+until the next keyframe. Docker-bridge dev testing won't surface this
+(essentially lossless), but a real network (WiFi, LTE) will.
 
-Without FEC, expect the same class of stutter to reappear the moment this
-is tested over anything less pristine than localhost/Docker — and it'll
-affect video too (visible glitches until the next keyframe), just less
-obviously than audio's hard stall.
-
-- [ ] Implement Reed-Solomon FEC for audio (4 data shards + N parity,
-      matching the shard layout the vendored client already expects — see
-      `fec_rs`/`create_audio_reed_solomon` in
-      `vendor/moonlight-common-rust/src/stream/proto/audio/depayloader.rs`,
-      not vendored into git, see `scripts/fetch-patched-deps.sh`).
 - [ ] Implement FEC for video (`NV_VIDEO_PACKET` FEC header + parity
       shards).
 
@@ -98,7 +84,24 @@ obviously than audio's hard stall.
       teardown chain (`RegisteredResource`/`ImportedLinear`/`MappedBuffer`/
       `ExternalMemory`/`BridgedImage` drop order) without finding the bug;
       needs either deeper live debugging or a GPU where the direct-import
-      path is actually exercised to compare against.
+      path is actually exercised to compare against. **Now believed to be
+      the same root cause as a worse, since-fixed symptom** — see
+      "Recently fixed" above: this exact fast path was also silently
+      breaking moonlight-web-stream's HEVC decode on every
+      same-resolution takeover/resume, bad enough that `session.rs` no
+      longer calls `reconfigure()` at all (always does a full rebuild
+      instead). One real, live-observed architectural detail worth
+      starting from if this gets picked up: `kwin-capture` links *two*
+      different versions of the `cudarc` crate simultaneously (`cudarc`
+      0.19 for `cuda_import.rs`'s `CudaImporter`, and `cudarc016` = 0.16
+      for the `CudaContext` `nvidia-video-codec-sdk` requires), both
+      believed to retain/release the *same* underlying CUDA primary
+      context for device 0 via refcounting — and both get torn down and
+      recreated together on every `reconfigure()` cycle, repeatedly, on
+      the same thread. A fresh spawn only ever exercises that pairing
+      once. Needs live GPU-level tooling (`cuda-gdb`, driver-level
+      context/refcount tracing) to actually confirm, not more static
+      reading — already tried once without success.
 
 ## Deliberate deferrals (documented, not bugs — just not built yet)
 
@@ -171,6 +174,46 @@ obviously than audio's hard stall.
   Confirmed live end to end with multiple real clients: resolution
   changes, bitrate reconnects, codec switching, and keyframe recovery all
   tested working.
+
+- **Audio FEC implemented** (`redfog-moonlight/src/audio.rs`) — groups
+  every 4 data packets into a Reed-Solomon block (2 parity shards, packet
+  type 127) using the exact non-default parity matrix real clients expect
+  (from moonlight-common-c's `RtpAudioQueue.c`). Requires constant-bitrate
+  Opus (`redfog-core`'s audio pipeline now sets `bitrate-type=cbr` —
+  Reed-Solomon needs every shard in a group to be the same length, which
+  the default constrained-VBR doesn't guarantee). Confirmed correct via a
+  round-trip reconstruction test and live against moonlight-qt with real
+  packet loss. Video FEC (`NV_VIDEO_PACKET` FEC header) is still
+  unimplemented.
+
+- **`CudaDirectEncoderSession::reconfigure`'s same-resolution fast path
+  disabled — was silently breaking moonlight-web-stream's HEVC decode on
+  every takeover/resume.** `reconcile_video_pipeline` (`session.rs`) now
+  always does a full pipeline rebuild (new capture connection, brand new
+  `CudaDirectEncoderSession`) on every takeover/resume, even when nothing
+  about width/height/fps/bitrate/codec changed at all — it no longer ever
+  calls `reconfigure()`. Root-caused live: a same-resolution
+  resume/takeover (the common case — reconnecting with identical or
+  bitrate-only-different settings) left moonlight-web-stream's client
+  permanently stuck waiting for an IDR frame that redfog-server had
+  actually already sent (confirmed via keyframe-production/-send logging
+  added specifically to check this — the server was demonstrably healthy,
+  producing and sending real keyframes throughout). moonlight-qt was
+  never affected by the same server-side behavior — ruling out a purely
+  client-side (moonlight-web-stream) bug, since a real bitstream defect
+  would affect any correctly-implemented decoder, not just one. Only
+  reproduces on the pre-Ampere Vulkan-bridge import path
+  (`vulkan_bridge.rs`'s detile-to-linear-buffer path, this dev machine's
+  Turing RTX 2080), and is very likely the *same* root cause as the
+  already-known `reconfigure_reuses_capture_connection` fd leak below —
+  changing only resolution (which always fully rebuilt already) or doing
+  a truly fresh spawn never showed the bug; same-resolution
+  `reconfigure()` reliably did. Confirmed fixed live: HEVC takeover now
+  works reliably against moonlight-web-stream after this change.
+  `CudaDirectEncoderSession::reconfigure` itself is unused now (kept, in
+  case its underlying leak/bug gets root-caused and the fast path is
+  worth reinstating for its socket-leak-avoidance benefit — see the gap
+  below) but nothing calls it from the live code path anymore.
 
 ## Fixed 2026-07-18 (older, for context — not TODO items)
 

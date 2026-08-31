@@ -909,6 +909,19 @@ impl SessionManager {
             let video_stats = video_stats.clone();
             move |data: Vec<u8>, is_key_frame: bool| {
                 tracing::debug!("video encoder produced {} bytes, key_frame={is_key_frame}", data.len());
+                // INFO-level (unlike the debug! line above) specifically for
+                // keyframes: this is what actually answers "did the client's
+                // IDR request get satisfied" without needing to bump the
+                // whole crate to debug logging (a lot more volume, one
+                // line/frame). Two log points, not one -- "encoder produced"
+                // here proves NVENC/GStreamer actually emitted IDR bytes;
+                // "sent keyframe" below (after `send_shards` returns Ok)
+                // proves those bytes were actually handed off to the UDP
+                // socket, not just produced and then dropped/timed out
+                // before reaching the wire.
+                if is_key_frame {
+                    tracing::info!("video encoder produced a keyframe ({} bytes) for generation={generation}", data.len());
+                }
                 // `origin` (packetizer/stream_start/etc) is looked up fresh
                 // from `shared` on every frame, not captured once at build
                 // time — a *resumed* background session's pipeline is
@@ -955,6 +968,7 @@ impl SessionManager {
                 // aren't encoded at a perfectly even interval.
                 let rtp_timestamp = (origin.stream_start.elapsed().as_secs_f64() * 90_000.0) as u32;
                 let shards = origin.video_packetizer.lock().unwrap().packetize(&data, is_key_frame, rtp_timestamp);
+                let shard_count = shards.len();
                 let ping_token = origin.ping_token;
                 handle.spawn(async move {
                     // Bounded, not a bare `.await` — a task holding this
@@ -967,7 +981,11 @@ impl SessionManager {
                     // see its doc comment), but a real, separate hardening:
                     // nothing here should ever be able to hang forever.
                     match tokio::time::timeout(Duration::from_secs(2), sender.send_shards(ping_token, &shards)).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            if is_key_frame {
+                                tracing::info!("video: sent keyframe ({shard_count} shards) for generation={generation}");
+                            }
+                        }
                         Ok(Err(e)) => tracing::warn!("video send failed: {e}"),
                         Err(_) => tracing::warn!("video send timed out after 2s — dropping this frame rather than holding its sender open forever"),
                     }
@@ -1105,31 +1123,37 @@ impl SessionManager {
             // to — confirmed live: audio played in silent-then-rushed-
             // garbled-burst cycles until this was fixed.
             let rtp_timestamp = origin.stream_start.elapsed().as_millis() as u32;
-            let opus_packet = origin.audio_packetizer.lock().unwrap().packetize_encrypted(&packet, rtp_timestamp, &key, key_id);
+            // 1 data packet, plus that group's 2 FEC packets on every 4th
+            // call — see `AudioPacketizer::packetize_encrypted`'s doc
+            // comment. Must all hit the wire in this exact order.
+            let opus_packets = origin.audio_packetizer.lock().unwrap().packetize_encrypted(&packet, rtp_timestamp, &key, key_id);
             // `block_on`, deliberately NOT `handle.spawn` (unlike the video
             // callback above): spawned tasks have no ordering guarantee
             // relative to each other once handed to tokio's scheduler, so
             // under any scheduling jitter two packets could hit the wire
             // out of the order they were captured in. The client's audio
-            // depayloader has zero tolerance for that — any packet arriving
-            // with a sequence number lower than one it's already seen gets
-            // dropped as permanently stale (no FEC to recover it, since we
-            // send redundancy=0), which stalls its jitter buffer until
-            // enough forward packets pile up to skip past the gap, then
-            // dumps them all at once. Confirmed live: the client logged
-            // exactly this ("Network dropped audio data (expected 990, but
-            // received 991)") and audio played in silent-then-rushed-burst
-            // cycles until sends were forced strictly in-order here.
+            // depayloader has zero tolerance for that — any data packet
+            // arriving with a sequence number lower than one it's already
+            // seen gets dropped as permanently stale, which stalls its
+            // jitter buffer until enough forward packets pile up to skip
+            // past the gap (or FEC recovers the gap, if within one group of
+            // 4), then dumps them all at once. Confirmed live (before FEC
+            // existed): the client logged exactly this ("Network dropped
+            // audio data (expected 990, but received 991)") and audio
+            // played in silent-then-rushed-burst cycles until sends were
+            // forced strictly in-order here.
             // GStreamer already calls `new_sample` serially on one thread
             // per pipeline, so blocking this thread on the send (bounded,
             // same as video's spawn-based timeout) is enough to guarantee
             // that ordering all the way onto the wire.
             let ping_token = origin.ping_token;
             handle.block_on(async move {
-                match tokio::time::timeout(Duration::from_secs(2), sender.send_packet(ping_token, &opus_packet)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::warn!("audio send failed: {e}"),
-                    Err(_) => tracing::warn!("audio send timed out after 2s — dropping this packet rather than holding its sender open forever"),
+                for opus_packet in &opus_packets {
+                    match tokio::time::timeout(Duration::from_secs(2), sender.send_packet(ping_token, opus_packet)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!("audio send failed: {e}"),
+                        Err(_) => tracing::warn!("audio send timed out after 2s — dropping this packet rather than holding its sender open forever"),
+                    }
                 }
             });
         });
@@ -1167,15 +1191,30 @@ impl SessionManager {
     /// comment) rather than this reconcile-on-takeover path, which only
     /// ever applies to an already-running session.
     ///
-    /// Two different outcomes depending on what actually changed: same
-    /// resolution (the common case — a bitrate/fps/codec-only difference)
-    /// reconfigures the existing `CudaDirectEncoderSession` in place via
-    /// `CudaDirectEncoderSession::reconfigure`, leaving its `PipewireCapture`
-    /// connection completely untouched; an actual resolution change still
-    /// resizes the compositor and rebuilds the whole video pipeline (a new
-    /// capture connection is unavoidable there). See `reconfigure`'s own
-    /// doc comment for why that split matters — it's a real leak fix, not
-    /// just an optimization.
+    /// Always does a full rebuild (new capture connection, brand new
+    /// `CudaDirectEncoderSession`) on every call — deliberately, even when
+    /// nothing about width/height/fps/bitrate/codec actually changed.
+    ///
+    /// This used to special-case same-resolution changes (the common case —
+    /// a bitrate/fps/codec-only difference) into a cheaper in-place
+    /// `CudaDirectEncoderSession::reconfigure` that reused the existing
+    /// `PipewireCapture` connection, to avoid a real socket leak a full
+    /// rebuild caused on every such reconnect (confirmed live via `ss -xp`:
+    /// a fresh D-Bus system-bus connection alongside the PipeWire one on
+    /// every rebuild, likely PipeWire/wireplumber doing DRM device
+    /// authorization via `logind` per stream connection). That optimization
+    /// is gone now: extensive live debugging (see conversation, and
+    /// TODO.md's still-open `reconfigure_reuses_capture_connection` fd-leak
+    /// item — same code path) found that same-resolution `reconfigure()`
+    /// specifically — not a fresh spawn, not a real resolution-change
+    /// rebuild — could leave a client's HEVC decoder permanently stuck
+    /// waiting for an IDR that never resolves, reproducible only on the
+    /// pre-Ampere Vulkan-bridge import path. A full rebuild was confirmed
+    /// live to reliably avoid it. The socket leak `reconfigure` was added
+    /// to fix is a real but lesser cost than an unrecoverable stuck
+    /// session — worth eventually fixing `reconfigure` properly (or the
+    /// leak underneath it) and reinstating the fast path, but not until
+    /// that's actually root-caused.
     ///
     /// Synchronous, not `async` — called via `spawn_blocking` from
     /// `handoff_to_user` since `SpawnedCompositor::resize` blocks (see its
@@ -1193,42 +1232,10 @@ impl SessionManager {
         if session.cuda_direct_session.is_none() {
             return session;
         }
-        if session.width == wanted_width
-            && session.height == wanted_height
-            && session.fps == wanted_fps
-            && session.codec == wanted_codec
-            && session.origin.target_bitrate_kbps == wanted_bitrate_kbps
-        {
-            return session;
-        }
         tracing::info!(
-            "handoff_to_user: negotiated params changed ({}x{}@{}fps {:?} {}kbps) -> ({wanted_width}x{wanted_height}@{wanted_fps}fps {wanted_codec:?} {wanted_bitrate_kbps}kbps)",
+            "handoff_to_user reconcile: rebuilding video pipeline unconditionally ({}x{}@{}fps {:?} {}kbps) -> ({wanted_width}x{wanted_height}@{wanted_fps}fps {wanted_codec:?} {wanted_bitrate_kbps}kbps)",
             session.width, session.height, session.fps, session.codec, session.origin.target_bitrate_kbps,
         );
-
-        // Same resolution: reconfigure the existing NVENC encoder in place
-        // instead of tearing down and rebuilding the whole video pipeline
-        // (which means a whole new `PipewireCapture`, i.e. a whole new
-        // PipeWire daemon connection). Confirmed live via `ss -xp` that
-        // rebuilding the capture connection on every bitrate-only change —
-        // the common case, e.g. a different client connecting with a
-        // different requested max bitrate — leaked a couple of sockets
-        // every single time (a fresh D-Bus system-bus connection alongside
-        // the PipeWire one, neither from anything in this crate's own EGL/
-        // Vulkan code, both already ruled out separately) — likely PipeWire
-        // itself or wireplumber doing DRM device authorization via `logind`
-        // on every new stream connection. A resolution change still needs a
-        // new capture connection regardless (the compositor's own output
-        // size changed), so only this fast path skips it.
-        if wanted_width == session.width && wanted_height == session.height {
-            if let Some(cuda_direct_session) = &session.cuda_direct_session {
-                cuda_direct_session.reconfigure(wanted_fps, wanted_bitrate_kbps, wanted_codec);
-            }
-            session.fps = wanted_fps;
-            session.codec = wanted_codec;
-            return session;
-        }
-        tracing::info!("handoff_to_user reconcile: resolution also changed, rebuilding the whole video pipeline (new capture connection unavoidable)");
 
         // Drop the *old* `CudaDirectEncoderSession` before building the new
         // one, not after (an earlier version of this code built first) —
@@ -1245,8 +1252,11 @@ impl SessionManager {
         session.cuda_direct_session = None;
         session.video_pipeline = gstreamer::Pipeline::new();
 
-        // Reaching here means width/height genuinely differ (the fast path
-        // above already returned otherwise), so this always applies.
+        // Called unconditionally now, even when width/height are unchanged
+        // — safe: `kwin-capture`'s own `set_output_mode` already
+        // short-circuits (`already_correct`) when the requested mode
+        // already matches, so a same-size call is a cheap no-op rather than
+        // a real hotplug/reconfiguration event.
         let resized = session.compositor.as_ref().is_some_and(|c| c.resize(wanted_width as i32, wanted_height as i32));
         tracing::info!(
             "handoff_to_user reconcile: resize to {wanted_width}x{wanted_height} {}",

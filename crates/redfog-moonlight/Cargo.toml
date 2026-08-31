@@ -62,6 +62,16 @@ serde_json = "1"
 
 tracing = "0.1"
 
+# BSD-2-Clause, real production dependency (unlike moonlight-common below,
+# GPL and dev-only) -- SIMD-accelerated Reed-Solomon erasure coding for
+# audio/video FEC parity shards. Same crate the vendored reference client
+# uses for reconstruction (see vendor/moonlight-common-rust/Cargo.toml),
+# used here on the encode side so both halves share the exact same GF(2^8)
+# arithmetic -- load-bearing, not just a convenience: real clients expect a
+# specific, non-default parity matrix (see audio.rs) that only produces
+# correct results if encoder and decoder agree on the underlying field.
+fec-rs = "0.1"
+
 [dev-dependencies]
 ureq = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -182,6 +182,10 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
     [ -n "${REDFOG_DEBUG_KWIN_LOGGING_RULES:-}" ] && broker_env+=("REDFOG_DEBUG_KWIN_LOGGING_RULES=${REDFOG_DEBUG_KWIN_LOGGING_RULES}")
     [ -n "${REDFOG_LIVE_SWAY:-}" ] && server_env+=("REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR=${PLUGIN_DIR}")
     [ -n "${REDFOG_VIDEO_ENCODER:-}" ] && server_env+=("REDFOG_VIDEO_ENCODER=${REDFOG_VIDEO_ENCODER}")
+    # Diagnostic toggle for audio.rs's AudioPacketizer -- see its
+    # `fec_enabled` field doc comment. Set to isolate whether a client's
+    # audio trouble comes from the FEC packets' sequence-number reuse.
+    [ -n "${REDFOG_DISABLE_AUDIO_FEC:-}" ] && server_env+=("REDFOG_DISABLE_AUDIO_FEC=${REDFOG_DISABLE_AUDIO_FEC}")
     [ -n "${REDFOG_DEBUG_GST_DEBUG:-}" ] && server_env+=("REDFOG_DEBUG_GST_DEBUG=${REDFOG_DEBUG_GST_DEBUG}")
     [ -n "${GST_TRACERS:-}" ] && server_env+=("GST_TRACERS=${GST_TRACERS}")
     [ -n "${GST_DEBUG:-}" ] && server_env+=("GST_DEBUG=${GST_DEBUG}")

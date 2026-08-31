@@ -1677,12 +1677,19 @@ impl Drop for AudioLoopback {
 /// silence, then a fast, garbled burst, on a perfectly regular cycle.
 /// Split out from `make_audio_pipeline` purely so this literal is
 /// unit-testable without needing a live PipeWire capture behind it.
+///
+/// `bitrate-type=cbr`: audio FEC (`AudioPacketizer` in redfog-moonlight)
+/// Reed-Solomon-encodes each group of 4 opus frames into 2 parity shards,
+/// which requires every shard in a group to be exactly the same length.
+/// `opusenc`'s default (`constrained-vbr`) varies each frame's encoded size
+/// with signal complexity, which would make the shards non-uniform. Real
+/// Sunshine/GFE encode CBR for the same reason.
 fn audio_pipeline_description(capture_name: &str, client_name: &str) -> String {
     format!(
         "pipewiresrc target-object={capture_name} client-name={client_name} do-timestamp=true \
          ! audioconvert ! audioresample \
          ! audio/x-raw,format=S16LE,channels=2,rate=48000 \
-         ! opusenc frame-size=5 \
+         ! opusenc frame-size=5 bitrate-type=cbr \
          ! appsink name=sink sync=false"
     )
 }
@@ -1731,6 +1738,14 @@ mod tests {
     fn audio_pipeline_requests_5ms_opus_frames() {
         let desc = audio_pipeline_description("some-capture-node", "some-client");
         assert!(desc.contains("opusenc frame-size=5"), "pipeline description: {desc}");
+    }
+
+    /// Guards the audio-FEC shard-uniformity requirement — see
+    /// `audio_pipeline_description`'s doc comment.
+    #[test]
+    fn audio_pipeline_uses_constant_bitrate_opus() {
+        let desc = audio_pipeline_description("some-capture-node", "some-client");
+        assert!(desc.contains("bitrate-type=cbr"), "pipeline description: {desc}");
     }
 
     /// Can't assert *which* encoder without depending on the test machine

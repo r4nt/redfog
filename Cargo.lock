@@ -4340,6 +4340,7 @@ dependencies = [
  "aes-gcm",
  "bytes",
  "cbc",
+ "fec-rs",
  "form_urlencoded",
  "gethostname 0.5.0",
  "gstreamer 0.21.3",
