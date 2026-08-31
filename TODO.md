@@ -1,9 +1,9 @@
 # TODO
 
 Audit of what's missing for a complete KDE/Plasma streaming session over
-redfog, as of 2026-07-18 (after the audio fixes in this session). Grounded
-in the current code, not just the original plan doc, which is stale in
-places (e.g. it didn't anticipate needing FEC).
+redfog, as of 2026-08-31 (after getting HEVC fully working end to end).
+Grounded in the current code, not just the original plan doc, which is
+stale in places (e.g. it didn't anticipate needing FEC).
 
 ## Priority: network robustness (no FEC)
 
@@ -76,14 +76,27 @@ obviously than audio's hard stall.
       expected to in a plain `cargo test` (needs a separately-built plugin
       dir most environments, including this one, don't have configured —
       normally excluded via `--skip` in real CI/local runs).
+- [ ] `CudaDirectEncoderSession::reconfigure`'s same-resolution fast path
+      (`reconfigure_reuses_capture_connection` in
+      `kwin-capture/tests/nvenc_reconfigure_reuses_capture.rs`, still
+      `#[ignore]`d) leaks a few `/dmabuf:` fds per call — only on
+      pre-Ampere GPUs, where frame import goes through
+      `vulkan_bridge.rs`'s detile-to-linear-buffer
+      path instead of a direct CUDA array import. Read through the whole
+      teardown chain (`RegisteredResource`/`ImportedLinear`/`MappedBuffer`/
+      `ExternalMemory`/`BridgedImage` drop order) without finding the bug;
+      needs either deeper live debugging or a GPU where the direct-import
+      path is actually exercised to compare against.
 
 ## Deliberate deferrals (documented, not bugs — just not built yet)
 
 - [ ] Gamepad/controller input. `control.rs` decodes keyboard + mouse
       only; every other input event type (including all gamepad packets)
       hits `_ => None` and is silently dropped.
-- [ ] HDR, AV1. `<IsHdrSupported>0</IsHdrSupported>` is hardcoded; video
-      is H.264 only.
+- [ ] HDR, AV1. `<IsHdrSupported>0</IsHdrSupported>` is hardcoded. Video
+      itself now does both H.264 and HEVC (see "recently fixed" below) —
+      AV1 isn't implemented, and testing it needs Ada Lovelace+ hardware
+      (the first NVIDIA generation with AV1 encode support).
 - [ ] HiDPI passthrough. KWin's virtual output is spawned with
       `--scale 1` hardcoded; never scales.
 - [ ] Live resolution/fps *re*negotiation (i.e. changing it mid-session,
@@ -110,11 +123,48 @@ obviously than audio's hard stall.
       `session_presets` TOML precedent) before anyone but the maintainer
       runs this. Not urgent for solo dev iteration.
 
-## Recently fixed (this session, for context — not TODO items)
+## Recently fixed (2026-08-31, for context — not TODO items)
+
+- **HEVC working end to end** (negotiation, Login-stage codec selection,
+  and the real per-session NVENC encode path) — four independent,
+  compounding bugs, each masking the next:
+  1. Real clients (moonlight-qt, moonlight-web-stream) never offered HEVC
+     in RTSP ANNOUNCE at all, regardless of `/serverinfo`'s
+     `ServerCodecModeSupport` bit. Root cause: real clients (confirmed
+     against actual moonlight-common-c and Sunshine source) gate HEVC
+     eligibility on finding the literal string
+     `sprop-parameter-sets=AAAAAU` in the RTSP DESCRIBE response — a
+     signal completely separate from `/serverinfo` that redfog never
+     sent. `rtsp.rs`'s `sdp()` now includes it.
+  2. The Login stage's video pipeline was built and started playing
+     *before* RTSP ANNOUNCE ever revealed the negotiated codec, always
+     defaulting to H.264 regardless of what the client's decoder had
+     already committed to. Fixed by deferring the Login pipeline's real
+     construction from `/launch` time to right before RTSP PLAY, which
+     always comes after ANNOUNCE for every client (`session.rs`'s
+     `start_streaming`).
+  3. GStreamer's `x265enc` (Login stage's software HEVC encoder) only
+     emits VPS/SPS/PPS once, at stream start — every keyframe after the
+     first arrived with no parameter sets, undecodable. Fixed with
+     `h265parse config-interval=-1`.
+  4. The real per-session NVENC path (`CudaDirectEncoderSession`) crashed
+     `encode_picture` on the second HEVC frame. Root cause:
+     `NV_ENC_PIC_PARAMS_HEVC::displayPOCSyntax` ("required to be set if
+     client is handling the picture type decision") and `refPicFlag` were
+     left zeroed on every frame — NVENC was very likely failing a POC
+     monotonicity check on the first manually-typed P-frame. Fixed with a
+     per-session POC counter, which also kept `request_keyframe()` (needed
+     for packet-loss recovery) working in place for HEVC exactly like it
+     already did for H.264 — no encoder rebuild, ~17ms.
+  Confirmed live end to end with multiple real clients: resolution
+  changes, bitrate reconnects, codec switching, and keyframe recovery all
+  tested working.
+
+## Fixed 2026-07-18 (older, for context — not TODO items)
 
 - **CPU usage during high-fps/high-bitrate NVENC streaming: 34% → ~10% of
   a core.** Root-caused via non-invasive per-thread `/proc/<pid>/task/*/stat`
-  sampling (no `perf` on this machine; avoids `gdb`/`perf record`'s
+  sampling (no `perf` available; avoids `gdb`/`perf record`'s
   pause-the-target problem) at 1920x1080@120fps, ~37Mbps, against a live
   session with continuous full-frame damage (`glxgears`):
   1. Nearly all CPU was on `pipewiresrc`'s own streaming thread — because
