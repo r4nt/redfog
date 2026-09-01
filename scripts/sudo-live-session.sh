@@ -38,19 +38,86 @@
 #                                without this, only the KDE Plasma/KWin
 #                                session-picker entry actually works.
 #
-#   REDFOG_LIVE_NSYS=1          runs redfog-server itself under `nsys profile`
-#                                (NVIDIA Nsight Systems -- must already be on
-#                                PATH, not installed by this script). Report
-#                                written to /tmp/redfog-live-nsys/redfog-server-
-#                                <timestamp>.nsys-rep; open with `nsys-ui` or
-#                                `nsys stats` afterward. In package-parity
-#                                mode this works by overriding redfog-server.
-#                                service's ExecStart= via the same ephemeral
-#                                drop-in the debug env vars already use (torn
-#                                down on exit, same as those). CPU-sampling
-#                                backtraces inside the report may still come
-#                                back empty depending on this machine's
-#                                perf_event_paranoid.
+#   REDFOG_LIVE_STANDALONE=1    forces standalone (both processes as root) mode
+#                                even when redfog-git is installed -- package-
+#                                parity mode is chosen purely by whether the
+#                                package is *installed* (binaries + unit files
+#                                present), not whether its service happens to
+#                                be running at invocation time, so stopping
+#                                redfog-server.service yourself first has no
+#                                effect on which mode this script picks. Not
+#                                needed for REDFOG_LIVE_NSYS specifically (see
+#                                below) -- kept only as a general escape hatch
+#                                for other cases wanting a from-scratch root
+#                                run without uninstalling the package.
+#
+#   REDFOG_LIVE_NSYS=1          launches redfog-server itself under `nsys
+#                                launch` (NVIDIA Nsight Systems -- must already
+#                                be on PATH, not installed by this script),
+#                                ready to be profiled but *not yet collecting
+#                                data* -- injection/instrumentation overhead is
+#                                paid at launch either way, but actual
+#                                recording only happens between separate `nsys
+#                                start`/`nsys stop` commands you run yourself
+#                                from another terminal once redfog is up:
+#
+#                                  sudo nsys start --session=redfog-live --sample=process-tree \
+#                                    --force-overwrite=true -o /tmp/redfog-live-nsys/redfog-server-$(date +%s)
+#                                  ...drive whatever real workload you want to
+#                                  capture (log in, get into the real KWin/
+#                                  User desktop, interact)...
+#                                  sudo nsys stop --session=redfog-live --keep=30
+#
+#                                `sudo`, not run as yourself: `nsys launch`
+#                                always runs as a more privileged identity
+#                                than you (root in standalone mode, the
+#                                unprivileged-but-different-from-you 'redfog'
+#                                system user in package-parity mode) --
+#                                confirmed live that targeting a session you
+#                                can't reach fails *completely silently* (exit
+#                                0, no output, nothing happens), easy to miss
+#                                without checking for a report afterward.
+#
+#                                `--keep=<seconds>` on `stop` discards
+#                                everything older than that, so even if you
+#                                `start` right away, keeping e.g. 30s at `stop`
+#                                time cleanly excludes the Login stage's own
+#                                brief encode burst (~3s, always software
+#                                x265 -- see VideoEncoder::Software's forced
+#                                use for SessionType::Login in session.rs,
+#                                unrelated to whatever's actually being
+#                                investigated in the real User-stage session)
+#                                as long as you've been in the real desktop
+#                                longer than that. Report lands wherever `-o`
+#                                on `start` pointed; `nsys sessions list` shows
+#                                any sessions still open if you lose track.
+#
+#                                Works entirely within package-parity mode's
+#                                normal privilege model (the real, unprivileged
+#                                'redfog' system user) -- no root/--run-as=
+#                                dance needed at all, unlike an older
+#                                REDFOG_LIVE_NSYS design here that wrapped the
+#                                whole session in `nsys profile` from launch to
+#                                Ctrl-C (confirmed live: nsys, launched via
+#                                `sudo`, silently drops its *target* back to
+#                                the pre-sudo user by default even though nsys
+#                                itself keeps root -- broke every filesystem
+#                                operation redfog-server's startup does, fixed
+#                                at the time with `--run-as=root`, now moot
+#                                since `nsys launch` here is invoked directly
+#                                by systemd's `User=redfog`, never through
+#                                `sudo` at all). Works by overriding
+#                                redfog-server.service's ExecStart= via the
+#                                same ephemeral drop-in the debug env vars
+#                                already use (torn down on exit, same as
+#                                those). CPU-sampling backtraces inside the
+#                                report may still come back empty depending on
+#                                this machine's kernel.perf_event_paranoid --
+#                                that's about the unprivileged 'redfog' user
+#                                specifically needing root/CAP_PERFMON for
+#                                sampling when perf_event_paranoid is at its
+#                                most restrictive (2), separate from the
+#                                dropped-privilege issue above.
 #
 #                                Trace scope is explicitly `cuda,vulkan,osrt,
 #                                nvtx` -- NOT nsys's own default
@@ -156,6 +223,7 @@ if [ -z "${REDFOG_LIVE_SCOPED:-}" ]; then
         --setenv="SUDO_USER=$SUDO_USER" \
         --setenv="PATH=$PATH" \
         --setenv="REDFOG_LIVE_SWAY=${REDFOG_LIVE_SWAY:-}" \
+        --setenv="REDFOG_LIVE_STANDALONE=${REDFOG_LIVE_STANDALONE:-}" \
         --setenv="REDFOG_LIVE_NSYS=${REDFOG_LIVE_NSYS:-}" \
         --setenv="GST_TRACERS=${GST_TRACERS:-}" \
         --setenv="GST_DEBUG=${GST_DEBUG:-}" \
@@ -177,7 +245,13 @@ fi
 ip=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.' | head -1)
 
 # Shared between both modes below -- see REDFOG_LIVE_NSYS's header comment.
-nsys_out=""
+# `nsys_session` (vs "") below marks that redfog-server was launched under
+# `nsys launch`, ready for you to `nsys start`/`nsys stop` yourself once
+# it's up -- `nsys_start_cmd`/`nsys_stop_cmd` are printed verbatim once the
+# server's ready (below), computed here so both modes share one spot.
+nsys_session=""
+nsys_start_cmd=""
+nsys_stop_cmd=""
 if [ -n "${REDFOG_LIVE_NSYS:-}" ]; then
     if ! command -v nsys >/dev/null 2>&1; then
         echo "error: REDFOG_LIVE_NSYS is set but 'nsys' (NVIDIA Nsight Systems) isn't on PATH." >&2
@@ -185,11 +259,35 @@ if [ -n "${REDFOG_LIVE_NSYS:-}" ]; then
     fi
     nsys_dir="/tmp/redfog-live-nsys"
     mkdir -p "$nsys_dir"
+    nsys_session="redfog-live"
     nsys_out="$nsys_dir/redfog-server-$(date +%s)"
+    # sudo, not run as yourself: `nsys launch` here always runs as a more
+    # privileged identity than you (root in standalone mode, the
+    # unprivileged-but-*different*-from-you 'redfog' system user in
+    # package-parity mode) -- confirmed live that `nsys start`/`nsys stop`
+    # targeting a session they can't reach fails *completely silently*
+    # (exit 0, no output at all, nothing happens) rather than erroring, so
+    # this is easy to not notice at all without checking for a report
+    # afterward. `nsys`'s own session-coordination state under
+    # /tmp/nvidia/nsight_systems/ is deliberately world-writable (built for
+    # cross-user coordination), so this isn't a raw filesystem permission
+    # wall -- more likely an ownership check inside nsys's own session
+    # protocol, which root should be able to cross regardless.
+    # --sample=process-tree: NOT on by default here the way it is for
+    # `nsys profile`/`nsys launch` -- confirmed via `nsys start --help`,
+    # `--sample=`'s "defaults to process-tree" rule is conditioned on *this
+    # command* launching the target, which `start` never does (that already
+    # happened via `nsys launch`); its own default is `none`. Without this,
+    # confirmed live: a real capture came back with zero CPU IP-sampling
+    # data at all (no COMPOSITE_EVENTS/SAMPLING_CALLCHAINS tables), even
+    # though everything else (API/OS-runtime tracing) worked fine.
+    nsys_start_cmd="sudo nsys start --session=${nsys_session} --sample=process-tree --force-overwrite=true -o ${nsys_out}"
+    nsys_stop_cmd="sudo nsys stop --session=${nsys_session} --keep=30"
 fi
 
 # ── Package-parity mode ──────────────────────────────────────────────────
-if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
+if [ -z "${REDFOG_LIVE_STANDALONE:-}" ] \
+    && [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
     && [ -e /usr/lib/systemd/system/redfog-server.service ] \
     && [ -e /usr/lib/systemd/system/redfog-broker.service ]; then
     echo "redfog-git package detected — testing via the real installed systemd units (package-parity mode)."
@@ -254,12 +352,18 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
     write_dropin redfog-broker.service "${broker_env[@]}"
     write_dropin redfog-server.service "${server_env[@]}"
 
-    if [ -n "$nsys_out" ]; then
+    if [ -n "$nsys_session" ]; then
         # redfog-server.service runs as the unprivileged 'redfog' system
         # user (User=/Group=redfog) -- it needs write access to the report
         # directory itself, not just this root setup phase.
         chown redfog:redfog "$nsys_dir"
-        echo "profiling redfog-server under nsys -- report will be written to ${nsys_out}.nsys-rep"
+        echo ""
+        echo "redfog-server launched under nsys (session '$nsys_session'), not yet collecting."
+        echo "Once redfog is up below, start/stop profiling yourself with:"
+        echo "  $nsys_start_cmd"
+        echo "  ...drive whatever real workload you want to capture..."
+        echo "  $nsys_stop_cmd"
+        echo ""
         # Empty `ExecStart=` clears the unit's own directive first (systemd
         # drop-in convention for replacing, not appending to, a single-value
         # key) before setting the wrapped one -- appended to the same file
@@ -267,32 +371,15 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
         # section), so the existing cleanup() below removing that file
         # tears this override down too, nothing extra to add there.
         #
-        # KillSignal=SIGINT (overriding systemd's own SIGTERM default):
-        # confirmed via `nsys profile --help` -- nsys only runs its own
-        # graceful stop-and-export-the-report path on SIGINT to itself; a
-        # bare SIGTERM has no such documented behavior, and `--kill`
-        # (default sigterm) is a *separate* knob for what nsys forwards to
-        # the target app once its own session is already ending, not what
-        # stops nsys itself. `systemctl stop` (cleanup()'s own call, below)
-        # sends whatever KillSignal= says and blocks until the unit is
-        # fully gone, so this is enough to get a real report on Ctrl-C --
-        # no extra wait needed.
-        #
-        # KillMode=process (overriding systemd's own control-group
-        # default): confirmed live -- the default sends the kill signal to
-        # *every* process in the unit's cgroup simultaneously, which killed
-        # nsys's traced redfog-server child (no signal handler of its own,
-        # so SIGINT terminates it immediately) at the same instant nsys
-        # itself got SIGINT, racing nsys's own orderly shutdown and
-        # producing "Connection to Agent lost ... End of file" with no
-        # report written at all. `process` targets only the main PID (nsys)
-        # -- nsys then kills its own child in its own time, via its own
-        # `--kill` (default sigterm), after finishing the report export.
+        # `nsys launch`, not `nsys profile`: report finalization now happens
+        # via an explicit `nsys stop` you run yourself (see header comment),
+        # completely decoupled from this process's own lifecycle -- unlike
+        # the old `nsys profile`-wraps-everything design, there's no signal
+        # timing to get right here any more, so this needs none of that
+        # design's KillSignal=/KillMode= overrides.
         {
             echo "ExecStart="
-            echo "ExecStart=/usr/bin/nsys profile --trace=cuda,vulkan,osrt,nvtx -o ${nsys_out} --force-overwrite=true -- /usr/bin/redfog-server"
-            echo "KillSignal=SIGINT"
-            echo "KillMode=process"
+            echo "ExecStart=/usr/bin/nsys launch --session-new=${nsys_session} --trace=cuda,vulkan,osrt,nvtx -- /usr/bin/redfog-server"
         } >> "/run/systemd/system/redfog-server.service.d/zz-redfog-live-session.conf"
     fi
 
@@ -372,7 +459,11 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
 
 # ── Standalone fallback (no package installed) ───────────────────────────
 else
-    echo "redfog-git not installed — falling back to standalone root-run mode."
+    if [ -n "${REDFOG_LIVE_STANDALONE:-}" ]; then
+        echo "REDFOG_LIVE_STANDALONE=1 — forcing standalone root-run mode."
+    else
+        echo "redfog-git not installed — falling back to standalone root-run mode."
+    fi
     echo "(doesn't exercise the packaged privilege-separation/systemd-unit model; run 'cd packaging/arch && makepkg -si' first for full parity.)"
 
     BROKER_LOG="/tmp/redfog-live-broker.log"
@@ -380,29 +471,15 @@ else
 
     cleanup() {
         echo "stopping..."
-        # SIGINT, not SIGTERM, when nsys is profiling redfog-server -- see
-        # REDFOG_LIVE_NSYS's header comment and the matching KillSignal=
-        # override in package-parity mode above: nsys only does its own
-        # graceful stop-and-export-the-report on SIGINT to itself. `wait`
-        # below already blocks until nsys (a background job of this shell,
-        # via `setsid ... &`) fully exits, which only happens once its
-        # report-export step is done -- no extra sleep needed.
-        #
-        # Targeted at $SERVER_PID alone (no leading "-"), not the whole
-        # process group, when nsys is involved -- unlike the plain-TERM
-        # case below: `setsid nsys ... -- redfog-server` puts nsys's child
-        # in the *same* process group, so a group-wide signal kills
-        # redfog-server (no handler of its own, dies immediately) out from
-        # under nsys at the same instant nsys itself gets signaled, racing
-        # its orderly shutdown and losing the report -- confirmed live via
-        # the matching KillMode=process fix in package-parity mode above.
-        # nsys kills its own child in its own time (via `--kill`) once it's
-        # done exporting.
-        if [ -n "$nsys_out" ]; then
-            [ -n "${SERVER_PID:-}" ] && kill -INT "$SERVER_PID" 2>/dev/null
-        else
-            [ -n "${SERVER_PID:-}" ] && kill -TERM "-$SERVER_PID" 2>/dev/null
-        fi
+        # Plain SIGTERM to the whole group, nsys included, same as any other
+        # case -- see REDFOG_LIVE_NSYS's header comment: `nsys launch`'s
+        # report finalization now happens via an explicit `nsys stop` you run
+        # yourself, decoupled from this process's own lifecycle, so (unlike
+        # the old `nsys profile`-wraps-everything design) there's no signal
+        # timing to get right here any more. Run `nsys stop --session=...`
+        # yourself *before* Ctrl-C'ing this script if you haven't already --
+        # once this process is gone, there's nothing left to stop collecting.
+        [ -n "${SERVER_PID:-}" ] && kill -TERM "-$SERVER_PID" 2>/dev/null
         [ -n "${BROKER_PID:-}" ] && kill -TERM "-$BROKER_PID" 2>/dev/null
         wait 2>/dev/null
         for unit in /run/systemd/system/redfog-session-*; do
@@ -417,7 +494,29 @@ else
     trap cleanup EXIT INT TERM
 
     rm -rf /tmp/redfog-runtime
+    # Pre-created at the final 0700 mode redfog-server's own
+    # HeadlessRuntime::start wants, not left for it to chmod itself --
+    # confirmed live that chmod-ing this dir can fail (EPERM) for a root
+    # process running under `nsys profile` specifically (it restricts a
+    # traced target's DAC-override authority even while still root), so
+    # `HeadlessRuntime::start` now skips its own chmod call entirely
+    # whenever the mode's already right. Only matters when REDFOG_LIVE_NSYS
+    # is set, but harmless either way.
+    mkdir -m 0700 /tmp/redfog-runtime
     rm -f /tmp/redfog-live-broker.sock
+
+    # Persistent (never rm -rf'd, unlike /tmp/redfog-runtime above) --
+    # TLS identity + the paired-client list live here (tls.rs's
+    # default_state_dir(), via REDFOG_STATE_DIR below). Without this,
+    # default_state_dir() falls back to the *runtime* dir instead (there's
+    # no $STATE_DIRECTORY here the way a real systemd unit would set one),
+    # which this script wipes at the top of every single run -- confirmed
+    # live, that forced re-pairing a real Moonlight client from scratch on
+    # every standalone-mode invocation. Still under /tmp (won't survive a
+    # reboot, unlike package-parity mode's real StateDirectory=redfog-server
+    # -> /var/lib/redfog-server), but that's an acceptable, much rarer cost
+    # compared to every single script re-run.
+    mkdir -m 0700 -p /tmp/redfog-live-state
 
     echo "starting redfog-broker..."
     REDFOG_DEBUG_KWIN_LOGGING_RULES="${REDFOG_DEBUG_KWIN_LOGGING_RULES-}" \
@@ -439,11 +538,28 @@ else
         echo "REDFOG_VIDEO_ENCODER=$REDFOG_VIDEO_ENCODER (forced, overriding auto-detection)"
     fi
     nsys_cmd=()
-    if [ -n "$nsys_out" ]; then
-        echo "profiling redfog-server under nsys -- report will be written to ${nsys_out}.nsys-rep"
-        nsys_cmd=(nsys profile --trace=cuda,vulkan,osrt,nvtx -o "$nsys_out" --force-overwrite=true --)
+    if [ -n "$nsys_session" ]; then
+        echo ""
+        echo "redfog-server launched under nsys (session '$nsys_session'), not yet collecting."
+        echo "Once redfog is up below, start/stop profiling yourself with:"
+        echo "  $nsys_start_cmd"
+        echo "  ...drive whatever real workload you want to capture..."
+        echo "  $nsys_stop_cmd"
+        echo ""
+        # --run-as=root: confirmed live that nsys, launched under `sudo`,
+        # silently drops its *target* application back to the pre-sudo
+        # invoking user by default (SUDO_UID-based) even though nsys itself
+        # keeps root -- broke every filesystem operation redfog-server's
+        # own startup does against directories redfog-broker (not
+        # nsys-wrapped, stays real root) already created as root. Still
+        # needed here even with `nsys launch` (unlike package-parity mode
+        # below, launched directly by systemd's `User=redfog`, never through
+        # `sudo`, so this drop-to-original-user behavior never triggers
+        # there): this whole standalone branch is still reached via `sudo`.
+        nsys_cmd=(nsys launch --session-new="$nsys_session" --trace=cuda,vulkan,osrt,nvtx --run-as=root --)
     fi
     REDFOG_BROKER_SOCKET=/tmp/redfog-runtime/broker.sock \
+    REDFOG_STATE_DIR=/tmp/redfog-live-state \
     REDFOG_LOGIN_APP="$REPO_DIR/target/release/redfog-login" \
     REDFOG_USER_APP="plasmashell --no-respawn" \
     REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR="${REDFOG_LIVE_SWAY:+$PLUGIN_DIR}" \

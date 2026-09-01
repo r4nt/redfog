@@ -128,10 +128,26 @@ impl HeadlessRuntime {
     /// process so `CompositorSession::spawn` picks it up automatically.
     pub fn start(runtime_dir: impl Into<PathBuf>) -> Result<Self, BoxError> {
         let runtime_dir = runtime_dir.into();
-        std::fs::create_dir_all(&runtime_dir)?;
-        let mut perms = std::fs::metadata(&runtime_dir)?.permissions();
-        perms.set_mode(0o700);
-        std::fs::set_permissions(&runtime_dir, perms)?;
+        std::fs::create_dir_all(&runtime_dir)
+            .map_err(|e| format!("failed to create runtime dir {runtime_dir:?}: {e}"))?;
+        let metadata = std::fs::metadata(&runtime_dir)
+            .map_err(|e| format!("failed to stat runtime dir {runtime_dir:?}: {e}"))?;
+        // Skip the chmod syscall entirely when the mode's already right, not
+        // just when it's a value-preserving no-op call -- confirmed live
+        // that `chmod`/`fchmodat` can fail outright (EPERM) for a root
+        // process under some profiler/sandboxing wrappers (observed under
+        // `nsys profile`, which restricts a traced target's DAC-override
+        // authority even while it's still running as root) regardless of
+        // whether the requested mode actually differs from the current one
+        // -- only avoiding the call altogether sidesteps that, which is why
+        // this checks first instead of always calling set_permissions like
+        // before.
+        if metadata.permissions().mode() & 0o777 != 0o700 {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&runtime_dir, perms)
+                .map_err(|e| format!("failed to chmod runtime dir {runtime_dir:?} to 0700: {e}"))?;
+        }
 
         let pipewire_socket = runtime_dir.join("pipewire-0");
         for stale in [
