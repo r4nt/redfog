@@ -42,6 +42,15 @@ pub struct VulkanBridge {
     physical_device: vk::PhysicalDevice,
     queue: vk::Queue,
     command_pool: vk::CommandPool,
+    // Reused across every `record_and_submit_copy` call (submit -> wait ->
+    // reset), not recreated per frame -- see that function's own doc
+    // comment for why a fence here at all, instead of `vkQueueWaitIdle`.
+    // Safe to share like this only because every caller already reaches
+    // this type through `shared()`'s `Mutex<VulkanBridge>`, so calls are
+    // fully serialized; a `&mut self`/interior-mutability-free design would
+    // otherwise need one fence per in-flight submission instead of one
+    // reused forever.
+    copy_fence: vk::Fence,
 }
 
 impl VulkanBridge {
@@ -108,6 +117,10 @@ impl VulkanBridge {
         let command_pool = unsafe { device.create_command_pool(&pool_create_info, None) }
             .map_err(|e| format!("vkCreateCommandPool: {e:?}"))?;
 
+        let fence_create_info = vk::FenceCreateInfo::default(); // unsignaled -- see `copy_fence`'s doc comment
+        let copy_fence = unsafe { device.create_fence(&fence_create_info, None) }
+            .map_err(|e| format!("vkCreateFence: {e:?}"))?;
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -115,6 +128,7 @@ impl VulkanBridge {
             physical_device,
             queue,
             command_pool,
+            copy_fence,
         })
     }
 
@@ -456,16 +470,26 @@ impl VulkanBridge {
         self.device.end_command_buffer(cmd).map_err(|e| format!("vkEndCommandBuffer: {e:?}"))?;
 
         let submit_info = vk::SubmitInfo { command_buffer_count: 1, p_command_buffers: &cmd, ..Default::default() };
-        // `queue_wait_idle`, not a fence we return early from: the caller
+        // Waited on synchronously, not returned early: the caller
         // (`nvenc_session`'s encode loop) immediately hands `dst_buffer`'s
         // CUDA-imported memory to NVENC right after this returns, so the
         // copy must be GPU-complete, not just submitted, before we do.
+        //
+        // `copy_fence` (wait-for-this-submission), not `vkQueueWaitIdle`
+        // (wait for the *entire queue* to drain): confirmed live via
+        // `nsys profile`'s Vulkan API trace that `vkQueueWaitIdle` was
+        // costing 300-450us average per call and dominating this bridge's
+        // own CPU-side time (roughly 80% of all Vulkan API time captured)
+        // -- a known, documented anti-pattern; it's implemented as a full
+        // pipeline-flush, far heavier than waiting on one submission's own
+        // completion. Same correctness guarantee, cheaper primitive.
         let submit_result = self
             .device
-            .queue_submit(self.queue, &[submit_info], vk::Fence::null())
-            .and_then(|()| self.device.queue_wait_idle(self.queue));
+            .queue_submit(self.queue, &[submit_info], self.copy_fence)
+            .and_then(|()| self.device.wait_for_fences(&[self.copy_fence], true, u64::MAX))
+            .and_then(|()| self.device.reset_fences(&[self.copy_fence]));
         self.device.free_command_buffers(self.command_pool, &cmd_buffers);
-        submit_result.map_err(|e| format!("vkQueueSubmit/vkQueueWaitIdle: {e:?}"))
+        submit_result.map_err(|e| format!("vkQueueSubmit/vkWaitForFences/vkResetFences: {e:?}"))
     }
 }
 
@@ -497,6 +521,7 @@ impl Drop for BridgedImage {
 impl Drop for VulkanBridge {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_fence(self.copy_fence, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
