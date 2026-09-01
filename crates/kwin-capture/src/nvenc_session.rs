@@ -412,6 +412,17 @@ fn run_encoder(
     // picture buffer, so POC continuity across one has no meaning).
     let mut hevc_poc: u32 = 0;
 
+    // Diagnostic-only: the *actual* delivered/encoded frame rate,
+    // independent of the `fps` parameter above (which only feeds NVENC's
+    // own rate-control math via `.framerate()` a few lines up — this loop
+    // itself has no pacing/throttle beyond the "no frame yet" sleep below,
+    // so it encodes every frame PipeWire/KWin's damage-driven output
+    // actually delivers, whatever that real rate turns out to be). Logged
+    // once a second so a live session can be checked directly against the
+    // client-requested fps, without needing an external profiler.
+    let mut fps_window_start = std::time::Instant::now();
+    let mut fps_window_count: u32 = 0;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return Ok(EncoderOutcome::Shutdown);
@@ -568,6 +579,17 @@ fn run_encoder(
             let locked = bitstream.lock().map_err(|e| format!("bitstream lock: {e:?}"))?;
             let is_keyframe = locked.picture_type() == NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR;
             on_access_unit(locked.data().to_vec(), is_keyframe, capture_instant);
+        }
+
+        fps_window_count += 1;
+        let fps_window_elapsed = fps_window_start.elapsed();
+        if fps_window_elapsed >= std::time::Duration::from_secs(1) {
+            eprintln!(
+                "kwin-capture: actual encoded frame rate: {:.1} fps (client-requested fps={fps})",
+                fps_window_count as f64 / fps_window_elapsed.as_secs_f64()
+            );
+            fps_window_start = std::time::Instant::now();
+            fps_window_count = 0;
         }
 
         frame_index += 1;

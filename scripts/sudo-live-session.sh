@@ -38,6 +38,39 @@
 #                                without this, only the KDE Plasma/KWin
 #                                session-picker entry actually works.
 #
+#   REDFOG_LIVE_NSYS=1          runs redfog-server itself under `nsys profile`
+#                                (NVIDIA Nsight Systems -- must already be on
+#                                PATH, not installed by this script). Report
+#                                written to /tmp/redfog-live-nsys/redfog-server-
+#                                <timestamp>.nsys-rep; open with `nsys-ui` or
+#                                `nsys stats` afterward. In package-parity
+#                                mode this works by overriding redfog-server.
+#                                service's ExecStart= via the same ephemeral
+#                                drop-in the debug env vars already use (torn
+#                                down on exit, same as those). CPU-sampling
+#                                backtraces inside the report may still come
+#                                back empty depending on this machine's
+#                                perf_event_paranoid.
+#
+#                                Trace scope is explicitly `cuda,vulkan,osrt,
+#                                nvtx` -- NOT nsys's own default
+#                                (`cuda,vulkan,osrt,opengl`, no `vulkan`,
+#                                useless `opengl` for a pipeline that never
+#                                touches it). `vulkan` matters here: on
+#                                non-Ampere+ GPUs this pipeline's per-frame
+#                                detile copy runs through `vulkan_bridge.rs`
+#                                (`vkCmdCopyImageToBuffer`), invisible without
+#                                it -- confirmed live, a first baseline
+#                                capture with nsys's own defaults showed
+#                                `cuda_gpu_kern_sum: SKIPPED (does not contain
+#                                CUDA kernel data)`, i.e. saw none of the real
+#                                per-frame GPU work at all. NVENC's own encode
+#                                calls are a separate vendor API (NvEncodeAPI,
+#                                not CUDA) that none of nsys's trace
+#                                categories cover -- only the CUDA-driver/
+#                                Vulkan work surrounding it is expected to
+#                                show up, not the encode itself.
+#
 # Ctrl-C stops both processes (and, in package mode, reverts the units to
 # exactly what the package itself installed) and cleans up.
 
@@ -123,6 +156,7 @@ if [ -z "${REDFOG_LIVE_SCOPED:-}" ]; then
         --setenv="SUDO_USER=$SUDO_USER" \
         --setenv="PATH=$PATH" \
         --setenv="REDFOG_LIVE_SWAY=${REDFOG_LIVE_SWAY:-}" \
+        --setenv="REDFOG_LIVE_NSYS=${REDFOG_LIVE_NSYS:-}" \
         --setenv="GST_TRACERS=${GST_TRACERS:-}" \
         --setenv="GST_DEBUG=${GST_DEBUG:-}" \
         --setenv="REDFOG_VIDEO_ENCODER=${REDFOG_VIDEO_ENCODER:-}" \
@@ -141,6 +175,18 @@ if [ -n "${REDFOG_LIVE_SWAY:-}" ] && [ ! -e "$PLUGIN_DIR/libgstwaylanddisplaysrc
 fi
 
 ip=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.' | head -1)
+
+# Shared between both modes below -- see REDFOG_LIVE_NSYS's header comment.
+nsys_out=""
+if [ -n "${REDFOG_LIVE_NSYS:-}" ]; then
+    if ! command -v nsys >/dev/null 2>&1; then
+        echo "error: REDFOG_LIVE_NSYS is set but 'nsys' (NVIDIA Nsight Systems) isn't on PATH." >&2
+        exit 1
+    fi
+    nsys_dir="/tmp/redfog-live-nsys"
+    mkdir -p "$nsys_dir"
+    nsys_out="$nsys_dir/redfog-server-$(date +%s)"
+fi
 
 # ── Package-parity mode ──────────────────────────────────────────────────
 if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
@@ -207,6 +253,48 @@ if [ -x /usr/bin/redfog-server ] && [ -x /usr/bin/redfog-broker ] \
     }
     write_dropin redfog-broker.service "${broker_env[@]}"
     write_dropin redfog-server.service "${server_env[@]}"
+
+    if [ -n "$nsys_out" ]; then
+        # redfog-server.service runs as the unprivileged 'redfog' system
+        # user (User=/Group=redfog) -- it needs write access to the report
+        # directory itself, not just this root setup phase.
+        chown redfog:redfog "$nsys_dir"
+        echo "profiling redfog-server under nsys -- report will be written to ${nsys_out}.nsys-rep"
+        # Empty `ExecStart=` clears the unit's own directive first (systemd
+        # drop-in convention for replacing, not appending to, a single-value
+        # key) before setting the wrapped one -- appended to the same file
+        # write_dropin already wrote (still under its one open [Service]
+        # section), so the existing cleanup() below removing that file
+        # tears this override down too, nothing extra to add there.
+        #
+        # KillSignal=SIGINT (overriding systemd's own SIGTERM default):
+        # confirmed via `nsys profile --help` -- nsys only runs its own
+        # graceful stop-and-export-the-report path on SIGINT to itself; a
+        # bare SIGTERM has no such documented behavior, and `--kill`
+        # (default sigterm) is a *separate* knob for what nsys forwards to
+        # the target app once its own session is already ending, not what
+        # stops nsys itself. `systemctl stop` (cleanup()'s own call, below)
+        # sends whatever KillSignal= says and blocks until the unit is
+        # fully gone, so this is enough to get a real report on Ctrl-C --
+        # no extra wait needed.
+        #
+        # KillMode=process (overriding systemd's own control-group
+        # default): confirmed live -- the default sends the kill signal to
+        # *every* process in the unit's cgroup simultaneously, which killed
+        # nsys's traced redfog-server child (no signal handler of its own,
+        # so SIGINT terminates it immediately) at the same instant nsys
+        # itself got SIGINT, racing nsys's own orderly shutdown and
+        # producing "Connection to Agent lost ... End of file" with no
+        # report written at all. `process` targets only the main PID (nsys)
+        # -- nsys then kills its own child in its own time, via its own
+        # `--kill` (default sigterm), after finishing the report export.
+        {
+            echo "ExecStart="
+            echo "ExecStart=/usr/bin/nsys profile --trace=cuda,vulkan,osrt,nvtx -o ${nsys_out} --force-overwrite=true -- /usr/bin/redfog-server"
+            echo "KillSignal=SIGINT"
+            echo "KillMode=process"
+        } >> "/run/systemd/system/redfog-server.service.d/zz-redfog-live-session.conf"
+    fi
 
     was_active_broker=$(systemctl is-active redfog-broker.service 2>/dev/null || true)
     was_active_server=$(systemctl is-active redfog-server.service 2>/dev/null || true)
@@ -292,7 +380,29 @@ else
 
     cleanup() {
         echo "stopping..."
-        [ -n "${SERVER_PID:-}" ] && kill -TERM "-$SERVER_PID" 2>/dev/null
+        # SIGINT, not SIGTERM, when nsys is profiling redfog-server -- see
+        # REDFOG_LIVE_NSYS's header comment and the matching KillSignal=
+        # override in package-parity mode above: nsys only does its own
+        # graceful stop-and-export-the-report on SIGINT to itself. `wait`
+        # below already blocks until nsys (a background job of this shell,
+        # via `setsid ... &`) fully exits, which only happens once its
+        # report-export step is done -- no extra sleep needed.
+        #
+        # Targeted at $SERVER_PID alone (no leading "-"), not the whole
+        # process group, when nsys is involved -- unlike the plain-TERM
+        # case below: `setsid nsys ... -- redfog-server` puts nsys's child
+        # in the *same* process group, so a group-wide signal kills
+        # redfog-server (no handler of its own, dies immediately) out from
+        # under nsys at the same instant nsys itself gets signaled, racing
+        # its orderly shutdown and losing the report -- confirmed live via
+        # the matching KillMode=process fix in package-parity mode above.
+        # nsys kills its own child in its own time (via `--kill`) once it's
+        # done exporting.
+        if [ -n "$nsys_out" ]; then
+            [ -n "${SERVER_PID:-}" ] && kill -INT "$SERVER_PID" 2>/dev/null
+        else
+            [ -n "${SERVER_PID:-}" ] && kill -TERM "-$SERVER_PID" 2>/dev/null
+        fi
         [ -n "${BROKER_PID:-}" ] && kill -TERM "-$BROKER_PID" 2>/dev/null
         wait 2>/dev/null
         for unit in /run/systemd/system/redfog-session-*; do
@@ -328,6 +438,11 @@ else
     if [ -n "${REDFOG_VIDEO_ENCODER:-}" ]; then
         echo "REDFOG_VIDEO_ENCODER=$REDFOG_VIDEO_ENCODER (forced, overriding auto-detection)"
     fi
+    nsys_cmd=()
+    if [ -n "$nsys_out" ]; then
+        echo "profiling redfog-server under nsys -- report will be written to ${nsys_out}.nsys-rep"
+        nsys_cmd=(nsys profile --trace=cuda,vulkan,osrt,nvtx -o "$nsys_out" --force-overwrite=true --)
+    fi
     REDFOG_BROKER_SOCKET=/tmp/redfog-runtime/broker.sock \
     REDFOG_LOGIN_APP="$REPO_DIR/target/release/redfog-login" \
     REDFOG_USER_APP="plasmashell --no-respawn" \
@@ -339,7 +454,7 @@ else
     GST_DEBUG="${GST_DEBUG:-}" \
     SSLKEYLOGFILE="${REDFOG_LIVE_TLS_KEYLOG:-}" \
     REDFOG_LOG_MOUSE_EVENTS="${REDFOG_LOG_MOUSE_EVENTS:-}" \
-    setsid "$REPO_DIR/target/release/redfog-server" > "$SERVER_LOG" 2>&1 &
+    setsid "${nsys_cmd[@]}" "$REPO_DIR/target/release/redfog-server" > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
 
     deadline=$((SECONDS + 15))
