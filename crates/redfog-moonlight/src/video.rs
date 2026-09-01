@@ -101,6 +101,20 @@ pub struct VideoPacketizer {
     /// construction, not per-frame — this is a launch-time tuning knob, not
     /// something that changes mid-session.
     fec_percentage: usize,
+    /// Keyed by `(nr_data_shards, nr_parity_shards)` — reused across frames
+    /// that land on the same shard counts (the common case: those only
+    /// change when a frame's encoded size crosses a
+    /// `requested_shard_payload_size` boundary) instead of rebuilding a
+    /// `ReedSolomon` from scratch every single frame. Confirmed live via CPU
+    /// IP-sampling that the rebuild — a real O(n^3) matrix inversion
+    /// (`fec_rs::Matrix::invert`) — dominated this crate's own sampled CPU
+    /// time under a normal FEC-enabled session, ~51% of all leaf samples
+    /// landing in `Matrix::invert`/`ReedSolomon::new` combined. A small
+    /// `HashMap`, not a single-slot cache: real sessions can legitimately
+    /// bounce between a couple of nearby shard counts frame to frame (e.g.
+    /// right at a size boundary), and the key space is bounded anyway by
+    /// `MAX_SHARDS_PER_FEC_BLOCK`.
+    reed_solomon_cache: std::collections::HashMap<(usize, usize), fec_rs::ReedSolomon>,
 }
 
 impl Default for VideoPacketizer {
@@ -115,7 +129,12 @@ impl VideoPacketizer {
         // moonlight-common-rust's own `VideoPayloader` ("Frame Index Starts
         // at 1!"). 0 may be treated as a sentinel/invalid value by strict
         // depacketizers.
-        Self { sequence_number: 0, frame_number: 1, fec_percentage: configured_fec_percentage() }
+        Self {
+            sequence_number: 0,
+            frame_number: 1,
+            fec_percentage: configured_fec_percentage(),
+            reed_solomon_cache: std::collections::HashMap::new(),
+        }
     }
 
     /// The frame number that will be assigned to the *next* `packetize()`
@@ -231,9 +250,12 @@ impl VideoPacketizer {
         if nr_parity_shards > 0 {
             // Standard Reed-Solomon matrix — unlike audio's, no custom
             // parity matrix needed here, confirmed against
-            // moonlight-common-rust's own `create_video_reed_solomon`.
-            let reed_solomon = fec_rs::ReedSolomon::new(nr_data_shards, nr_parity_shards)
-                .expect("nr_data_shards/nr_parity_shards are always > 0 and their sum is capped at MAX_SHARDS_PER_FEC_BLOCK");
+            // moonlight-common-rust's own `create_video_reed_solomon`. Cached
+            // by shard-count pair — see `reed_solomon_cache`'s doc comment.
+            let reed_solomon = self.reed_solomon_cache.entry((nr_data_shards, nr_parity_shards)).or_insert_with(|| {
+                fec_rs::ReedSolomon::new(nr_data_shards, nr_parity_shards)
+                    .expect("nr_data_shards/nr_parity_shards are always > 0 and their sum is capped at MAX_SHARDS_PER_FEC_BLOCK")
+            });
             let mut parity_payloads: Vec<Vec<u8>> = (0..nr_parity_shards).map(|_| vec![0u8; requested_shard_payload_size]).collect();
             reed_solomon
                 .encode_sep(&data_shard_payloads, &mut parity_payloads)
