@@ -247,7 +247,9 @@ struct RunningSession {
     /// `video_pipeline` (a clone handed to a detached `tokio::spawn`) works
     /// here too.
     cuda_direct_session: Option<Arc<redfog_core::CudaDirectEncoderSession>>,
-    _audio_loopback: AudioLoopback,
+    /// `None` for `SessionType::Login` — see `make_silent_audio_pipeline`'s
+    /// doc comment for why Login never gets a real `AudioLoopback` at all.
+    _audio_loopback: Option<AudioLoopback>,
     /// The `session_id` this session was registered under with the broker
     /// (`SpawnSession` for Kwin, `SpawnPayload` for GstWaylandDisplay), if
     /// spawned via one at all — `None` for the Login stage (always spawned
@@ -1134,7 +1136,7 @@ impl SessionManager {
         &self,
         kind: &SessionType,
         compositor: &SpawnedCompositor,
-        audio_loopback: &AudioLoopback,
+        audio_loopback: Option<&AudioLoopback>,
         generation: u64,
         fps_cap: Option<u32>,
         initial_bitrate_kbps: u32,
@@ -1166,7 +1168,7 @@ impl SessionManager {
             self.build_video_pipeline(kind, compositor, generation, fps_cap, initial_bitrate_kbps, codec, handle.clone(), this.clone())
         };
 
-        let audio_pipeline = redfog_core::make_audio_pipeline(audio_loopback, &audio_client_name, move |packet| {
+        let on_audio_packet = move |packet: Vec<u8>| {
             // Looked up by `generation`, not `client_key` — see
             // `session_by_generation`'s doc comment (same reasoning as the
             // video callback above).
@@ -1227,7 +1229,14 @@ impl SessionManager {
                     Err(_) => tracing::warn!("audio send timed out after 2s — dropping this group rather than holding its sender open forever"),
                 }
             });
-        });
+        };
+        // `audio_client_name` is only meaningful to `pipewiresrc` (see its
+        // own comment above) — the silent Login path never touches
+        // PipeWire at all, so there's nothing for it to name.
+        let audio_pipeline = match audio_loopback {
+            Some(loopback) => redfog_core::make_audio_pipeline(loopback, &audio_client_name, on_audio_packet),
+            None => redfog_core::make_silent_audio_pipeline(on_audio_packet),
+        };
 
         (video_pipeline, audio_pipeline, cuda_direct_session)
     }
@@ -1395,7 +1404,7 @@ impl SessionManager {
         generation: u64,
         origin: SessionOrigin,
         selected_session: Option<SelectedSession>,
-        audio_loopback: AudioLoopback,
+        audio_loopback: Option<AudioLoopback>,
     ) -> Result<RunningSession, String> {
         // `origin.codec` — `VideoCodec::default()` (H.264) for a genuinely
         // fresh `/launch` (nothing has negotiated anything yet), but for
@@ -1426,7 +1435,7 @@ impl SessionManager {
             self.config.bitrate_kbps,
         );
         let (video_pipeline, audio_pipeline, cuda_direct_session) =
-            self.build_pipelines(&kind, &compositor, &audio_loopback, generation, fps_cap, origin.target_bitrate_kbps, codec);
+            self.build_pipelines(&kind, &compositor, audio_loopback.as_ref(), generation, fps_cap, origin.target_bitrate_kbps, codec);
         // Must come *after* `build_pipelines`, not before (this used to be
         // the other way around): `SpawnedCompositor::GstWaylandDisplay`'s
         // `input_sink` now looks up its `waylanddisplaysrc` element inside
@@ -2141,18 +2150,17 @@ impl SessionManager {
             None => {
                 tracing::info!("handoff_to_user: no backgrounded session for {username}, spawning a fresh user compositor");
                 let spawn_start = std::time::Instant::now();
-                // Spawned before spawn_user_compositor, not after — see
-                // spawn_session's own comment on `audio_loopback` for why:
-                // Chrome (or anything else the desktop session launches) must
-                // never get a head start on our own pw-loopback sink existing
-                // in the graph. Confirmed live as the actual root cause of an
-                // intermittent (~50/50) bug where Chrome's own audio-output
-                // stream would never appear in the PipeWire graph at all for
-                // an entire session's lifetime -- the old ordering spawned
-                // the compositor (and everything it launches, including
-                // Chrome) first, then only created the audio loopback
-                // afterward, racing Chrome's own one-shot device enumeration
-                // at its AudioService's startup against ours.
+                // Spawned before spawn_user_compositor, not after — so
+                // nothing the compositor launches can get a head start on
+                // our own pw-loopback sink existing in the graph. Real
+                // hardening (a genuine race exists for anything that starts
+                // automatically alongside the desktop), but NOT confirmed to
+                // explain the ~50/50 intermittent-audio bug this project
+                // actually hit: that bug reproduced even when Chrome was
+                // started manually, long after the session was already up
+                // and this ordering had long since settled — see
+                // `AudioLoopback::spawn`'s doc comment for the bug that
+                // ordering fix turned out to be.
                 let audio_loopback = AudioLoopback::spawn("redfog-user-0")
                     .map_err(|e| format!("failed to spawn audio loopback for redfog-user-0: {e}"))?;
                 let (compositor, resolved_username, broker_session_id) = self.spawn_user_compositor(width, height, fps, &reported).await?;
@@ -2170,7 +2178,7 @@ impl SessionManager {
                         generation,
                         origin,
                         selected,
-                        audio_loopback,
+                        Some(audio_loopback),
                     )?,
                     false,
                 )
@@ -2264,24 +2272,10 @@ impl LaunchHandler for SessionManager {
         // every future `/launch` from this client would just time out
         // waiting on a condvar nothing will ever notify.
         let spawn_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Spawned before the compositor, not after — see spawn_session's
-            // own comment on `audio_loopback` for why: the compositor (and
-            // anything it launches) must never get a head start on our own
-            // pw-loopback sink existing in the graph.
-            //
-            // "redfog-login-0" (and "redfog-user-0" at the other call site)
-            // is a hardcoded literal, deliberately not derived from
-            // compositor.socket_name(): for Backend::Kwin that happens to
-            // already be unique per stage, but for Backend::GstWaylandDisplay
-            // it's always literally "wayland-1" (waylanddisplaysrc's own
-            // fixed socket name) — using it here would collide the Login and
-            // User stages' pw-loopback sink names during handoff, since the
-            // old Login session isn't dropped (and its AudioLoopback torn
-            // down) until after the new User one is already spawned.
-            let audio_loopback = AudioLoopback::spawn("redfog-login-0")
-                .map_err(|e| format!("failed to spawn audio loopback for redfog-login-0: {e}"))?;
+            // No `AudioLoopback` at all for Login — see
+            // `make_silent_audio_pipeline`'s doc comment for why.
             let compositor = self.spawn_login_compositor(width, height, generation)?;
-            self.spawn_session(SessionType::Login, width, height, fps, compositor, None, generation, origin, None, audio_loopback)
+            self.spawn_session(SessionType::Login, width, height, fps, compositor, None, generation, origin, None, None)
         }));
         let session = match spawn_result {
             Ok(Ok(session)) => session,

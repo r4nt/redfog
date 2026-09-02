@@ -1609,9 +1609,48 @@ pub struct AudioLoopback {
     process: Child,
 }
 
+/// Polls `pw-dump` for a node whose `node.name` is `name`, up to `timeout`
+/// — see `AudioLoopback::spawn`'s doc comment for why this exists: without
+/// it, `pw-loopback`'s own `spawn()` (which returns as soon as the process
+/// is *forked*, not once its sink/source nodes actually register with
+/// PipeWire) races whatever starts producing audio next. A plain substring
+/// search on `pw-dump`'s JSON output, not real parsing — `sink_name`/
+/// `capture_name` are generated, session-unique strings (`redfog-audio-
+/// {sink,capture}-{session_name}`), unlikely to collide with anything else
+/// in a real graph dump, and this file already favors shelling out and
+/// checking raw output/exit status over pulling in a JSON crate or a
+/// PipeWire client library binding just for this one thing.
+fn wait_for_pipewire_node(name: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(output) = Command::new("pw-dump").output() {
+            if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(name) {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 impl AudioLoopback {
     /// Spawn a loopback named after `session_name` (e.g. the compositor's
     /// socket name, to keep it unique per session).
+    ///
+    /// Only ever called for `SessionType::User` — Login uses
+    /// `make_silent_audio_pipeline` instead of a real `AudioLoopback`, so it
+    /// never calls this at all. That's load-bearing, not incidental: an
+    /// earlier version had Login spawn one of these too, and every call
+    /// here unconditionally claims `default.configured.audio.sink` for
+    /// itself (see below) — which, per that metadata's own semantics,
+    /// *actively migrates* whatever was already linked to the old default
+    /// (a User session's real app audio, concretely) onto Login's own sink.
+    /// Since resuming a backgrounded User session never calls this again
+    /// (see `rebuild_for_resume`'s doc comment: it's a no-op), nothing ever
+    /// claimed the default back afterward, permanently stranding that app's
+    /// audio on a sink nothing captures from anymore — confirmed live as
+    /// the root cause of a bug where a User session's audio would go
+    /// silent forever after any quit-and-reconnect.
     pub fn spawn(session_name: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let sink_name = format!("redfog-audio-sink-{session_name}");
         let capture_name = format!("redfog-audio-capture-{session_name}");
@@ -1627,6 +1666,26 @@ impl AudioLoopback {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("failed to spawn pw-loopback: {e}"))?;
+
+        // Wait for both nodes to actually exist before doing anything that
+        // depends on them (the pw-metadata call right below, and — more
+        // importantly — before our own caller goes on to start whatever
+        // will actually produce audio). Confirmed by this struct's own doc
+        // comment above (see "Confirmed live") that skipping this can let
+        // an app's audio stream get routed to the real hardware sink
+        // instead of ours, entirely depending on relative startup timing
+        // between two independently-started async processes -- exactly the
+        // shape of bug that shows up as intermittent, not reliably
+        // reproducible. Best-effort like the pw-metadata call below, not a
+        // hard failure on timeout: proceeding anyway (possibly racy again)
+        // is still strictly better than this session never starting at all
+        // over a slow-to-register loopback.
+        if !wait_for_pipewire_node(&sink_name, Duration::from_secs(5)) {
+            eprintln!("redfog-core: pw-loopback's sink node {sink_name} didn't appear in pw-dump within 5s — continuing anyway, but this session's audio routing may race");
+        }
+        if !wait_for_pipewire_node(&capture_name, Duration::from_secs(5)) {
+            eprintln!("redfog-core: pw-loopback's capture node {capture_name} didn't appear in pw-dump within 5s — continuing anyway, but this session's audio capture may fail to find it");
+        }
 
         // Force this session's sink to be the default target for new audio
         // streams — see the struct doc comment for why this can't be left
@@ -1708,25 +1767,43 @@ impl Drop for AudioLoopback {
 /// quality difference for less CPU per call -- which matters more here
 /// than usual given that cost is already being paid 4x more often than a
 /// typical Opus setup would pay it.
+/// Shared by every audio pipeline below regardless of source element — see
+/// this function's own doc comment for why `frame-size`/`bitrate-type`/
+/// `complexity` are exactly what they are.
+const AUDIO_ENCODE_TAIL: &str = "! audioconvert ! audioresample \
+     ! audio/x-raw,format=S16LE,channels=2,rate=48000 \
+     ! opusenc frame-size=5 bitrate-type=cbr complexity=8 \
+     ! appsink name=sink sync=false";
+
 fn audio_pipeline_description(capture_name: &str, client_name: &str) -> String {
-    format!(
-        "pipewiresrc target-object={capture_name} client-name={client_name} do-timestamp=true \
-         ! audioconvert ! audioresample \
-         ! audio/x-raw,format=S16LE,channels=2,rate=48000 \
-         ! opusenc frame-size=5 bitrate-type=cbr complexity=8 \
-         ! appsink name=sink sync=false"
-    )
+    format!("pipewiresrc target-object={capture_name} client-name={client_name} do-timestamp=true {AUDIO_ENCODE_TAIL}")
 }
 
-/// Capture -> Opus encode pipeline for network streaming: `pipewiresrc`
-/// targeting an [`AudioLoopback`]'s capture side -> stereo 48kHz -> Opus.
-/// Delivers one encoded Opus packet per callback invocation.
-pub fn make_audio_pipeline<F>(loopback: &AudioLoopback, client_name: &str, on_packet: F) -> gst::Pipeline
+/// `audiotestsrc wave=silence`, not a real capture source at all — used for
+/// the Login stage instead of [`make_audio_pipeline`]. Login never plays
+/// anything (it's a static rendered login form), so it has no legitimate
+/// need to touch PipeWire audio at all; giving it a real `AudioLoopback`
+/// anyway was the root cause of a bug where a User session's audio would go
+/// silent forever after any quit-and-reconnect (see `AudioLoopback::spawn`'s
+/// git history for the full mechanism) — this sidesteps that whole class of
+/// bug by construction rather than by careful sequencing, and also means
+/// Login never needs its own isolated PipeWire instance at all once User
+/// sessions get one each. `is-live=true`: paces output in real time (like a
+/// real capture source would) instead of producing samples as fast as
+/// possible — matters here because `opusenc`'s `frame-size=5` still expects
+/// a steady ~5ms cadence downstream, same as the real capture path.
+fn silent_audio_pipeline_description() -> String {
+    format!("audiotestsrc wave=silence is-live=true {AUDIO_ENCODE_TAIL}")
+}
+
+/// Wires `on_packet` up to `desc`'s `appsink` — shared by
+/// [`make_audio_pipeline`] and [`make_silent_audio_pipeline`], which differ
+/// only in their source element.
+fn build_audio_pipeline<F>(desc: &str, on_packet: F) -> gst::Pipeline
 where
     F: Fn(Vec<u8>) + Send + Sync + 'static,
 {
-    let desc = audio_pipeline_description(&loopback.capture_name, client_name);
-    let pipeline = gst::parse_launch(&desc)
+    let pipeline = gst::parse_launch(desc)
         .expect("audio pipeline parse failed")
         .dynamic_cast::<gst::Pipeline>()
         .unwrap();
@@ -1745,6 +1822,26 @@ where
             .build(),
     );
     pipeline
+}
+
+/// Capture -> Opus encode pipeline for network streaming: `pipewiresrc`
+/// targeting an [`AudioLoopback`]'s capture side -> stereo 48kHz -> Opus.
+/// Delivers one encoded Opus packet per callback invocation.
+pub fn make_audio_pipeline<F>(loopback: &AudioLoopback, client_name: &str, on_packet: F) -> gst::Pipeline
+where
+    F: Fn(Vec<u8>) + Send + Sync + 'static,
+{
+    build_audio_pipeline(&audio_pipeline_description(&loopback.capture_name, client_name), on_packet)
+}
+
+/// [`make_audio_pipeline`] counterpart for the Login stage — see
+/// `silent_audio_pipeline_description`'s doc comment for why this exists at
+/// all instead of just giving Login its own `AudioLoopback`.
+pub fn make_silent_audio_pipeline<F>(on_packet: F) -> gst::Pipeline
+where
+    F: Fn(Vec<u8>) + Send + Sync + 'static,
+{
+    build_audio_pipeline(&silent_audio_pipeline_description(), on_packet)
 }
 
 #[cfg(test)]
@@ -1770,6 +1867,48 @@ mod tests {
     fn audio_pipeline_uses_constant_bitrate_opus() {
         let desc = audio_pipeline_description("some-capture-node", "some-client");
         assert!(desc.contains("bitrate-type=cbr"), "pipeline description: {desc}");
+    }
+
+    /// Guards against the Login stage silently regressing back to a real
+    /// `pipewiresrc` capture — see `silent_audio_pipeline_description`'s
+    /// doc comment for why it must never touch PipeWire at all.
+    #[test]
+    fn silent_audio_pipeline_never_touches_pipewire() {
+        let desc = silent_audio_pipeline_description();
+        assert!(desc.contains("audiotestsrc wave=silence"), "pipeline description: {desc}");
+        assert!(!desc.contains("pipewiresrc"), "pipeline description: {desc}");
+    }
+
+    /// Same encode settings as the real capture path (frame-size/CBR/
+    /// complexity) — both share `AUDIO_ENCODE_TAIL`, but assert on it
+    /// directly so a future split of that constant doesn't go unnoticed.
+    #[test]
+    fn silent_audio_pipeline_shares_the_same_opus_settings() {
+        let desc = silent_audio_pipeline_description();
+        assert!(desc.contains("opusenc frame-size=5 bitrate-type=cbr complexity=8"), "pipeline description: {desc}");
+    }
+
+    /// Real parse-and-run check, no live PipeWire needed (unlike the
+    /// capture path, `audiotestsrc` needs nothing external) — catches a
+    /// typo/missing `gst-plugins-base` element at test time instead of only
+    /// at a real Login spawn. Waits for the first actual encoded packet
+    /// rather than a fixed sleep — `is-live=true` real-time pacing means
+    /// one arrives almost immediately (a real 5ms Opus frame), so this
+    /// resolves fast on success and only hits its timeout on genuine
+    /// failure.
+    #[test]
+    fn silent_audio_pipeline_parses_and_runs() {
+        use gst::prelude::*;
+        gst::init().expect("gst::init");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pipeline = make_silent_audio_pipeline(move |packet| {
+            let _ = tx.send(packet);
+        });
+        pipeline.set_state(gst::State::Playing).expect("set Playing");
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        let _ = pipeline.set_state(gst::State::Null);
+        let packet = result.expect("no packet arrived from the silent pipeline within 5s");
+        assert!(!packet.is_empty(), "silent pipeline produced an empty Opus packet");
     }
 
     /// Can't assert *which* encoder without depending on the test machine
