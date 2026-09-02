@@ -111,6 +111,40 @@ fn wait_for_path(path: &Path, timeout: Duration) -> bool {
     false
 }
 
+/// Wraps `program` (`pipewire`/`wireplumber`) in a `bwrap` sandbox that
+/// hides `/dev/snd` entirely -- an empty tmpfs over it, nothing
+/// re-exposed -- so this isolated PipeWire instance can never see, and
+/// wireplumber's own ALSA monitor can never claim, any of the host's real
+/// hardware audio devices (speakers *or* microphone). `/dev/snd` isn't
+/// namespaced by anything else this isolated instance already does (only
+/// D-Bus/socket state is) -- see `AudioLoopback`'s own doc comment for the
+/// sink-side symptom of this exact gap, confirmed live there: an app's
+/// audio linking straight to the real hardware sink because nothing told
+/// wireplumber not to pick it. The source (microphone) side has no
+/// equivalent "force the default" metadata override the way the sink
+/// does, and doesn't need one once the real device is never visible in
+/// the first place -- simpler and more robust than trying to keep
+/// steering wireplumber away from a device it can see, the same way
+/// `redfog-broker`'s `gpu_sandbox_argv_prefix` hides every render node but
+/// the intended one from KWin rather than hoping it picks correctly.
+/// Falls back to running `program` unsandboxed (with a warning) if
+/// `bwrap` isn't installed -- this crate's own package depends on it, but
+/// a from-scratch dev environment might not have it yet.
+fn hide_real_audio_devices(program: &str) -> Command {
+    let bwrap_available =
+        Command::new("bwrap").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+    if !bwrap_available {
+        eprintln!(
+            "redfog-core: would sandbox {program} away from /dev/snd's real hardware devices, but `bwrap` isn't installed -- skipping (install \
+             bubblewrap to enable it; {program} will see the host's real audio hardware and wireplumber may pick it as a default)"
+        );
+        return Command::new(program);
+    }
+    let mut cmd = Command::new("bwrap");
+    cmd.args(["--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--tmpfs", "/dev/snd", "--", program]);
+    cmd
+}
+
 /// A running PipeWire + wireplumber pair on an isolated `XDG_RUNTIME_DIR`,
 /// with `PIPEWIRE_REMOTE` exported for this process (and its children) to
 /// pick up. Killed on drop.
@@ -195,7 +229,7 @@ impl HeadlessRuntime {
         )?;
 
         let debug_pipewire = std::env::var_os("REDFOG_DEBUG_PIPEWIRE_LOG").is_some();
-        let mut pipewire_cmd = Command::new("pipewire");
+        let mut pipewire_cmd = hide_real_audio_devices("pipewire");
         pipewire_cmd.env("XDG_RUNTIME_DIR", &runtime_dir).env("PIPEWIRE_CONFIG_DIR", &pipewire_config_dir);
         if debug_pipewire {
             pipewire_cmd.arg("-v").arg("-v").stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -208,7 +242,7 @@ impl HeadlessRuntime {
             return Err("PipeWire socket did not appear within 10s".into());
         }
 
-        let mut wireplumber_cmd = Command::new("wireplumber");
+        let mut wireplumber_cmd = hide_real_audio_devices("wireplumber");
         wireplumber_cmd.env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("PIPEWIRE_REMOTE", &pipewire_socket)
             .env("PIPEWIRE_CONFIG_DIR", &pipewire_config_dir);
