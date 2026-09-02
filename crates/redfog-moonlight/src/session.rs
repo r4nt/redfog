@@ -1215,12 +1215,16 @@ impl SessionManager {
             // that ordering all the way onto the wire.
             let ping_token = origin.ping_token;
             handle.block_on(async move {
-                for opus_packet in &opus_packets {
-                    match tokio::time::timeout(Duration::from_secs(2), sender.send_packet(ping_token, opus_packet)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => tracing::warn!("audio send failed: {e}"),
-                        Err(_) => tracing::warn!("audio send timed out after 2s — dropping this packet rather than holding its sender open forever"),
-                    }
+                // One batched send for the whole group (still strictly
+                // ordered — see `send_packets`' own doc comment) instead of
+                // a per-packet loop; one timeout covering the batch instead
+                // of one per packet, since a real `sendmmsg` either sends
+                // the whole group or blocks, not partially per-packet in a
+                // way "drop just this one" ever meaningfully applied to.
+                match tokio::time::timeout(Duration::from_secs(2), sender.send_packets(ping_token, &opus_packets)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("audio send failed: {e}"),
+                    Err(_) => tracing::warn!("audio send timed out after 2s — dropping this group rather than holding its sender open forever"),
                 }
             });
         });

@@ -202,8 +202,21 @@ impl AudioSender {
         self.inner.wait_for_client(ping_token).await
     }
 
-    pub async fn send_packet(&self, ping_token: [u8; 16], packet: &[u8]) -> Result<(), String> {
-        self.inner.send_to(ping_token, packet).await
+    /// One `sendmmsg` batch for the whole group (the 1 data packet, plus 2
+    /// FEC parity packets on every 4th call) instead of one `sendto` per
+    /// packet — see `udp_sender.rs`'s doc comment and `VideoSender::
+    /// send_shards`' own version of this for the same fix on the video
+    /// side. A much smaller win here in absolute terms (at most 3 packets
+    /// a batch, vs. up to hundreds for a video keyframe), but the
+    /// machinery already exists and this path still adds up: real
+    /// `sendmmsg` preserves submission order (each buffer is still its own
+    /// independent datagram either way), so this doesn't weaken the strict
+    /// in-order delivery this stream depends on (see this method's caller
+    /// in session.rs) — if anything it's a stronger ordering guarantee
+    /// than separately-awaited sends ever were, being one atomic kernel
+    /// call instead of several.
+    pub async fn send_packets(&self, ping_token: [u8; 16], packets: &[Vec<u8>]) -> Result<(), String> {
+        self.inner.send_batch_to(ping_token, packets).await
     }
 }
 

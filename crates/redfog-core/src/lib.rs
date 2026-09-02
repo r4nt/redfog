@@ -1693,12 +1693,27 @@ impl Drop for AudioLoopback {
 /// `opusenc`'s default (`constrained-vbr`) varies each frame's encoded size
 /// with signal complexity, which would make the shards non-uniform. Real
 /// Sunshine/GFE encode CBR for the same reason.
+///
+/// `complexity=8`, not `opusenc`'s own default of 10 (its max): confirmed
+/// live via CPU profiling that libopus was a disproportionately large CPU
+/// consumer given how little actual audio data is involved — traced to two
+/// compounding factors, only one of which is ours to fix. `frame-size=5`
+/// above means encode() runs 4x as often as a typical 20ms VoIP setup
+/// (wire-protocol-mandated, not adjustable — see that property's own doc
+/// comment), and every one of those calls was running at the encoder's
+/// most CPU-expensive quality setting purely by GStreamer's own default,
+/// never deliberately chosen for a real-time interactive use case. 10 is
+/// meant for offline/file encoding where CPU time is free; 8 is a common
+/// real-time-streaming value, trading a small (often inaudible at CBR)
+/// quality difference for less CPU per call -- which matters more here
+/// than usual given that cost is already being paid 4x more often than a
+/// typical Opus setup would pay it.
 fn audio_pipeline_description(capture_name: &str, client_name: &str) -> String {
     format!(
         "pipewiresrc target-object={capture_name} client-name={client_name} do-timestamp=true \
          ! audioconvert ! audioresample \
          ! audio/x-raw,format=S16LE,channels=2,rate=48000 \
-         ! opusenc frame-size=5 bitrate-type=cbr \
+         ! opusenc frame-size=5 bitrate-type=cbr complexity=8 \
          ! appsink name=sink sync=false"
     )
 }
