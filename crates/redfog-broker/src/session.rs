@@ -1046,6 +1046,18 @@ fn which_kwin_wayland() -> Option<String> {
 /// re-adds only the node `select_gpu_render_node` chose. No namespace
 /// unsharing beyond the mount namespace `bwrap` always creates.
 ///
+/// Also unconditionally blanks out `/dev/snd` — unrelated to the GPU
+/// narrowing above, tacked on here since it's the same sandbox and the
+/// same rationale in miniature: nothing legitimate in this session needs
+/// direct hardware audio device access at all (games/apps talk to
+/// PipeWire over its socket, never `/dev/snd` directly — same reasoning
+/// as `redfog-core::environment::hide_real_audio_devices`, which does the
+/// analogous thing for the PipeWire daemon itself), so there's no
+/// re-exposure step the way there is for the one GPU render node. Closes
+/// off a second path to the same class of bug that fix addresses: an app
+/// inside the session reaching the host's real microphone or speakers
+/// via some legacy direct-ALSA route instead of going through PipeWire.
+///
 /// Returns `None` (skip sandboxing, behave exactly as before) only when
 /// there's truly nothing to narrow to (no `/dev/dri` render nodes at all —
 /// a machine with no GPU) or when `bwrap` itself isn't installed (logged,
@@ -1071,7 +1083,7 @@ fn gpu_sandbox_argv_prefix() -> Option<Vec<String>> {
         (None, n) => format!(" (plus {n} by-path symlink(s))"),
         (Some(card), n) => format!(" (plus {card} and {n} by-path symlink(s))"),
     };
-    tracing::info!("sandboxing /dev/dri down to {node}{sibling_desc} for KWin");
+    tracing::info!("sandboxing /dev/dri down to {node}{sibling_desc} for KWin, and hiding /dev/snd entirely (see this function's own doc comment)");
 
     let mut argv = vec![
         "bwrap".to_string(),
@@ -1086,6 +1098,8 @@ fn gpu_sandbox_argv_prefix() -> Option<Vec<String>> {
         "--dev-bind".to_string(),
         node.clone(),
         node,
+        "--tmpfs".to_string(),
+        "/dev/snd".to_string(),
     ];
     if let Some(card_node) = extra.card_node {
         argv.push("--dev-bind".to_string());
