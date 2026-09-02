@@ -49,8 +49,49 @@
 # that) reproduces this near-total illegibility every time. So the whole
 # pipeline below — record AND both symbolization steps — stays under sudo;
 # only the finished output files get handed back to you at the end.
+#
+# That's necessary but NOT sufficient at kptr_restrict=2 specifically: that
+# value hides /proc/kallsyms' real addresses from *everyone*, root included
+# — unlike kptr_restrict=1, which only restricts non-root readers. Confirmed
+# live: `sudo perf report` alone still showed 100% `[unknown]` for every
+# kernel-space frame at =2, even though the whole pipeline was already
+# root. So this script now lowers it to 1 itself for the duration of the
+# capture (root can resolve symbols there; unprivileged users still can't,
+# so this isn't a broader exposure than perf needing root to attach at all
+# already implies) and restores whatever it was before on exit, via a trap
+# — covering Ctrl-C and errors, not just a clean run.
 
 set -euo pipefail
+
+# See the kptr_restrict paragraph above for why this exists at all.
+ORIGINAL_KPTR_RESTRICT="$(cat /proc/sys/kernel/kptr_restrict)"
+restore_kptr_restrict() {
+    if [ "$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)" != "$ORIGINAL_KPTR_RESTRICT" ]; then
+        sudo sysctl -qw kernel.kptr_restrict="$ORIGINAL_KPTR_RESTRICT"
+    fi
+}
+trap restore_kptr_restrict EXIT
+if [ "$ORIGINAL_KPTR_RESTRICT" -gt 1 ]; then
+    echo "kernel.kptr_restrict=$ORIGINAL_KPTR_RESTRICT hides kernel-space symbols even from root — lowering to 1 for this capture, restoring on exit..."
+    sudo sysctl -qw kernel.kptr_restrict=1
+fi
+
+# perf has debuginfod support built in (confirmed via `perf version
+# --build-options`), but `sudo` strips DEBUGINFOD_URLS same as it strips
+# PATH -- explicitly passed through below (`sudo env DEBUGINFOD_URLS=...`),
+# same fix as the existing `PATH` one. Read from /etc/debuginfod/*.urls
+# directly (matching /etc/profile.d/debuginfod.sh's own logic) rather than
+# hardcoding a specific distro's server: confirmed live on an Arch+CachyOS
+# machine that the *stock* Arch debuginfod server alone doesn't cover
+# CachyOS's own optimized rebuilds (different build-ids from upstream Arch
+# even at the "same" version -- glibc and libopus both 404'd there) while
+# CachyOS's own server (also listed in that same directory) does. Best
+# effort only, not a guaranteed fix like the kptr_restrict one above: even
+# with the right server, coverage isn't universal (confirmed via nsys's own
+# earlier debuginfod use in this same investigation, ~33% query success
+# rate) -- misses just stay `[unknown]`, same as without this at all,
+# they don't error the capture out.
+DEBUGINFOD_URLS="${DEBUGINFOD_URLS:-$(find /etc/debuginfod -name '*.urls' -exec cat {} + 2>/dev/null | tr '\n' ' ')}"
 
 DURATION="${1:-10}"
 OUT_DIR="/tmp/redfog-flamegraph"
@@ -97,11 +138,12 @@ echo "generating flamegraph (root, for kernel-frame symbols — see header comme
 # `env "PATH=$PATH"`: `flamegraph`/`cargo-flamegraph` live in ~/.cargo/bin,
 # which sudo's secure_path strips for the root command it execs — without
 # this, plain `sudo flamegraph` fails with "command not found" even though
-# it resolves fine for you unprivileged (confirmed live).
-sudo env "PATH=$PATH" flamegraph --perfdata "$PERF_DATA" -o "$SVG" --title "redfog-server pid $PID, ${DURATION}s"
+# it resolves fine for you unprivileged (confirmed live). `DEBUGINFOD_URLS`
+# passed the same way — see this script's own header comment.
+sudo env "PATH=$PATH" "DEBUGINFOD_URLS=$DEBUGINFOD_URLS" flamegraph --perfdata "$PERF_DATA" -o "$SVG" --title "redfog-server pid $PID, ${DURATION}s"
 
 echo "generating Perfetto-compatible text (drag into https://ui.perfetto.dev)..."
-sudo perf script -i "$PERF_DATA" > "$PERFTEXT"
+sudo env "DEBUGINFOD_URLS=$DEBUGINFOD_URLS" perf script -i "$PERF_DATA" > "$PERFTEXT"
 
 sudo chown "$(id -u):$(id -g)" "$PERF_DATA" "$SVG" "$PERFTEXT"
 

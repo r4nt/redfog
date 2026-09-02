@@ -37,12 +37,38 @@
 # symbolized after handing the file back to your own user) doesn't need a
 # second, separate root step for that part.
 #
+# Being root for that step still isn't enough on its own at kptr_restrict=2
+# specifically, though — that value hides /proc/kallsyms' real addresses
+# from *everyone*, root included, unlike kptr_restrict=1 (non-root readers
+# only). Confirmed live via the same issue in scripts/flamegraph.sh. So
+# this script also lowers it to 1 itself for the capture and restores
+# whatever it was before on exit (a trap, covering Ctrl-C and errors too).
+#
 # Run this WHILE a real client is actively streaming (see
 # scripts/sudo-live-session.sh) — idle CPU tells you nothing. Needs sudo
 # (attaching to a root-owned process needs the same privilege perf itself
 # would) — will prompt.
 
 set -euo pipefail
+
+# See the kptr_restrict paragraph above for why this exists at all.
+ORIGINAL_KPTR_RESTRICT="$(cat /proc/sys/kernel/kptr_restrict)"
+restore_kptr_restrict() {
+    if [ "$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)" != "$ORIGINAL_KPTR_RESTRICT" ]; then
+        sudo sysctl -qw kernel.kptr_restrict="$ORIGINAL_KPTR_RESTRICT"
+    fi
+}
+trap restore_kptr_restrict EXIT
+if [ "$ORIGINAL_KPTR_RESTRICT" -gt 1 ]; then
+    echo "kernel.kptr_restrict=$ORIGINAL_KPTR_RESTRICT hides kernel-space symbols even from root — lowering to 1 for this capture, restoring on exit..."
+    sudo sysctl -qw kernel.kptr_restrict=1
+fi
+
+# samply supports debuginfod, but `sudo` strips DEBUGINFOD_URLS same as it
+# strips PATH below — see scripts/flamegraph.sh's header comment for the
+# full rationale (reading /etc/debuginfod/*.urls directly rather than
+# hardcoding one distro's server, best-effort not guaranteed).
+DEBUGINFOD_URLS="${DEBUGINFOD_URLS:-$(find /etc/debuginfod -name '*.urls' -exec cat {} + 2>/dev/null | tr '\n' ' ')}"
 
 DURATION="${1:-10}"
 OUT_DIR="/tmp/redfog-samply"
@@ -75,7 +101,8 @@ echo "recording with samply (pid $PID) over ${DURATION}s..."
 # `env "PATH=$PATH"`: samply lives in ~/.cargo/bin, which sudo's secure_path
 # strips for the root command it execs — same fix as scripts/flamegraph.sh
 # uses for `flamegraph` itself (see that script's header comment).
-sudo env "PATH=$PATH" samply record -p "$PID" -d "$DURATION" --save-only -o "$PROFILE"
+# `DEBUGINFOD_URLS` passed the same way, same reason.
+sudo env "PATH=$PATH" "DEBUGINFOD_URLS=$DEBUGINFOD_URLS" samply record -p "$PID" -d "$DURATION" --save-only -o "$PROFILE"
 sudo chown "$(id -u):$(id -g)" "$PROFILE"
 
 echo "opening interactive profiler UI (local server + your default browser)..."

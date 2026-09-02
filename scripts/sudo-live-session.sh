@@ -92,6 +92,25 @@
 #                                on `start` pointed; `nsys sessions list` shows
 #                                any sessions still open if you lose track.
 #
+#                                `--wait=primary` on `nsys launch` (not
+#                                nsys's own default, `all`): confirmed live
+#                                this is a real deadlock hazard otherwise.
+#                                redfog-server deliberately leaves the
+#                                compositor session (KWin, dbus-daemon,
+#                                pipewire/wireplumber) it spawns running in
+#                                the background after it exits, to support
+#                                reconnect -- that's by design, not a leak.
+#                                `--wait=all` makes nsys wait for *every*
+#                                reparented process redfog-server ever
+#                                spawned, directly or not, to also exit
+#                                before nsys itself returns -- which, given
+#                                the above, may never happen at all. When it
+#                                hits, nsys itself becomes the stuck
+#                                process, which in turn makes this whole
+#                                script un-Ctrl-C-able (cleanup()'s own
+#                                final `wait` blocks on it). `--wait=primary`
+#                                only waits for the direct target.
+#
 #                                Works entirely within package-parity mode's
 #                                normal privilege model (the real, unprivileged
 #                                'redfog' system user) -- no root/--run-as=
@@ -379,7 +398,7 @@ if [ -z "${REDFOG_LIVE_STANDALONE:-}" ] \
         # design's KillSignal=/KillMode= overrides.
         {
             echo "ExecStart="
-            echo "ExecStart=/usr/bin/nsys launch --session-new=${nsys_session} --trace=cuda,vulkan,osrt,nvtx -- /usr/bin/redfog-server"
+            echo "ExecStart=/usr/bin/nsys launch --session-new=${nsys_session} --trace=cuda,vulkan,osrt,nvtx --wait=primary -- /usr/bin/redfog-server"
         } >> "/run/systemd/system/redfog-server.service.d/zz-redfog-live-session.conf"
     fi
 
@@ -556,7 +575,7 @@ else
         # below, launched directly by systemd's `User=redfog`, never through
         # `sudo`, so this drop-to-original-user behavior never triggers
         # there): this whole standalone branch is still reached via `sudo`.
-        nsys_cmd=(nsys launch --session-new="$nsys_session" --trace=cuda,vulkan,osrt,nvtx --run-as=root --)
+        nsys_cmd=(nsys launch --session-new="$nsys_session" --trace=cuda,vulkan,osrt,nvtx --run-as=root --wait=primary --)
     fi
     REDFOG_BROKER_SOCKET=/tmp/redfog-runtime/broker.sock \
     REDFOG_STATE_DIR=/tmp/redfog-live-state \
