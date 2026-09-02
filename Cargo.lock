@@ -4370,6 +4370,7 @@ dependencies = [
  "serde_json",
  "session-backend",
  "sha2",
+ "socket2 0.6.4",
  "tokio",
  "tokio-enet",
  "tokio-rustls",

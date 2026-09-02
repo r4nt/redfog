@@ -34,6 +34,23 @@
 //! their own socket per launch and tracked exactly one learned
 //! `client_addr` — fine when only one session could ever be active, not
 //! once more than one needs to stream concurrently.
+//!
+//! [`MultiClientUdpSender::send_batch_to`] exists alongside the plain
+//! per-buffer [`MultiClientUdpSender::send_to`] because a single encoded
+//! video frame can legitimately need many separate UDP datagrams — the
+//! wire protocol's fixed ~1KB per-packet payload size (see `video.rs`'s
+//! `REQUESTED_PACKET_SIZE`) isn't something we control, so a large frame
+//! (a keyframe especially) means a correspondingly large *number* of
+//! individually-tiny `sendto`s, all for data that was already fully
+//! computed and ready to go before the first one was even issued.
+//! Confirmed live via CPU profiling that `sendto` was the single largest
+//! syscall category in a real capture (~28k calls across ~1.4k frames,
+//! averaging ~20 shards/frame) — `sendmmsg(2)` collapses a whole frame's
+//! worth of already-ready shards into one syscall instead of one per
+//! shard, with zero change to what's actually sent on the wire (same
+//! datagrams, same boundaries, same content) and zero added latency
+//! (nothing is delayed to accumulate a batch — the "batch" is just
+//! whatever was already sitting fully-formed in memory).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -143,14 +160,151 @@ impl MultiClientUdpSender {
         rx.await.map_err(|_| format!("{} sender dropped while waiting for client ping", self.label))
     }
 
+    fn learned_addr(&self, ping_token: [u8; 16]) -> Result<SocketAddr, String> {
+        let s = self.state.lock().unwrap();
+        s.addresses
+            .get(&ping_token)
+            .copied()
+            .ok_or_else(|| format!("{} client address not yet known for this session (wait_for_client not called/completed)", self.label))
+    }
+
     pub async fn send_to(&self, ping_token: [u8; 16], data: &[u8]) -> Result<(), String> {
-        let addr = {
-            let s = self.state.lock().unwrap();
-            *s.addresses
-                .get(&ping_token)
-                .ok_or_else(|| format!("{} client address not yet known for this session (wait_for_client not called/completed)", self.label))?
-        };
+        let addr = self.learned_addr(ping_token)?;
         self.socket.send_to(data, addr).await.map_err(|e| format!("{} send failed: {e}", self.label))?;
         Ok(())
+    }
+
+    /// Sends every buffer in `data` to the same learned destination as one
+    /// `sendmmsg(2)` batch instead of one `send_to`/`sendto` syscall per
+    /// buffer — see this module's own doc comment addendum below for why
+    /// this exists at all. Same wire output either way (each buffer is
+    /// still its own, independent UDP datagram — nothing about packet
+    /// boundaries or count changes), just fewer syscalls to get there.
+    ///
+    /// `tokio::net::UdpSocket` has no `sendmmsg` of its own (it's a
+    /// Linux-specific syscall outside tokio's cross-platform socket API),
+    /// so this drives the raw syscall by hand through `try_io` — tokio's
+    /// own documented pattern for "do a raw syscall myself, still
+    /// correctly integrated with the runtime's readiness tracking" (as
+    /// opposed to a bare `libc` call, which could block the whole runtime
+    /// thread if the send buffer were ever actually full).
+    pub async fn send_batch_to(&self, ping_token: [u8; 16], data: &[Vec<u8>]) -> Result<(), String> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let addr = self.learned_addr(ping_token)?;
+        let dest = socket2::SockAddr::from(addr);
+
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            self.socket.writable().await.map_err(|e| format!("{} writable: {e}", self.label))?;
+            match self.socket.try_io(tokio::io::Interest::WRITABLE, || send_mmsg_batch(&self.socket, &dest, remaining)) {
+                Ok(sent) => remaining = &remaining[sent..],
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(format!("{} sendmmsg failed: {e}", self.label)),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The actual `sendmmsg(2)` call, run from inside `UdpSocket::try_io` (see
+/// `send_batch_to`) so its `WouldBlock` return is what tells tokio's
+/// readiness tracking to wait and retry, same as any other non-blocking
+/// socket op. Returns how many of `buffers` were actually accepted by the
+/// kernel this call (can be fewer than `buffers.len()` if the send buffer
+/// fills mid-batch — the caller retries the remainder after the socket is
+/// writable again, same as a partial `write()`).
+///
+/// # Safety-adjacent notes
+/// `iov_base`/`msg_name` are `*mut` fields on `iovec`/`msghdr` for
+/// symmetry with the read side of these same C structs (`recvmmsg` writes
+/// through them) — `sendmmsg` only ever reads through them here, so
+/// casting away `const` is standard practice for this FFI, not actually
+/// unsound.
+fn send_mmsg_batch(socket: &UdpSocket, dest: &socket2::SockAddr, buffers: &[Vec<u8>]) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+
+    let mut iovecs: Vec<libc::iovec> =
+        buffers.iter().map(|b| libc::iovec { iov_base: b.as_ptr() as *mut _, iov_len: b.len() }).collect();
+    let mut msgs: Vec<libc::mmsghdr> = iovecs
+        .iter_mut()
+        .map(|iov| libc::mmsghdr {
+            msg_hdr: libc::msghdr {
+                msg_name: dest.as_ptr() as *mut _,
+                msg_namelen: dest.len(),
+                msg_iov: iov,
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            },
+            msg_len: 0,
+        })
+        .collect();
+
+    let sent = unsafe { libc::sendmmsg(socket.as_raw_fd(), msgs.as_mut_ptr(), msgs.len() as u32, 0) };
+    if sent < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(sent as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Registers `client`'s address the same way a real client's PING
+    /// does (see `bind`'s receive loop) — a 20-byte `[16-byte token][4-byte
+    /// seq]` datagram, source address is what gets learned.
+    async fn register(sender: &MultiClientUdpSender, client: &UdpSocket, sender_addr: SocketAddr, token: [u8; 16]) {
+        let mut ping = [0u8; PING_PAYLOAD_PACKET_SIZE];
+        ping[..16].copy_from_slice(&token);
+        client.send_to(&ping, sender_addr).await.expect("send ping");
+        tokio::time::timeout(Duration::from_secs(2), sender.wait_for_client(token)).await.expect("ping arrived").expect("wait_for_client");
+    }
+
+    #[tokio::test]
+    async fn send_batch_to_delivers_every_buffer_as_its_own_datagram() {
+        let sender = MultiClientUdpSender::bind("127.0.0.1".parse().unwrap(), 0, "test").await.unwrap();
+        let sender_addr = sender.socket.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let token = [7u8; 16];
+        register(&sender, &client, sender_addr, token).await;
+
+        // More than a couple, to exercise the real sendmmsg array path
+        // (not just a degenerate 1-2 element case).
+        let buffers: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 50 + i as usize]).collect();
+        sender.send_batch_to(token, &buffers).await.expect("send_batch_to");
+
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        let mut buf = [0u8; 2048];
+        for _ in 0..buffers.len() {
+            let (len, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await.expect("recv before timeout").expect("recv_from");
+            assert_eq!(from, sender_addr, "datagram should come from the sender's own socket");
+            received.push(buf[..len].to_vec());
+        }
+
+        // UDP doesn't guarantee ordering in general, but a single
+        // sendmmsg batch over loopback is realistically always delivered
+        // in submission order -- asserting the stronger (order-preserving)
+        // property here is deliberate: an ordering regression in the
+        // batch-construction logic (e.g. iovecs pointing at the wrong
+        // buffer) would otherwise still pass an order-independent check.
+        assert_eq!(received, buffers, "every buffer should arrive intact, in submission order");
+    }
+
+    #[tokio::test]
+    async fn send_batch_to_with_no_buffers_is_a_harmless_no_op() {
+        let sender = MultiClientUdpSender::bind("127.0.0.1".parse().unwrap(), 0, "test").await.unwrap();
+        let sender_addr = sender.socket.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let token = [9u8; 16];
+        register(&sender, &client, sender_addr, token).await;
+
+        sender.send_batch_to(token, &[]).await.expect("empty batch should succeed trivially");
     }
 }

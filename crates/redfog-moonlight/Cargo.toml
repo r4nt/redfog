@@ -57,6 +57,18 @@ uuid = { version = "1", features = ["v4"] }
 mdns-sd = "0.13"
 gethostname = "0.5"
 
+# Real production use (unlike the dev-dependencies libc/nix below, which
+# stay separate -- these are for udp_sender.rs's sendmmsg batching
+# specifically, see that file's own doc comment): libc for the raw
+# sendmmsg/mmsghdr FFI (no safe wrapper for it exists in the ecosystem
+# worth pulling in a whole crate for), socket2 for SockAddr -- converting a
+# std::net::SocketAddr into a raw sockaddr correctly (v4 vs v6, byte order)
+# by hand is exactly the kind of unsafe-adjacent code worth not
+# hand-rolling. Already in the dependency tree transitively via tokio/
+# hyper-util at a compatible version -- this doesn't add a new one.
+libc = "0.2"
+socket2 = "0.6"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -76,7 +88,7 @@ fec-rs = "0.1"
 ureq = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nix = { version = "0.26", features = ["signal"] }
-libc = "0.2"
+# libc is now a real (non-dev) dependency above, covering test builds too.
 redfog-test-cleanup = { path = "../redfog-test-cleanup" }
 # GPL-3.0-or-later, dev-only: the real reference client implementation, used
 # to validate our server against actual client-side crypto/parsing rather

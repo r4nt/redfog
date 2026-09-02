@@ -373,11 +373,13 @@ impl VideoSender {
         self.inner.wait_for_client(ping_token).await
     }
 
+    /// One `sendmmsg` batch for the whole frame instead of one `sendto`
+    /// per shard — see `udp_sender.rs`'s own doc comment for why (this was
+    /// the single largest syscall category in a live capture, and every
+    /// shard here is already fully computed before this is even called,
+    /// so batching the sends costs nothing in latency).
     pub async fn send_shards(&self, ping_token: [u8; 16], shards: &[Vec<u8>]) -> Result<(), String> {
-        for shard in shards {
-            self.inner.send_to(ping_token, shard).await?;
-        }
-        Ok(())
+        self.inner.send_batch_to(ping_token, shards).await
     }
 }
 
