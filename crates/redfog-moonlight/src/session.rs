@@ -2946,7 +2946,12 @@ impl ControlEventHandler for SessionManager {
                 if self.config.log_mouse_events {
                     tracing::info!("mouse event: ScrollVertical amount={amount}");
                 }
-                fwd.axis(0, amount as f64)
+                // Moonlight/Windows uses positive for scrolling up (away from user)
+                // and negative for scrolling down (toward user). Wayland's wl_pointer
+                // axis (and org_kde_kwin_fake_input axis 0) uses positive for scrolling
+                // down and negative for scrolling up. Invert vertical amount so standard
+                // wheel scrolling down scrolls the page down.
+                fwd.axis(0, -amount as f64)
             }
             InputEvent::ScrollHorizontal { amount } => {
                 if self.config.log_mouse_events {
