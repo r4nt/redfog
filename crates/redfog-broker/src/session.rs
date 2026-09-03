@@ -204,6 +204,16 @@ pub struct SessionManager {
     active: Mutex<HashMap<String, ActiveSession>>,
 }
 
+/// What a successful spawn hands back to `redfog-server` — see
+/// `SpawnedSession`'s own doc comment (`redfog-broker-protocol`) for why
+/// `pipewire_socket_path` exists as its own field rather than being derived
+/// from `wayland_socket_path`'s directory: this session's own dedicated
+/// PipeWire instance, not the process-wide shared one.
+pub struct SpawnResult {
+    pub wayland_socket_path: String,
+    pub pipewire_socket_path: String,
+}
+
 impl SessionManager {
     pub fn new() -> Self {
         Self { active: Mutex::new(HashMap::new()) }
@@ -217,7 +227,7 @@ impl SessionManager {
         height: u32,
         socket_name: &str,
         payload: &[String],
-    ) -> Result<String, String> {
+    ) -> Result<SpawnResult, String> {
         if std::env::var_os("REDFOG_BROKER_FAKE_SPAWN").is_some() {
             return self.spawn_fake(session_id, width, height, socket_name, payload).await;
         }
@@ -247,7 +257,7 @@ impl SessionManager {
     /// needs `sudo`. Never set this in production; it defeats both
     /// cross-user spawning and the Wayland-socket permission isolation the
     /// systemd path provides.
-    async fn spawn_fake(&self, session_id: &str, width: u32, height: u32, socket_name: &str, payload: &[String]) -> Result<String, String> {
+    async fn spawn_fake(&self, session_id: &str, width: u32, height: u32, socket_name: &str, payload: &[String]) -> Result<SpawnResult, String> {
         tracing::warn!("REDFOG_BROKER_FAKE_SPAWN set — spawning kwin_wayland directly, no systemd/cross-user involved");
 
         let runtime_dir = format!("{}/session-{session_id}", default_runtime_dir());
@@ -256,20 +266,23 @@ impl SessionManager {
         let _ = std::fs::remove_file(&wayland_socket_path);
 
         let kwin_path = which_kwin_wayland().unwrap_or_else(|| "kwin_wayland".to_string());
-        let pipewire_socket_path = format!("{}/pipewire-0", default_runtime_dir());
-        // Like `pipewire_socket_path` above: PipeWire/wireplumber/pipewire-
-        // pulse all run under `redfog-server`'s own identity, in *its*
-        // runtime dir (`HeadlessRuntime::start`), not this session's private
-        // `runtime_dir` — pointing PULSE_SERVER at the session dir instead
-        // (an earlier bug here) meant it never had a pulse server listening
-        // on it at all.
-        let pulse_socket_path = pulse_socket_path();
+        // This session's own dedicated PipeWire instance — see
+        // `SpawnedSession`'s doc comment for why it's no longer the one
+        // process-wide shared one. Routed through `redfog-pipewire-session`
+        // below (same helper `spawn_via_systemd` uses) rather than
+        // hand-spawning `pipewire`/`wireplumber`/`pipewire-pulse` here
+        // directly, so this test-only path exercises the exact same
+        // bring-up code as production instead of a second, divergent copy
+        // of it.
+        let pipewire_socket_path = format!("{runtime_dir}/pipewire-0");
+        let pulse_socket_path = format!("{runtime_dir}/pulse/native");
 
-        let mut cmd = tokio::process::Command::new(&kwin_path);
+        let pipewire_session_path = pipewire_session_path()?;
+        let mut cmd = tokio::process::Command::new(&pipewire_session_path);
+        cmd.arg(&runtime_dir).arg("--").arg(&kwin_path);
         cmd.env("KWIN_PLATFORM", "virtual")
             .env("KWIN_WAYLAND_NO_PERMISSION_CHECKS", "1")
             .env("XDG_RUNTIME_DIR", &runtime_dir)
-            .env("PIPEWIRE_REMOTE", &pipewire_socket_path)
             .env("PULSE_SERVER", format!("unix:{pulse_socket_path}"))
             .env("LIBGL_ALWAYS_SOFTWARE", "1")
             .arg("--virtual")
@@ -302,12 +315,15 @@ impl SessionManager {
         // once left real, orphaned `kwin_wayland`/`redfog-test-ux` pairs
         // running after a test run finished). `terminate()`'s own
         // `DirectChild` case still works fine with a plain single-PID
-        // `child.kill()` regardless, since this path has no
-        // `dbus-run-session`-style wrapper forking a separate child in
-        // the first place.
+        // `child.kill()` regardless: `redfog-pipewire-session` execs into
+        // `kwin_wayland` (same PID, not a fork), and its own
+        // pipewire/wireplumber/pipewire-pulse children each have
+        // `maybe_die_with_parent` applied (inside `HeadlessRuntime::start`
+        // itself) against *that* PID — so killing the one tracked PID here
+        // cascades to all of them via PDEATHSIG, no extra tracking needed.
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
         die_with_parent(&mut cmd);
-        let child = cmd.spawn().map_err(|e| format!("failed to spawn {kwin_path}: {e}"))?;
+        let child = cmd.spawn().map_err(|e| format!("failed to spawn {pipewire_session_path:?}: {e}"))?;
 
         let socket_path_buf = PathBuf::from(&wayland_socket_path);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -319,7 +335,7 @@ impl SessionManager {
         }
 
         self.active.lock().unwrap().insert(session_id.to_string(), ActiveSession::DirectChild { child });
-        Ok(wayland_socket_path)
+        Ok(SpawnResult { wayland_socket_path, pipewire_socket_path })
     }
 
     async fn spawn_via_systemd(
@@ -330,7 +346,7 @@ impl SessionManager {
         height: u32,
         socket_name: &str,
         payload: &[String],
-    ) -> Result<String, String> {
+    ) -> Result<SpawnResult, String> {
         let unit_name = format!("redfog-session-{session_id}");
         let runtime_dir = format!("{}/session-{session_id}", default_runtime_dir());
         let wayland_socket_path = format!("{runtime_dir}/{socket_name}");
@@ -367,33 +383,17 @@ impl SessionManager {
             "[Socket]\nListenStream={wayland_socket_path}\nSocketUser={broker_user}\nSocketMode=0660\n"
         );
         let kwin_path = which_kwin_wayland().unwrap_or_else(|| "kwin_wayland".to_string());
-        // KWin's own XDG_RUNTIME_DIR is a fresh, per-session directory (for
-        // Wayland-socket isolation — see design.md's "Cross-user socket
-        // reachability"), but PipeWire/wireplumber stay running under
-        // redfog-server's own identity in *its* runtime dir, per that same
-        // section — so PIPEWIRE_REMOTE must be an absolute path pointing
-        // there, not a bare name that'd resolve inside KWin's own (empty,
-        // unrelated) runtime dir instead.
-        let pipewire_socket_path = format!("{}/pipewire-0", default_runtime_dir());
-        // Same reasoning as pipewire_socket_path: pipewire-pulse also runs
-        // under redfog-server's own identity, in its runtime dir — not
-        // this session's private `runtime_dir`.
-        let pulse_socket_path = pulse_socket_path();
-        // redfog-server owns and creates this socket under its own
-        // identity (see design.md's "Cross-user socket reachability") — the
-        // target user's KWin needs an explicit grant to connect in, since
-        // it's a different uid.
-        //
-        // Two grants are needed, not one: `HeadlessRuntime::start()` sets
-        // its runtime dir to mode 0700 (owner-only) — Unix requires
-        // *execute/traverse* permission on every directory component of a
-        // path, not just read/write on the final file, so without also
-        // granting that on the parent directory, the target user can't even
-        // reach the socket file regardless of its own ACL. Confirmed live:
-        // granting only the socket file left KWin's connection attempt
-        // never even reaching PipeWire's own access-control code at all
-        // (visible in its access-check log) — it failed at the kernel/
-        // filesystem level first, silently, before ever getting there.
+        // This session's own dedicated PipeWire instance — see
+        // `SpawnedSession`'s doc comment for why it's no longer
+        // `redfog-server`'s old process-wide shared one. Spawned as part of
+        // this same systemd unit (via `redfog-pipewire-session`, inserted
+        // into the exec chain below) inside this session's own
+        // already-chowned `runtime_dir` — unlike the old shared-instance
+        // path, `username` needs no *separate* ACL grant on either socket
+        // itself: their own process creates and owns both directly.
+        let pipewire_socket_path = format!("{runtime_dir}/pipewire-0");
+        let pulse_socket_path = format!("{runtime_dir}/pulse/native");
+
         async fn grant_acl(username: &str, path: &str, perm: &str, what: &str) {
             match tokio::process::Command::new("setfacl")
                 .args(["-m", &format!("u:{username}:{perm}"), path])
@@ -415,18 +415,24 @@ impl SessionManager {
                 }
             }
         }
-        for (path, perm, what) in [
-            (default_runtime_dir(), "x", "traverse"),
-            (pipewire_socket_path.clone(), "rw", "connect to"),
-            (format!("{}/pulse", default_runtime_dir()), "x", "traverse"),
-            (pulse_socket_path.clone(), "rw", "connect to"),
-        ] {
-            grant_acl(username, &path, perm, what).await;
-        }
-        // See `redfog_server_user`'s doc comment: without this, redfog-server
-        // (once it's not root/`username` itself) can't even traverse into
-        // `default_runtime_dir()` to reach this session's own Wayland socket
-        // below, regardless of that socket's own permissions.
+        // `username` needs traverse (`x`) on `default_runtime_dir()` itself
+        // just to *reach* their own `runtime_dir` underneath it, regardless
+        // of owning that subdirectory outright — POSIX requires execute
+        // permission on every ancestor path component, not just the final
+        // target. Confirmed live as a real regression, not a hypothetical:
+        // dropping this on the assumption that owning `runtime_dir` made it
+        // unnecessary broke `redfog-pipewire-session`'s very first
+        // `create_dir_all` on its own already-owned directory outright
+        // ("Permission denied" — the failed lookup was on the *parent*, not
+        // the target). `default_runtime_dir()` itself is never chmod'd by
+        // anything, so — unlike the two grants added further down after
+        // `.service` starts — this one's safe to grant this early.
+        //
+        // `redfog-server`'s own identity needs the exact same thing, for
+        // the exact same reason (reaching this session's Wayland socket,
+        // and further down, its PipeWire socket) — see
+        // `redfog_server_user`'s doc comment.
+        grant_acl(username, &default_runtime_dir(), "x", "traverse").await;
         if let Some(server_user) = redfog_server_user() {
             grant_acl(&server_user, &default_runtime_dir(), "x", "traverse").await;
         }
@@ -443,6 +449,7 @@ impl SessionManager {
         // wraps its *entire* process tree — but this systemd unit is a
         // separate process tree that never goes through that.
         let session_init_path = session_init_path()?;
+        let pipewire_session_path = pipewire_session_path()?;
         // `redfog-session-init <username> -- <command>...` (see its own doc
         // comment): does the *correct* uid/gid/supplementary-group drop
         // (initgroups from /etc/group, then setgid, then setuid) before
@@ -461,10 +468,23 @@ impl SessionManager {
         // tree into its own separate `pam_systemd`-created scope, breaking
         // this unit's cgroup-based termination) — the bwrap-as-root fix
         // never depended on a PAM session in the first place.
+        //
+        // `redfog-pipewire-session` (see its own doc comment) is inserted
+        // right after that privilege drop, before `dbus-run-session`/KWin:
+        // it starts this session's own pipewire/wireplumber/pipewire-pulse
+        // trio and blocks until ready, then execs into the rest of the
+        // chain — so KWin's own screencast producer (and anything the
+        // session later plays audio through) only ever sees this session's
+        // own instance, from the very first PipeWire connection either one
+        // makes. Runs as `username` (post-privilege-drop), not root: its
+        // own `/dev/snd`-hiding sandboxing works fine unprivileged (no
+        // re-exposure step needed, unlike GPU sandboxing), same as it
+        // already does for the old shared instance.
         let mut exec_start = format!(
-            "{} {username} -- dbus-run-session -- {kwin_path} --virtual --width {width} --height {height} --scale 1 \
+            "{} {username} -- {} {runtime_dir} -- dbus-run-session -- {kwin_path} --virtual --width {width} --height {height} --scale 1 \
              --no-lockscreen --wayland-fd 3 --socket {socket_name} --xwayland",
-            session_init_path.display()
+            session_init_path.display(),
+            pipewire_session_path.display(),
         );
         if !payload.is_empty() {
             let session_script_path = write_session_script(&runtime_dir, socket_name, &pipewire_socket_path, &pulse_socket_path, payload)?;
@@ -573,11 +593,47 @@ impl SessionManager {
         }
         run_systemctl(&["start", &format!("{unit_name}.service")]).await?;
 
+        // Wait for this session's own PipeWire socket to actually exist
+        // before granting `redfog-server` cross-uid access to it — and
+        // before returning it as ready to connect to at all.
+        // `HeadlessRuntime::start` (deep in the exec chain started above,
+        // inside `redfog-pipewire-session`) chmods `runtime_dir` to 0700
+        // *before* spawning pipewire, and POSIX chmod recalculates a
+        // directory's ACL mask from its new group-class permission bits —
+        // granting the ACL below any earlier than this wouldn't just race
+        // it, that later chmod would silently mask the grant right back
+        // out. This existence check is a reliable proxy for "the chmod
+        // already happened", since it strictly precedes pipewire's own
+        // spawn in `HeadlessRuntime::start`'s own sequence.
+        let pipewire_socket_path_buf = PathBuf::from(&pipewire_socket_path);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !pipewire_socket_path_buf.exists() {
+            if std::time::Instant::now() > deadline {
+                return Err(format!("session PipeWire socket {pipewire_socket_path} failed to appear"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // `redfog-server`'s own audio/video capture (a *third* identity,
+        // distinct from both the broker/root and `username`) needs to reach
+        // this session's own PipeWire socket — same reasoning as the
+        // `wayland_socket_path` grant above, but this one also needs
+        // traverse on `runtime_dir` itself (see this block's own comment on
+        // why that can't be granted any earlier): unlike
+        // `default_runtime_dir()`, this directory gets chmod'd to 0700
+        // during startup, which — again, unlike a plain permission check —
+        // active *use* of chmod on a directory that already has an ACL
+        // recalculates its mask, so this one grant must specifically follow
+        // that chmod rather than just following *a* socket-creation step.
+        if let Some(server_user) = redfog_server_user() {
+            grant_acl(&server_user, &runtime_dir, "x", "traverse").await;
+            grant_acl(&server_user, &pipewire_socket_path, "rw", "connect to").await;
+        }
+
         self.active
             .lock()
             .unwrap()
             .insert(session_id.to_string(), ActiveSession::Systemd { unit_name });
-        Ok(wayland_socket_path)
+        Ok(SpawnResult { wayland_socket_path, pipewire_socket_path })
     }
 
     /// Grants `username` access to a socket/runtime dir the *caller*
@@ -1013,6 +1069,23 @@ fn session_init_path() -> Result<PathBuf, String> {
     Ok(dir.join("redfog-session-init"))
 }
 
+/// Locates the `redfog-pipewire-session` helper binary — see its own doc
+/// comment for what it does. Same lookup convention as
+/// `session_init_path`/`REDFOG_KWIN_WAYLAND_PATH`, including the env var
+/// override for tests/non-standard installs, but this one lives in
+/// `redfog-core`'s own binary output (a separate crate from
+/// `redfog-session-init`), which happens to still land in the same
+/// workspace target dir as this broker binary in every real build/install
+/// layout.
+fn pipewire_session_path() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("REDFOG_PIPEWIRE_SESSION_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    let exe = std::env::current_exe().map_err(|e| format!("failed to determine current_exe: {e}"))?;
+    let dir = exe.parent().ok_or_else(|| format!("{exe:?} has no parent directory"))?;
+    Ok(dir.join("redfog-pipewire-session"))
+}
+
 fn which_kwin_wayland() -> Option<String> {
     std::env::var("REDFOG_KWIN_WAYLAND_PATH").ok()
 }
@@ -1261,31 +1334,3 @@ fn redfog_server_user() -> Option<String> {
     std::env::var("REDFOG_SERVER_USER").ok().filter(|s| !s.is_empty())
 }
 
-/// PipeWire/wireplumber/pipewire-pulse all run under `redfog-server`'s own
-/// identity, in *its* runtime dir (`HeadlessRuntime::start`) — never a
-/// session's own private `runtime_dir` (that's KWin's isolated
-/// `XDG_RUNTIME_DIR`, a completely different directory). A single helper
-/// exists specifically so every call site gets this from one place instead
-/// of hand-building the same path — a hand-built copy of this once drifted
-/// from `pipewire_socket_path`'s equivalent construction and pointed at the
-/// wrong directory, which meant `PULSE_SERVER` never had a pulse server
-/// listening on it at all (confirmed live: KDE showed "connection to sound
-/// server lost").
-fn pulse_socket_path() -> String {
-    format!("{}/pulse/native", default_runtime_dir())
-}
-
-#[cfg(test)]
-mod pulse_socket_path_tests {
-    use super::*;
-
-    #[test]
-    fn always_rooted_at_default_runtime_dir_not_a_session_dir() {
-        // SAFETY: this test doesn't run concurrently with anything else
-        // that reads/writes REDFOG_RUNTIME_DIR — it's the only test in this
-        // crate that touches it.
-        unsafe { std::env::set_var("REDFOG_RUNTIME_DIR", "/tmp/redfog-runtime-test-marker") };
-        assert_eq!(pulse_socket_path(), "/tmp/redfog-runtime-test-marker/pulse/native");
-        unsafe { std::env::remove_var("REDFOG_RUNTIME_DIR") };
-    }
-}
