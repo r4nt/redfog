@@ -203,6 +203,13 @@ if [ "$(id -u)" -ne 0 ]; then
     build_pkgs=(-p redfog-server -p redfog-broker -p redfog-login -p redfog-pair -p redfog-session-init)
     echo "building redfog (release): ${build_pkgs[*]}"
     (cd "$REPO_DIR" && cargo build --release "${build_pkgs[@]}")
+    # redfog-pipewire-session is a `src/bin/` target inside redfog-core, not
+    # its own crate — a separate invocation, not just another `-p` above:
+    # see packaging/arch/PKGBUILD's own build() comment for why combining
+    # it with the `-p`s above fails outright instead of building only what
+    # exists where.
+    echo "building redfog-pipewire-session (release)"
+    (cd "$REPO_DIR" && cargo build --release -p redfog-core --bin redfog-pipewire-session)
 
     echo "re-executing as root for the broker/server run phase (sudo may prompt for your password)..."
     exec sudo -E env "PATH=$PATH" "$SELF" "$@"
@@ -317,6 +324,7 @@ if [ -z "${REDFOG_LIVE_STANDALONE:-}" ] \
     install -Dm755 "$REPO_DIR/target/release/redfog-login" /usr/bin/redfog-login
     install -Dm755 "$REPO_DIR/target/release/redfog-pair" /usr/bin/redfog-pair
     install -Dm755 "$REPO_DIR/target/release/redfog-session-init" /usr/bin/redfog-session-init
+    install -Dm755 "$REPO_DIR/target/release/redfog-pipewire-session" /usr/bin/redfog-pipewire-session
 
     # Ephemeral (/run, not /etc) drop-ins so the debug env vars below never
     # touch the package's own committed units or /etc/redfog/redfog.conf --
