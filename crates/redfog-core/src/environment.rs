@@ -217,6 +217,15 @@ impl HeadlessRuntime {
             let _ = std::fs::copy(SYSTEM_PULSE_CONF, pipewire_config_dir.join("pipewire-pulse.conf"));
         }
 
+        // Create a built-in virtual audio null-sink in this PipeWire instance.
+        // Applications output audio to redfog-audio-sink, which WirePlumber routes
+        // to as the default audio sink. GStreamer pipewiresrc can capture directly
+        // from its monitor ports using stream.capture.sink=true.
+        std::fs::write(
+            pipewire_config_dir.join("pipewire.conf.d/98-redfog-null-sink.conf"),
+            "context.objects = [\n    {\n        factory = adapter\n        args = {\n            factory.name     = support.null-audio-sink\n            node.name        = \"redfog-audio-sink\"\n            node.description = \"Redfog Virtual Audio\"\n            media.class      = \"Audio/Sink\"\n            audio.position   = [ FL FR ]\n        }\n    }\n]\n",
+        )?;
+
         // Specifying access.socket at all switches libpipewire-module-access
         // to socket-based policy. Map our custom socket name
         // "pipewire-0-manager" to unrestricted, and fall back to mapping

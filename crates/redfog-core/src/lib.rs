@@ -1652,20 +1652,12 @@ pub struct AudioLoopback {
     /// without every caller having to separately thread this same path
     /// through again.
     pipewire_socket_path: String,
-    process: Child,
 }
 
 /// Polls `pw-dump` for a node whose `node.name` is `name`, up to `timeout`
 /// — see `AudioLoopback::spawn`'s doc comment for why this exists: without
-/// it, `pw-loopback`'s own `spawn()` (which returns as soon as the process
-/// is *forked*, not once its sink/source nodes actually register with
-/// PipeWire) races whatever starts producing audio next. A plain substring
-/// search on `pw-dump`'s JSON output, not real parsing — `sink_name`/
-/// `capture_name` are generated, session-unique strings (`redfog-audio-
-/// {sink,capture}-{session_name}`), unlikely to collide with anything else
-/// in a real graph dump, and this file already favors shelling out and
-/// checking raw output/exit status over pulling in a JSON crate or a
-/// PipeWire client library binding just for this one thing.
+/// it, any race between PipeWire node instantiation and clients starting to
+/// play audio could lead to audio routing issues.
 fn wait_for_pipewire_node(pipewire_socket_path: &str, name: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -1680,16 +1672,9 @@ fn wait_for_pipewire_node(pipewire_socket_path: &str, name: &str, timeout: Durat
 }
 
 impl AudioLoopback {
-    /// Spawn a loopback named after `session_name` (e.g. the compositor's
-    /// socket name, to keep it unique per session), on `pipewire_socket_path`
-    /// — this session's own dedicated PipeWire instance (see
-    /// `redfog-broker-protocol::SpawnedSession`'s doc comment), not
-    /// whatever the calling process's own ambient `PIPEWIRE_REMOTE` happens
-    /// to be: `redfog-server` is one process serving many concurrent
-    /// sessions, so every subprocess this spawns (`pw-loopback`,
-    /// `pw-metadata`, and `wait_for_pipewire_node`'s own `pw-dump`) gets
-    /// this path set explicitly via `.env()`, safe regardless of whatever
-    /// else is running concurrently in this same process.
+    /// Configure audio routing for `session_name` on `pipewire_socket_path`.
+    /// The virtual audio sink `redfog-audio-sink` is provided in-daemon by PipeWire's
+    /// `support.null-audio-sink` adapter, configured in `pipewire.conf.d/98-redfog-null-sink.conf`.
     ///
     /// Only ever called for `SessionType::User` — Login uses
     /// `make_silent_audio_pipeline` instead of a real `AudioLoopback`, so it
@@ -1705,41 +1690,16 @@ impl AudioLoopback {
     /// audio on a sink nothing captures from anymore — confirmed live as
     /// the root cause of a bug where a User session's audio would go
     /// silent forever after any quit-and-reconnect.
-    pub fn spawn(session_name: &str, pipewire_socket_path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let sink_name = format!("redfog-audio-sink-{session_name}");
-        let capture_name = format!("redfog-audio-capture-{session_name}");
+    pub fn spawn(_session_name: &str, pipewire_socket_path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let sink_name = "redfog-audio-sink".to_string();
+        let capture_name = "redfog-audio-sink".to_string();
 
-        let process = Command::new("pw-loopback")
-            .env("PIPEWIRE_REMOTE", pipewire_socket_path)
-            .arg("-n")
-            .arg(format!("redfog-audio-{session_name}"))
-            .arg("--capture-props")
-            .arg(format!("media.class=Audio/Sink node.name={sink_name}"))
-            .arg("--playback-props")
-            .arg(format!("media.class=Audio/Source node.name={capture_name}"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("failed to spawn pw-loopback: {e}"))?;
-
-        // Wait for both nodes to actually exist before doing anything that
-        // depends on them (the pw-metadata call right below, and — more
+        // Wait for the null-sink node to appear in pw-dump before doing anything that
+        // depends on it (the pw-metadata call right below, and — more
         // importantly — before our own caller goes on to start whatever
-        // will actually produce audio). Confirmed by this struct's own doc
-        // comment above (see "Confirmed live") that skipping this can let
-        // an app's audio stream get routed to the real hardware sink
-        // instead of ours, entirely depending on relative startup timing
-        // between two independently-started async processes -- exactly the
-        // shape of bug that shows up as intermittent, not reliably
-        // reproducible. Best-effort like the pw-metadata call below, not a
-        // hard failure on timeout: proceeding anyway (possibly racy again)
-        // is still strictly better than this session never starting at all
-        // over a slow-to-register loopback.
+        // will actually produce audio).
         if !wait_for_pipewire_node(pipewire_socket_path, &sink_name, Duration::from_secs(5)) {
-            eprintln!("redfog-core: pw-loopback's sink node {sink_name} didn't appear in pw-dump within 5s — continuing anyway, but this session's audio routing may race");
-        }
-        if !wait_for_pipewire_node(pipewire_socket_path, &capture_name, Duration::from_secs(5)) {
-            eprintln!("redfog-core: pw-loopback's capture node {capture_name} didn't appear in pw-dump within 5s — continuing anyway, but this session's audio capture may fail to find it");
+            eprintln!("redfog-core: null sink node {sink_name} didn't appear in pw-dump within 5s — continuing anyway, but this session's audio routing may race");
         }
 
         // Force this session's sink to be the default target for new audio
@@ -1775,15 +1735,7 @@ impl AudioLoopback {
             sink_name,
             capture_name,
             pipewire_socket_path: pipewire_socket_path.to_string(),
-            process,
         })
-    }
-}
-
-impl Drop for AudioLoopback {
-    fn drop(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
     }
 }
 
@@ -1810,27 +1762,27 @@ impl Drop for AudioLoopback {
 /// with signal complexity, which would make the shards non-uniform. Real
 /// Sunshine/GFE encode CBR for the same reason.
 ///
-/// `complexity=8`, not `opusenc`'s own default of 10 (its max): confirmed
-/// live via CPU profiling that libopus was a disproportionately large CPU
-/// consumer given how little actual audio data is involved — traced to two
-/// compounding factors, only one of which is ours to fix. `frame-size=5`
-/// above means encode() runs 4x as often as a typical 20ms VoIP setup
-/// (wire-protocol-mandated, not adjustable — see that property's own doc
-/// comment), and every one of those calls was running at the encoder's
-/// most CPU-expensive quality setting purely by GStreamer's own default,
-/// never deliberately chosen for a real-time interactive use case. 10 is
-/// meant for offline/file encoding where CPU time is free; 8 is a common
-/// real-time-streaming value, trading a small (often inaudible at CBR)
-/// quality difference for less CPU per call -- which matters more here
-/// than usual given that cost is already being paid 4x more often than a
-/// typical Opus setup would pay it.
-/// Shared by every audio pipeline below regardless of source element — see
-/// this function's own doc comment for why `frame-size`/`bitrate-type`/
-/// `complexity` are exactly what they are.
-const AUDIO_ENCODE_TAIL: &str = "! audioconvert name=aconv ! audioresample name=aresample \
-     ! audio/x-raw,format=S16LE,channels=2,rate=48000 \
-     ! opusenc name=aenc frame-size=5 bitrate-type=cbr complexity=8 \
-     ! appsink name=sink sync=false";
+/// `complexity=6` by default, configurable via `REDFOG_OPUS_COMPLEXITY`:
+/// libopus encodes at 200 Hz (`frame-size=5`, wire-protocol-mandated for Moonlight).
+/// At 200 calls/sec, GStreamer's default complexity of 10 uses excessive CPU.
+/// Complexity 6 provides high quality while saving substantial CPU on real-time encoding.
+fn audio_opus_complexity() -> u32 {
+    std::env::var("REDFOG_OPUS_COMPLEXITY")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.min(10))
+        .unwrap_or(6)
+}
+
+fn audio_encode_tail() -> String {
+    let complexity = audio_opus_complexity();
+    format!(
+        "! audioconvert name=aconv ! audioresample name=aresample \
+         ! audio/x-raw,format=S16LE,channels=2,rate=48000 \
+         ! opusenc name=aenc frame-size=5 bitrate-type=cbr complexity={complexity} \
+         ! appsink name=sink sync=false"
+    )
+}
 
 fn audio_pipeline_description(capture_name: &str, client_name: &str) -> String {
     // `provide-clock=false`: fixes a real, confirmed bug where `pipewiresrc`
@@ -1851,8 +1803,9 @@ fn audio_pipeline_description(capture_name: &str, client_name: &str) -> String {
     // same way and made no measurable difference (1/35, statistically the
     // same as the ~5% baseline that test's flawed reused-PipeWire-instance
     // design produced) — ruled out, never landed.
+    let tail = audio_encode_tail();
     format!(
-        "pipewiresrc name=audiosrc target-object={capture_name} client-name={client_name} do-timestamp=true provide-clock=false {AUDIO_ENCODE_TAIL}"
+        r#"pipewiresrc name=audiosrc target-object={capture_name} client-name={client_name} stream-properties="props,stream.capture.sink=true" do-timestamp=true provide-clock=false {tail}"#
     )
 }
 
@@ -1892,7 +1845,8 @@ pub fn open_pipewire_fd(pipewire_socket_path: &str) -> Result<std::os::fd::RawFd
 /// possible — matters here because `opusenc`'s `frame-size=5` still expects
 /// a steady ~5ms cadence downstream, same as the real capture path.
 fn silent_audio_pipeline_description() -> String {
-    format!("audiotestsrc wave=silence is-live=true {AUDIO_ENCODE_TAIL}")
+    let tail = audio_encode_tail();
+    format!("audiotestsrc wave=silence is-live=true {tail}")
 }
 
 /// TEMPORARY diagnostic: counts buffers arriving at `element`'s `sink` pad
@@ -1938,16 +1892,14 @@ where
         .expect("audio pipeline parse failed")
         .dynamic_cast::<gst::Pipeline>()
         .unwrap();
-    // See `probe_buffer_flow`'s own doc comment for why this is here at
-    // all — narrows down a real, still-open "appsink stops firing partway
-    // through" bug to whichever of these is the *last* element a buffer was
-    // ever seen at, including `sink` (appsink) itself: reaching every other
-    // element but never appsink's own sink pad would point at `opusenc`
-    // itself never handing off its encoded output, not at anything on the
-    // Rust side of the `new_sample` callback.
-    for (name, label) in [("aconv", "audioconvert"), ("aresample", "audioresample"), ("aenc", "opusenc"), ("sink", "appsink")] {
-        if let Some(element) = pipeline.by_name(name) {
-            probe_buffer_flow(&element, format!("{pipeline_label}/{label}"));
+    // `probe_buffer_flow` narrows down an appsink stall to whichever element
+    // a buffer was last seen at. Placed behind REDFOG_DEBUG_AUDIO_PROBE to avoid
+    // probe overhead and log spam during normal operation.
+    if std::env::var_os("REDFOG_DEBUG_AUDIO_PROBE").is_some() {
+        for (name, label) in [("aconv", "audioconvert"), ("aresample", "audioresample"), ("aenc", "opusenc"), ("sink", "appsink")] {
+            if let Some(element) = pipeline.by_name(name) {
+                probe_buffer_flow(&element, format!("{pipeline_label}/{label}"));
+            }
         }
     }
     let appsink = pipeline
@@ -2033,13 +1985,13 @@ mod tests {
     }
 
     /// Same encode settings as the real capture path (frame-size/CBR/
-    /// complexity) — both share `AUDIO_ENCODE_TAIL`, but assert on it
-    /// directly so a future split of that constant doesn't go unnoticed.
+    /// complexity) — both share `audio_encode_tail()`, but assert on it
+    /// directly so a future split doesn't go unnoticed.
     #[test]
     fn silent_audio_pipeline_shares_the_same_opus_settings() {
         let desc = silent_audio_pipeline_description();
         assert!(
-            desc.contains("opusenc name=aenc frame-size=5 bitrate-type=cbr complexity=8"),
+            desc.contains("opusenc name=aenc frame-size=5 bitrate-type=cbr complexity=6"),
             "pipeline description: {desc}"
         );
     }

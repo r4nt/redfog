@@ -1280,27 +1280,6 @@ impl SessionManager {
                 }
             });
         };
-        // TEMPORARY diagnostic: `REDFOG_AUDIO_PIPELINE_DELAY_MS` lets us
-        // deliberately shift *when* `pipewiresrc` connects relative to
-        // `AudioLoopback::spawn` returning (which already waited for the
-        // capture node to exist in `pw-dump`, so this tests whether some
-        // *later* stage of PipeWire-side readiness — port negotiation,
-        // format negotiation, first real data arriving — is what the race
-        // is actually against, not raw node existence) — see
-        // `probe_buffer_flow`'s doc comment for the bug this is chasing:
-        // some sessions' `pipewiresrc` delivers exactly one buffer then
-        // never again, despite PipeWire itself continuing to feed it real
-        // data forever after (confirmed live via `pw-top`). Blocks whatever
-        // thread called `build_pipelines` for up to this long — acceptable
-        // only because it's opt-in (default 0, off), bounded, and fires at
-        // most once per session spawn, not because blocking a tokio worker
-        // thread is fine in general (see the `on_input`/`self.shared`
-        // deadlock this project already hit once from exactly that
-        // mistake).
-        if let Some(delay_ms) = std::env::var("REDFOG_AUDIO_PIPELINE_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
-            tracing::info!("build_pipelines(generation={generation}): REDFOG_AUDIO_PIPELINE_DELAY_MS={delay_ms} set, delaying audio pipeline construction");
-            std::thread::sleep(Duration::from_millis(delay_ms));
-        }
         // `audio_client_name` is only meaningful to `pipewiresrc` (see its
         // own comment above) — the silent Login path never touches
         // PipeWire at all, so there's nothing for it to name.
