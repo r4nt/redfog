@@ -1827,9 +1827,9 @@ impl Drop for AudioLoopback {
 /// Shared by every audio pipeline below regardless of source element — see
 /// this function's own doc comment for why `frame-size`/`bitrate-type`/
 /// `complexity` are exactly what they are.
-const AUDIO_ENCODE_TAIL: &str = "! audioconvert ! audioresample \
+const AUDIO_ENCODE_TAIL: &str = "! audioconvert name=aconv ! audioresample name=aresample \
      ! audio/x-raw,format=S16LE,channels=2,rate=48000 \
-     ! opusenc frame-size=5 bitrate-type=cbr complexity=8 \
+     ! opusenc name=aenc frame-size=5 bitrate-type=cbr complexity=8 \
      ! appsink name=sink sync=false";
 
 fn audio_pipeline_description(capture_name: &str, client_name: &str) -> String {
@@ -1875,10 +1875,42 @@ fn silent_audio_pipeline_description() -> String {
     format!("audiotestsrc wave=silence is-live=true {AUDIO_ENCODE_TAIL}")
 }
 
+/// TEMPORARY diagnostic: counts buffers arriving at `element`'s `sink` pad
+/// and logs a heartbeat at most once/second (plus always the very first
+/// buffer), to localize a real, still-open bug — a whole class of session
+/// where `redfog-audio-gen-N` (per `pw-top`) is demonstrably receiving real
+/// data from PipeWire continuously, video keeps working throughout,
+/// GStreamer's own bus reports zero errors or warnings, and yet the
+/// `appsink` callback below stops firing partway through a session — no
+/// confirmation of a send, no confirmation of `session_by_generation`
+/// finding nothing, nothing at all after the first packet or two. A
+/// first-buffer-only probe couldn't distinguish "never worked" from "worked
+/// once, then silently stalled downstream" — this can, and the periodic
+/// heartbeat simply stopping is itself the signal: whichever element's last
+/// log line has the latest timestamp is where the buffer flow actually
+/// died. `label` identifies both the pipeline (its `client-name`, e.g.
+/// `redfog-audio-gen-9`) and the element, since multiple generations'
+/// pipelines can be alive concurrently.
+fn probe_buffer_flow(element: &gst::Element, label: String) {
+    let Some(pad) = element.static_pad("sink") else { return };
+    let count = std::sync::atomic::AtomicU64::new(0);
+    let last_print = Mutex::new(Instant::now() - Duration::from_secs(1));
+    let start = Instant::now();
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+        let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let mut last = last_print.lock().unwrap();
+        if n == 1 || last.elapsed() >= Duration::from_secs(1) {
+            eprintln!("redfog-core: audio pipeline probe [{label}]: {n} buffers so far, after {:?}", start.elapsed());
+            *last = Instant::now();
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
 /// Wires `on_packet` up to `desc`'s `appsink` — shared by
 /// [`make_audio_pipeline`] and [`make_silent_audio_pipeline`], which differ
 /// only in their source element.
-fn build_audio_pipeline<F>(desc: &str, on_packet: F) -> gst::Pipeline
+fn build_audio_pipeline<F>(desc: &str, pipeline_label: &str, on_packet: F) -> gst::Pipeline
 where
     F: Fn(Vec<u8>) + Send + Sync + 'static,
 {
@@ -1886,6 +1918,18 @@ where
         .expect("audio pipeline parse failed")
         .dynamic_cast::<gst::Pipeline>()
         .unwrap();
+    // See `probe_buffer_flow`'s own doc comment for why this is here at
+    // all — narrows down a real, still-open "appsink stops firing partway
+    // through" bug to whichever of these is the *last* element a buffer was
+    // ever seen at, including `sink` (appsink) itself: reaching every other
+    // element but never appsink's own sink pad would point at `opusenc`
+    // itself never handing off its encoded output, not at anything on the
+    // Rust side of the `new_sample` callback.
+    for (name, label) in [("aconv", "audioconvert"), ("aresample", "audioresample"), ("aenc", "opusenc"), ("sink", "appsink")] {
+        if let Some(element) = pipeline.by_name(name) {
+            probe_buffer_flow(&element, format!("{pipeline_label}/{label}"));
+        }
+    }
     let appsink = pipeline
         .by_name("sink").unwrap()
         .dynamic_cast::<gst_app::AppSink>().unwrap();
@@ -1917,7 +1961,7 @@ pub fn make_audio_pipeline<F>(loopback: &AudioLoopback, client_name: &str, on_pa
 where
     F: Fn(Vec<u8>) + Send + Sync + 'static,
 {
-    let pipeline = build_audio_pipeline(&audio_pipeline_description(&loopback.capture_name, client_name), on_packet);
+    let pipeline = build_audio_pipeline(&audio_pipeline_description(&loopback.capture_name, client_name), client_name, on_packet);
     let fd = open_pipewire_fd(&loopback.pipewire_socket_path).expect("open_pipewire_fd for AudioLoopback's own instance");
     pipeline.by_name("audiosrc").expect("audio pipeline always names its pipewiresrc audiosrc").set_property("fd", fd);
     pipeline
@@ -1930,7 +1974,7 @@ pub fn make_silent_audio_pipeline<F>(on_packet: F) -> gst::Pipeline
 where
     F: Fn(Vec<u8>) + Send + Sync + 'static,
 {
-    build_audio_pipeline(&silent_audio_pipeline_description(), on_packet)
+    build_audio_pipeline(&silent_audio_pipeline_description(), "silent", on_packet)
 }
 
 #[cfg(test)]
@@ -1947,7 +1991,7 @@ mod tests {
     #[test]
     fn audio_pipeline_requests_5ms_opus_frames() {
         let desc = audio_pipeline_description("some-capture-node", "some-client");
-        assert!(desc.contains("opusenc frame-size=5"), "pipeline description: {desc}");
+        assert!(desc.contains("opusenc name=aenc frame-size=5"), "pipeline description: {desc}");
     }
 
     /// Guards the audio-FEC shard-uniformity requirement — see
@@ -1974,7 +2018,10 @@ mod tests {
     #[test]
     fn silent_audio_pipeline_shares_the_same_opus_settings() {
         let desc = silent_audio_pipeline_description();
-        assert!(desc.contains("opusenc frame-size=5 bitrate-type=cbr complexity=8"), "pipeline description: {desc}");
+        assert!(
+            desc.contains("opusenc name=aenc frame-size=5 bitrate-type=cbr complexity=8"),
+            "pipeline description: {desc}"
+        );
     }
 
     /// Real parse-and-run check, no live PipeWire needed (unlike the

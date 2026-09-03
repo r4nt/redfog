@@ -1172,6 +1172,19 @@ impl SessionManager {
         // permanently poisons every later session's video/audio too —
         // confirmed live via matching mutex addresses across generations.
         let audio_client_name = format!("redfog-audio-gen-{generation}");
+        // Audio's own counterpart to `video_stats` below — added
+        // specifically to close a real diagnostic gap: unlike video, audio
+        // previously had *no* periodic confirmation that packets were
+        // actually being sent at all, and its one silent-failure path
+        // (`session_by_generation` returning `None`) logged nothing
+        // whatsoever — confirmed live as a real investigation dead end, a
+        // session with a fully healthy PipeWire graph (Chrome linked,
+        // `redfog-audio-gen-N` actively processing real buffers per
+        // `pw-top`) and zero audio reaching the client, with nothing in
+        // the logs to distinguish "never even tried to send" from "sent
+        // fine, client-side problem" from "sent and silently dropped
+        // somewhere in between".
+        let audio_stats = Arc::new(Mutex::new(EncodedFrameStats::new()));
 
         // Login's own real video pipeline is deliberately NOT built here —
         // see `start_streaming`'s doc comment for why (RTSP ANNOUNCE, the
@@ -1191,7 +1204,17 @@ impl SessionManager {
             // video callback above).
             let origin = {
                 let shared = this.shared.lock().unwrap();
-                let Some(session) = session_by_generation(&shared, generation) else { return };
+                let Some(session) = session_by_generation(&shared, generation) else {
+                    // Was silent before — see `audio_stats`'s own doc
+                    // comment for why that was a real diagnostic gap, not a
+                    // hypothetical one. Logged every time this fires
+                    // (potentially every ~5ms while it's happening), not
+                    // rate-limited: if this is ever the actual cause,
+                    // finding out fast matters more than log volume for a
+                    // condition that should never legitimately persist.
+                    tracing::warn!("audio callback for generation={generation}: session_by_generation found nothing — dropping this packet");
+                    return;
+                };
                 session.origin.clone()
             };
             let sender = this.audio_sender.clone();
@@ -1233,6 +1256,7 @@ impl SessionManager {
             // same as video's spawn-based timeout) is enough to guarantee
             // that ordering all the way onto the wire.
             let ping_token = origin.ping_token;
+            let audio_stats = audio_stats.clone();
             handle.block_on(async move {
                 // One batched send for the whole group (still strictly
                 // ordered — see `send_packets`' own doc comment) instead of
@@ -1241,12 +1265,42 @@ impl SessionManager {
                 // the whole group or blocks, not partially per-packet in a
                 // way "drop just this one" ever meaningfully applied to.
                 match tokio::time::timeout(Duration::from_secs(2), sender.send_packets(ping_token, &opus_packets)).await {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        // See `audio_stats`'s own doc comment for why this
+                        // exists at all — positive confirmation that sends
+                        // are actually succeeding, not just the absence of
+                        // a failure warning.
+                        let wire_bytes: usize = opus_packets.iter().map(|p| p.len()).sum();
+                        if let Some((rate, encoded_kbps, wire_kbps)) = audio_stats.lock().unwrap().record(packet.len(), wire_bytes) {
+                            tracing::info!("audio: {rate:.1} pkts/s, {encoded_kbps:.0} kbps encoded / {wire_kbps:.0} kbps wire (generation={generation})");
+                        }
+                    }
                     Ok(Err(e)) => tracing::warn!("audio send failed: {e}"),
                     Err(_) => tracing::warn!("audio send timed out after 2s — dropping this group rather than holding its sender open forever"),
                 }
             });
         };
+        // TEMPORARY diagnostic: `REDFOG_AUDIO_PIPELINE_DELAY_MS` lets us
+        // deliberately shift *when* `pipewiresrc` connects relative to
+        // `AudioLoopback::spawn` returning (which already waited for the
+        // capture node to exist in `pw-dump`, so this tests whether some
+        // *later* stage of PipeWire-side readiness — port negotiation,
+        // format negotiation, first real data arriving — is what the race
+        // is actually against, not raw node existence) — see
+        // `probe_buffer_flow`'s doc comment for the bug this is chasing:
+        // some sessions' `pipewiresrc` delivers exactly one buffer then
+        // never again, despite PipeWire itself continuing to feed it real
+        // data forever after (confirmed live via `pw-top`). Blocks whatever
+        // thread called `build_pipelines` for up to this long — acceptable
+        // only because it's opt-in (default 0, off), bounded, and fires at
+        // most once per session spawn, not because blocking a tokio worker
+        // thread is fine in general (see the `on_input`/`self.shared`
+        // deadlock this project already hit once from exactly that
+        // mistake).
+        if let Some(delay_ms) = std::env::var("REDFOG_AUDIO_PIPELINE_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            tracing::info!("build_pipelines(generation={generation}): REDFOG_AUDIO_PIPELINE_DELAY_MS={delay_ms} set, delaying audio pipeline construction");
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
         // `audio_client_name` is only meaningful to `pipewiresrc` (see its
         // own comment above) — the silent Login path never touches
         // PipeWire at all, so there's nothing for it to name.
