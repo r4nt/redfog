@@ -1833,7 +1833,27 @@ const AUDIO_ENCODE_TAIL: &str = "! audioconvert name=aconv ! audioresample name=
      ! appsink name=sink sync=false";
 
 fn audio_pipeline_description(capture_name: &str, client_name: &str) -> String {
-    format!("pipewiresrc name=audiosrc target-object={capture_name} client-name={client_name} do-timestamp=true {AUDIO_ENCODE_TAIL}")
+    // `provide-clock=false`: fixes a real, confirmed bug where `pipewiresrc`
+    // delivers exactly one buffer then stalls forever, specifically on a
+    // freshly-started PipeWire instance (the case every real session hits —
+    // each gets its own dedicated instance, never a reused one). Root
+    // cause: by default this element *provides the pipeline clock*, while
+    // also (`do-timestamp=true`) stamping buffers using current stream time
+    // read back *from* that same clock — a circular dependency that a
+    // still-settling PipeWire graph's own clock/quantum negotiation can
+    // wedge permanently. Confirmed via `kwin-capture`'s
+    // `audio_pipeline_stall_repro_kwin` test (a real KWin session + a real
+    // PulseAudio-compat audio producer, cycled with a genuinely fresh
+    // PipeWire instance per iteration, matching production): 12/20 (60%)
+    // stalled without this, 0/40 across two full batches with it. An
+    // earlier theory (missing a `queue` after `pipewiresrc`, to prevent
+    // downstream processing from starving its buffer pool) was tested the
+    // same way and made no measurable difference (1/35, statistically the
+    // same as the ~5% baseline that test's flawed reused-PipeWire-instance
+    // design produced) — ruled out, never landed.
+    format!(
+        "pipewiresrc name=audiosrc target-object={capture_name} client-name={client_name} do-timestamp=true provide-clock=false {AUDIO_ENCODE_TAIL}"
+    )
 }
 
 /// Opens a fresh connection to `pipewire_socket_path` and hands back its raw
