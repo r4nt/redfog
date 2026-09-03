@@ -14,7 +14,7 @@
 # Build with: cd packaging/arch && makepkg -si
 
 pkgname=redfog-git
-pkgver=r70.246042d
+pkgver=r97.d4c2f16
 pkgrel=1
 pkgdesc="Moonlight/GameStream-compatible game streaming server for KDE Plasma on Wayland"
 arch=('x86_64')
@@ -68,13 +68,27 @@ backup=('etc/redfog/redfog.conf')
 # about the two environments differed.
 options=('!lto')
 # #branch=main is deliberate, not cosmetic: a bare git+file:// URL clones
-# whatever this repo's *own* HEAD currently is, which in a jj-colocated
-# repo can be a stale, detached commit that doesn't match the "main"
-# bookmark/branch -- confirmed live, silently building an old tree with no
-# error at all. Naming the branch explicitly clones what "main" actually
-# points at, matching a real AUR git+https://... source's usual intent
-# (build the project's main branch) when this URL gets swapped later.
-source=("redfog::git+file://$startdir/../..#branch=main")
+# whatever branch this repo's own git HEAD symref currently points at --
+# which, matching a real AUR git+https://... source's usual intent (build
+# the project's main branch), should always be "main" regardless of
+# whatever's currently checked out here. Naming it explicitly avoids
+# depending on that symref actually pointing at it locally.
+#
+# Set REDFOG_PKG_FROM_HEAD=1 (in the environment before invoking makepkg)
+# to package from HEAD/@ instead -- for locally test-building not-yet-
+# merged work without first moving the main bookmark forward just to make
+# a build possible. Pinned to HEAD's exact commit hash (#commit=...), not
+# a bare git+file:// URL: this repo is jj-colocated, so git's own HEAD is
+# normally *detached* (jj doesn't use git branches for its own working-copy
+# tracking) -- confirmed live that cloning a detached HEAD over file://
+# doesn't follow it at all, silently falling back to some other branch
+# instead (here, right back to main) with no error either way.
+if [ -n "$REDFOG_PKG_FROM_HEAD" ]; then
+    _head_commit="$(git -C "$startdir/../.." rev-parse HEAD)"
+    source=("redfog::git+file://$startdir/../..#commit=$_head_commit")
+else
+    source=("redfog::git+file://$startdir/../..#branch=main")
+fi
 sha256sums=('SKIP')
 
 pkgver() {
@@ -112,6 +126,14 @@ build() {
         -p redfog-login \
         -p redfog-pair \
         -p redfog-session-init
+    # redfog-pipewire-session is a `src/bin/` target inside redfog-core, not
+    # its own crate -- a separate invocation, not just another `-p` above:
+    # `--bin` applies across *every* `-p` package in the same invocation,
+    # not just the one that actually has it, so combining it with the
+    # `-p`s above fails outright ("no bin target named
+    # redfog-pipewire-session in redfog-server") rather than building only
+    # what exists where.
+    cargo build --frozen --release -p redfog-core --bin redfog-pipewire-session
 }
 
 package() {
@@ -122,6 +144,7 @@ package() {
     install -Dm755 target/release/redfog-login        "$pkgdir/usr/bin/redfog-login"
     install -Dm755 target/release/redfog-pair         "$pkgdir/usr/bin/redfog-pair"
     install -Dm755 target/release/redfog-session-init "$pkgdir/usr/bin/redfog-session-init"
+    install -Dm755 target/release/redfog-pipewire-session "$pkgdir/usr/bin/redfog-pipewire-session"
 
     install -Dm644 packaging/arch/redfog-broker.service "$pkgdir/usr/lib/systemd/system/redfog-broker.service"
     install -Dm644 packaging/arch/redfog-server.service "$pkgdir/usr/lib/systemd/system/redfog-server.service"
