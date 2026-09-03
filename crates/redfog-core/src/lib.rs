@@ -188,6 +188,11 @@ pub trait InputSink: Send {
     fn pointer_motion_absolute(&mut self, x: f64, y: f64);
     fn button(&mut self, button: u32, pressed: bool);
     fn axis(&mut self, axis: u32, value: f64);
+    fn touch_down(&mut self, _id: u32, _x: f64, _y: f64) {}
+    fn touch_motion(&mut self, _id: u32, _x: f64, _y: f64) {}
+    fn touch_up(&mut self, _id: u32) {}
+    fn touch_cancel(&mut self) {}
+    fn touch_frame(&mut self) {}
     /// Apply queued events — required for Wayland's fake_input (an explicit
     /// `wl_display_flush`), a no-op for backends whose event delivery is
     /// already synchronous (e.g. `GstElement::send_event`).
@@ -547,6 +552,21 @@ impl InputSink for InputForwarder {
     }
     fn axis(&mut self, axis: u32, value: f64) {
         self.fake_input.axis(axis, value);
+    }
+    fn touch_down(&mut self, id: u32, x: f64, y: f64) {
+        self.fake_input.touch_down(id, x, y);
+    }
+    fn touch_motion(&mut self, id: u32, x: f64, y: f64) {
+        self.fake_input.touch_motion(id, x, y);
+    }
+    fn touch_up(&mut self, id: u32) {
+        self.fake_input.touch_up(id);
+    }
+    fn touch_cancel(&mut self) {
+        self.fake_input.touch_cancel();
+    }
+    fn touch_frame(&mut self) {
+        self.fake_input.touch_frame();
     }
     fn flush(&mut self) {
         let _ = self.conn.flush();

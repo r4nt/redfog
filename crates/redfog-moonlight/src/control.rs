@@ -40,6 +40,11 @@ pub enum InputEvent {
     MouseButtonUp { button: u32 },
     ScrollVertical { amount: i16 },
     ScrollHorizontal { amount: i16 },
+    TouchDown { pointer_id: u32, x: f32, y: f32, pressure: f32 },
+    TouchMotion { pointer_id: u32, x: f32, y: f32, pressure: f32 },
+    TouchUp { pointer_id: u32 },
+    TouchCancel { pointer_id: u32 },
+    TouchCancelAll,
 }
 
 /// `rikey` identifies which session a message came from — matched by
@@ -260,8 +265,18 @@ impl ControlServer {
     fn handle_message(&self, rikey: [u8; 16], buffer: &[u8]) {
         match ControlMessage::parse(buffer, &rikey) {
             Ok(ControlMessage::InputData(payload)) => match decode_input_event(&payload) {
-                Some(event) => self.handler.on_input(rikey, event),
-                None => tracing::trace!("unhandled/unknown input event"),
+                Some(event) => {
+                    tracing::trace!("control input event: {event:?}");
+                    self.handler.on_input(rikey, event);
+                }
+                None => {
+                    let ev_type = if payload.len() >= 4 {
+                        u32::from_le_bytes(payload[0..4].try_into().unwrap())
+                    } else {
+                        0
+                    };
+                    tracing::warn!("unhandled/unknown input event type: 0x{ev_type:08x}, payload_len={}", payload.len());
+                }
             },
             Ok(ControlMessage::RequestIdrFrame) => self.handler.on_request_idr_frame(rikey),
             Ok(ControlMessage::LossStats { last_good_frame }) => self.handler.on_loss_stats(rikey, last_good_frame),
@@ -424,6 +439,36 @@ fn decode_input_event(payload: &[u8]) -> Option<InputEvent> {
                 return None;
             }
             Some(InputEvent::ScrollHorizontal { amount: i16::from_be_bytes(body[0..2].try_into().ok()?) })
+        }
+        0x55000002 => {
+            // Moonlight / Sunshine Touch packet (SS_TOUCH_MAGIC = 0x55000002):
+            // body has 28 bytes:
+            //   [0]: event_type (u8): 0x01=Down, 0x02=Up, 0x03=Move, 0x04=Cancel, 0x07=CancelAll
+            //   [1]: reserved (u8)
+            //   [2..4]: rotation (u16 LE)
+            //   [4..8]: pointer_id (u32 LE)
+            //   [8..12]: x (f32 LE, normalized 0.0..1.0)
+            //   [12..16]: y (f32 LE, normalized 0.0..1.0)
+            //   [16..20]: pressure_or_distance (f32 LE)
+            //   [20..24]: contact_area_minor (f32 LE)
+            //   [24..28]: contact_area_major (f32 LE)
+            if body.len() < 28 {
+                return None;
+            }
+            let event_type = body[0];
+            let pointer_id = u32::from_le_bytes(body[4..8].try_into().ok()?);
+            let x = f32::from_le_bytes(body[8..12].try_into().ok()?);
+            let y = f32::from_le_bytes(body[12..16].try_into().ok()?);
+            let pressure = f32::from_le_bytes(body[16..20].try_into().ok()?);
+
+            match event_type {
+                0x01 => Some(InputEvent::TouchDown { pointer_id, x, y, pressure }),
+                0x02 => Some(InputEvent::TouchUp { pointer_id }),
+                0x03 => Some(InputEvent::TouchMotion { pointer_id, x, y, pressure }),
+                0x04 => Some(InputEvent::TouchCancel { pointer_id }),
+                0x07 => Some(InputEvent::TouchCancelAll),
+                _ => None,
+            }
         }
         _ => None, // gamepad and other event types: deferred (see plan doc)
     }
@@ -683,5 +728,88 @@ mod tests {
         buffer.extend([0u8; 8]);
         let key = [0u8; 16];
         assert!(ControlMessage::parse(&buffer, &key).is_err());
+    }
+
+    #[test]
+    fn touch_down_and_up_decodes() {
+        let key = [0x77u8; 16];
+        let mut body = Vec::new();
+        body.push(0x01); // event_type: Down
+        body.push(0x00); // reserved
+        body.extend(0u16.to_le_bytes()); // rotation
+        body.extend(5u32.to_le_bytes()); // pointer_id
+        body.extend(0.25f32.to_le_bytes()); // x
+        body.extend(0.75f32.to_le_bytes()); // y
+        body.extend(0.5f32.to_le_bytes()); // pressure
+        body.extend(0.0f32.to_le_bytes()); // minor
+        body.extend(0.0f32.to_le_bytes()); // major
+
+        let inner = input_data_message(0x55000002, &body);
+        let encrypted = encrypt_message(&key, 0, &inner);
+
+        match ControlMessage::parse(&encrypted, &key).unwrap() {
+            ControlMessage::InputData(payload) => {
+                let event = decode_input_event(&payload).unwrap();
+                assert_eq!(
+                    event,
+                    InputEvent::TouchDown {
+                        pointer_id: 5,
+                        x: 0.25,
+                        y: 0.75,
+                        pressure: 0.5,
+                    }
+                );
+            }
+            _ => panic!("expected InputData"),
+        }
+
+        let mut up_body = Vec::new();
+        up_body.push(0x02); // event_type: Up
+        up_body.push(0x00); // reserved
+        up_body.extend(0u16.to_le_bytes());
+        up_body.extend(5u32.to_le_bytes());
+        up_body.extend([0u8; 20]); // x, y, pressure, contact areas
+
+        let inner_up = input_data_message(0x55000002, &up_body);
+        let encrypted_up = encrypt_message(&key, 1, &inner_up);
+        match ControlMessage::parse(&encrypted_up, &key).unwrap() {
+            ControlMessage::InputData(payload) => {
+                let event = decode_input_event(&payload).unwrap();
+                assert_eq!(event, InputEvent::TouchUp { pointer_id: 5 });
+            }
+            _ => panic!("expected InputData"),
+        }
+
+        let mut cancel_body = Vec::new();
+        cancel_body.push(0x04); // event_type: Cancel
+        cancel_body.push(0x00);
+        cancel_body.extend(0u16.to_le_bytes());
+        cancel_body.extend(5u32.to_le_bytes());
+        cancel_body.extend([0u8; 20]);
+
+        let inner_cancel = input_data_message(0x55000002, &cancel_body);
+        let encrypted_cancel = encrypt_message(&key, 2, &inner_cancel);
+        match ControlMessage::parse(&encrypted_cancel, &key).unwrap() {
+            ControlMessage::InputData(payload) => {
+                let event = decode_input_event(&payload).unwrap();
+                assert_eq!(event, InputEvent::TouchCancel { pointer_id: 5 });
+            }
+            _ => panic!("expected InputData"),
+        }
+
+        let mut cancel_all_body = Vec::new();
+        cancel_all_body.push(0x07); // event_type: CancelAll
+        cancel_all_body.push(0x00);
+        cancel_all_body.extend([0u8; 26]);
+
+        let inner_cancel_all = input_data_message(0x55000002, &cancel_all_body);
+        let encrypted_cancel_all = encrypt_message(&key, 3, &inner_cancel_all);
+        match ControlMessage::parse(&encrypted_cancel_all, &key).unwrap() {
+            ControlMessage::InputData(payload) => {
+                let event = decode_input_event(&payload).unwrap();
+                assert_eq!(event, InputEvent::TouchCancelAll);
+            }
+            _ => panic!("expected InputData"),
+        }
     }
 }

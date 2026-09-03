@@ -318,6 +318,28 @@ impl InputSink for HeadlessLoginInputSink {
     fn axis(&mut self, axis: u32, value: f64) {
         let _ = self.tx.send(redfog_login_protocol::render::LoginInputEvent::MouseAxis { axis, value });
     }
+    fn touch_down(&mut self, id: u32, x: f64, y: f64) {
+        if id == 0 {
+            let _ = self.tx.send(redfog_login_protocol::render::LoginInputEvent::MouseMoveAbsolute { x, y });
+            let _ = self.tx.send(redfog_login_protocol::render::LoginInputEvent::MouseButton {
+                button: 0x110, // BTN_LEFT
+                pressed: true,
+            });
+        }
+    }
+    fn touch_motion(&mut self, id: u32, x: f64, y: f64) {
+        if id == 0 {
+            let _ = self.tx.send(redfog_login_protocol::render::LoginInputEvent::MouseMoveAbsolute { x, y });
+        }
+    }
+    fn touch_up(&mut self, id: u32) {
+        if id == 0 {
+            let _ = self.tx.send(redfog_login_protocol::render::LoginInputEvent::MouseButton {
+                button: 0x110, // BTN_LEFT
+                pressed: false,
+            });
+        }
+    }
 }
 
 /// Prepares (but does not build any GStreamer element for, and does not

@@ -186,6 +186,24 @@ impl eframe::App for TestUxApp {
                             std::process::exit(0);
                         }
                     }
+                    // Real touch input, distinct from the synthesized
+                    // PointerMoved/PointerButton egui *also* sends alongside
+                    // it (see this variant's own doc comment) — logged
+                    // separately so a test can tell the two apart and prove
+                    // genuine multi-touch data (not just mouse emulation)
+                    // reached this session, all the way from the wire
+                    // protocol through `redfog_moonlight::session`'s touch
+                    // dispatch and the real `org_kde_kwin_fake_input`
+                    // Wayland round trip.
+                    egui::Event::Touch { id, phase, pos, .. } => {
+                        let phase_name = match phase {
+                            egui::TouchPhase::Start => "touch_down",
+                            egui::TouchPhase::Move => "touch_motion",
+                            egui::TouchPhase::End => "touch_up",
+                            egui::TouchPhase::Cancel => "touch_cancel",
+                        };
+                        println!("TESTUX[{label}]: {phase_name} id={} x={} y={}", id.0, pos.x, pos.y);
+                    }
                     _ => {}
                 }
             }

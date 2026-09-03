@@ -20,7 +20,7 @@
 //! `Backend::GstWaylandDisplay` concurrently is unverified and not
 //! recommended, even though nothing here enforces it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -238,6 +238,10 @@ struct RunningSession {
     /// else, so every read site below just `.as_mut()`/`.as_ref()`s past it.
     compositor: Option<SpawnedCompositor>,
     input_forwarder: Box<dyn InputSink>,
+    /// Tracks active touch pointer IDs currently down in this session.
+    /// Used to avoid leaking touch slots if a release packet is dropped,
+    /// and to ensure all slots are cleanly released on cancel or teardown.
+    active_touch_ids: HashSet<u32>,
     video_pipeline: gstreamer::Pipeline,
     audio_pipeline: gstreamer::Pipeline,
     /// `Some` only for `VideoEncoder::NvencDirect` — see `build_pipelines`.
@@ -1501,6 +1505,7 @@ impl SessionManager {
             codec,
             compositor: Some(compositor),
             input_forwarder,
+            active_touch_ids: HashSet::new(),
             video_pipeline,
             audio_pipeline,
             cuda_direct_session,
@@ -2542,6 +2547,9 @@ fn background_or_discard(session: RunningSession, background_sessions: &Mutex<Ha
     match &session.kind {
         SessionType::User(username) => {
             let username = username.clone();
+            let mut session = session;
+            release_all_touches(&mut session.active_touch_ids, session.input_forwarder.as_mut());
+            session.input_forwarder.flush();
             // Keeping the GStreamer pipelines running in the `Playing` state
             // during backgrounding avoids the need to recreate the screencast
             // stream on resume, which originally caused 1 FPS throttling by
@@ -2636,6 +2644,10 @@ fn discard_running_session(mut session: RunningSession) {
     // clone of the pipeline, so it can actually be freed once this
     // function's own clones are `Null`'d too — see `bus_watchers_stop`'s
     // doc comment for why `set_state(Null)` alone doesn't achieve that.
+    // Ensure any held touch contacts are cleanly lifted before destroying session
+    release_all_touches(&mut session.active_touch_ids, session.input_forwarder.as_mut());
+    session.input_forwarder.flush();
+
     session.bus_watchers_stop.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let video_pipeline = session.video_pipeline.clone();
@@ -2880,6 +2892,69 @@ impl RtspHandler for SessionManager {
     }
 }
 
+/// Scales one wire-protocol touch coordinate (`InputEvent::TouchDown`/
+/// `TouchMotion`'s `x`/`y` — normalized 0.0-1.0 across the video area) into
+/// a pixel coordinate for a session of `dimension` pixels along that axis —
+/// clamped the same way `MouseMoveAbsolute`'s handling is, so `1.0` (or
+/// anything past it) never lands exactly on `dimension`: valid pixel
+/// coordinates run `0` to `dimension - 1`.
+fn scale_touch_coord(normalized: f32, dimension: u32) -> f64 {
+    (normalized as f64 * dimension as f64).clamp(0.0, dimension as f64 - 1.0)
+}
+
+/// One touch went down at `(x, y)` (already scaled to pixel coordinates —
+/// see `scale_touch_coord`) — forwards it to `fwd`, first releasing
+/// `pointer_id`'s slot if it was already marked down (a lost Up packet,
+/// confirmed live to otherwise leave a permanently stuck touch slot in
+/// KWin). Extracted out of `on_input`'s own match arm so this bookkeeping
+/// is unit-testable without needing a full `SessionManager`/
+/// `RunningSession` (GStreamer pipelines, a real compositor, ...) just to
+/// exercise it.
+fn touch_down(active_touch_ids: &mut HashSet<u32>, fwd: &mut dyn InputSink, pointer_id: u32, x: f64, y: f64) {
+    if active_touch_ids.contains(&pointer_id) {
+        fwd.touch_up(pointer_id);
+        fwd.touch_frame();
+    }
+    active_touch_ids.insert(pointer_id);
+    fwd.touch_down(pointer_id, x, y);
+    fwd.touch_frame();
+}
+
+/// One touch moved to `(x, y)` — synthesizes a `touch_down` instead of a
+/// `touch_motion` if `pointer_id`'s own Down packet was ever lost, so
+/// motion is always valid from the forwarder's perspective. `HashSet::
+/// insert` returning `true` (newly inserted, i.e. wasn't already active)
+/// doubles as the "did we miss the Down" check.
+fn touch_motion(active_touch_ids: &mut HashSet<u32>, fwd: &mut dyn InputSink, pointer_id: u32, x: f64, y: f64) {
+    if active_touch_ids.insert(pointer_id) {
+        fwd.touch_down(pointer_id, x, y);
+    } else {
+        fwd.touch_motion(pointer_id, x, y);
+    }
+    fwd.touch_frame();
+}
+
+/// One touch lifted or got cancelled — identical handling either way (see
+/// `on_input`'s own `TouchUp`/`TouchCancel` arms, which differ only in
+/// their log message).
+fn touch_up(active_touch_ids: &mut HashSet<u32>, fwd: &mut dyn InputSink, pointer_id: u32) {
+    active_touch_ids.remove(&pointer_id);
+    fwd.touch_up(pointer_id);
+    fwd.touch_frame();
+}
+
+/// Releases every currently-active touch — shared by `on_input`'s
+/// `TouchCancelAll` handling and every place a session gets torn down or
+/// backgrounded mid-gesture (`background_or_discard`, `discard_running_
+/// session`), so a client disconnecting or backgrounding mid-touch never
+/// leaves a phantom contact held down forever in KWin.
+fn release_all_touches(active_touch_ids: &mut HashSet<u32>, fwd: &mut dyn InputSink) {
+    for id in active_touch_ids.drain() {
+        fwd.touch_up(id);
+    }
+    fwd.touch_frame();
+}
+
 impl ControlEventHandler for SessionManager {
     fn on_input(&self, rikey: [u8; 16], event: InputEvent) {
         let mut shared = self.shared.lock().unwrap();
@@ -2924,9 +2999,14 @@ impl ControlEventHandler for SessionManager {
                     );
                 }
                 if screen_width > 0 && screen_height > 0 {
-                    // Client viewport coords -> our actual output resolution.
-                    let scaled_x = x as f64 / screen_width as f64 * session.width as f64;
-                    let scaled_y = y as f64 / screen_height as f64 * session.height as f64;
+                    // Moonlight client coordinates run from 0 to (screen_width-1, screen_height-1)
+                    // or 0 to (screen_width, screen_height). Use max(screen_width - 1, 1) if x reaches screen_width - 1.
+                    let max_x = if screen_width > 1 { (screen_width - 1) as f64 } else { screen_width as f64 };
+                    let max_y = if screen_height > 1 { (screen_height - 1) as f64 } else { screen_height as f64 };
+                    let target_max_x = (session.width.saturating_sub(1)) as f64;
+                    let target_max_y = (session.height.saturating_sub(1)) as f64;
+                    let scaled_x = (x as f64 / max_x * target_max_x).clamp(0.0, target_max_x);
+                    let scaled_y = (y as f64 / max_y * target_max_y).clamp(0.0, target_max_y);
                     fwd.pointer_motion_absolute(scaled_x, scaled_y);
                 }
             }
@@ -2959,8 +3039,32 @@ impl ControlEventHandler for SessionManager {
                 }
                 fwd.axis(1, amount as f64)
             }
+            InputEvent::TouchDown { pointer_id, x, y, .. } => {
+                let px = scale_touch_coord(x, session.width);
+                let py = scale_touch_coord(y, session.height);
+                tracing::info!("touch event: TouchDown id={pointer_id} x={px:.1} y={py:.1} (active_before={})", session.active_touch_ids.len());
+                touch_down(&mut session.active_touch_ids, fwd.as_mut(), pointer_id, px, py);
+            }
+            InputEvent::TouchMotion { pointer_id, x, y, .. } => {
+                let px = scale_touch_coord(x, session.width);
+                let py = scale_touch_coord(y, session.height);
+                tracing::info!("touch event: TouchMotion id={pointer_id} x={px:.1} y={py:.1}");
+                touch_motion(&mut session.active_touch_ids, fwd.as_mut(), pointer_id, px, py);
+            }
+            InputEvent::TouchUp { pointer_id } => {
+                touch_up(&mut session.active_touch_ids, fwd.as_mut(), pointer_id);
+                tracing::info!("touch event: TouchUp id={pointer_id} (active_remaining={})", session.active_touch_ids.len());
+            }
+            InputEvent::TouchCancel { pointer_id } => {
+                touch_up(&mut session.active_touch_ids, fwd.as_mut(), pointer_id);
+                tracing::info!("touch event: TouchCancel id={pointer_id} (active_remaining={})", session.active_touch_ids.len());
+            }
+            InputEvent::TouchCancelAll => {
+                tracing::info!("touch event: TouchCancelAll (releasing {} active touches)", session.active_touch_ids.len());
+                release_all_touches(&mut session.active_touch_ids, fwd.as_mut());
+            }
         }
-        fwd.flush();
+        session.input_forwarder.flush();
     }
 
     fn on_request_idr_frame(&self, rikey: [u8; 16]) {
@@ -3078,6 +3182,164 @@ mod adaptive_bitrate_tests {
         // target/4 would be 500 for a 2_000 target, but the floor never
         // goes below 1_000 regardless of how low the configured target is.
         assert_eq!(adapt_bitrate_kbps(1_050, 2_000, 10), 1_000);
+    }
+}
+
+#[cfg(test)]
+mod touch_tests {
+    use super::{release_all_touches, scale_touch_coord, touch_down, touch_motion, touch_up};
+    use redfog_core::InputSink;
+    use std::collections::HashSet;
+
+    /// Records every call it receives, in order, as a short tag string —
+    /// exercises `on_input`'s extracted touch-bookkeeping helpers
+    /// (`touch_down`/`touch_motion`/`touch_up`/`release_all_touches`)
+    /// against a real `InputSink` implementation without needing a full
+    /// `SessionManager`/`RunningSession` (GStreamer pipelines, a real
+    /// compositor, ...) — this is exactly the logic confirmed live to be
+    /// working correctly (see redfog project memory/commit history for the
+    /// real session capture this was validated against): a clean Down ->
+    /// many Motion -> Up sequence, and the two recovery paths ("stuck slot"
+    /// on a repeated Down, "missed Down" on a bare Motion) that keep a
+    /// client's own dropped packets from ever wedging a touch permanently
+    /// down in KWin.
+    #[derive(Default)]
+    struct MockInputSink(Vec<String>);
+
+    impl InputSink for MockInputSink {
+        fn keyboard_key(&mut self, _keycode: u32, _pressed: bool) {}
+        fn pointer_motion(&mut self, _dx: f64, _dy: f64) {}
+        fn pointer_motion_absolute(&mut self, _x: f64, _y: f64) {}
+        fn button(&mut self, _button: u32, _pressed: bool) {}
+        fn axis(&mut self, _axis: u32, _value: f64) {}
+        fn touch_down(&mut self, id: u32, x: f64, y: f64) {
+            self.0.push(format!("down({id}, {x}, {y})"));
+        }
+        fn touch_motion(&mut self, id: u32, x: f64, y: f64) {
+            self.0.push(format!("motion({id}, {x}, {y})"));
+        }
+        fn touch_up(&mut self, id: u32) {
+            self.0.push(format!("up({id})"));
+        }
+        fn touch_cancel(&mut self) {
+            self.0.push("cancel".to_string());
+        }
+        fn touch_frame(&mut self) {
+            self.0.push("frame".to_string());
+        }
+    }
+
+    #[test]
+    fn down_then_motion_then_up_forwards_every_call_in_order() {
+        let mut active = HashSet::new();
+        let mut fwd = MockInputSink::default();
+
+        touch_down(&mut active, &mut fwd, 1, 10.0, 20.0);
+        touch_motion(&mut active, &mut fwd, 1, 12.0, 22.0);
+        touch_up(&mut active, &mut fwd, 1);
+
+        assert_eq!(fwd.0, vec!["down(1, 10, 20)", "frame", "motion(1, 12, 22)", "frame", "up(1)", "frame",]);
+        assert!(active.is_empty(), "pointer 1 should no longer be active after Up");
+    }
+
+    /// A Down for a `pointer_id` that's already marked active (its previous
+    /// Up packet was lost somewhere) must release the stuck slot first —
+    /// confirmed live this is what prevents a touch staying permanently
+    /// held down in KWin.
+    #[test]
+    fn down_recovers_a_stuck_slot_before_starting_the_new_touch() {
+        let mut active = HashSet::from([1]);
+        let mut fwd = MockInputSink::default();
+
+        touch_down(&mut active, &mut fwd, 1, 5.0, 5.0);
+
+        assert_eq!(fwd.0, vec!["up(1)", "frame", "down(1, 5, 5)", "frame",]);
+        assert!(active.contains(&1));
+    }
+
+    /// A Motion for a `pointer_id` that was never marked active (its Down
+    /// packet was lost) must synthesize a Down instead of sending a bare
+    /// Motion, so the forwarder never sees motion for a contact it never
+    /// saw start.
+    #[test]
+    fn motion_synthesizes_a_missed_down() {
+        let mut active = HashSet::new();
+        let mut fwd = MockInputSink::default();
+
+        touch_motion(&mut active, &mut fwd, 7, 1.0, 2.0);
+
+        assert_eq!(fwd.0, vec!["down(7, 1, 2)", "frame",]);
+        assert!(active.contains(&7));
+    }
+
+    /// Once a pointer is already active, further Motion calls forward as
+    /// real motion, not repeated synthesized Downs.
+    #[test]
+    fn motion_forwards_as_motion_once_the_pointer_is_already_active() {
+        let mut active = HashSet::from([7]);
+        let mut fwd = MockInputSink::default();
+
+        touch_motion(&mut active, &mut fwd, 7, 3.0, 4.0);
+
+        assert_eq!(fwd.0, vec!["motion(7, 3, 4)", "frame",]);
+    }
+
+    #[test]
+    fn up_removes_the_pointer_from_the_active_set() {
+        let mut active = HashSet::from([1, 2]);
+        let mut fwd = MockInputSink::default();
+
+        touch_up(&mut active, &mut fwd, 1);
+
+        assert_eq!(active, HashSet::from([2]));
+        assert_eq!(fwd.0, vec!["up(1)", "frame",]);
+    }
+
+    /// `TouchCancelAll` (focus loss, session backgrounding/teardown mid-
+    /// gesture, ...) must release every active touch, each with its own
+    /// `touch_up`, all under one trailing `touch_frame` — not one frame per
+    /// touch — so a client that was mid-multi-touch-gesture when the
+    /// session went away never leaves any of its contacts stuck down.
+    #[test]
+    fn release_all_touches_lifts_every_active_pointer_under_one_frame() {
+        let mut active = HashSet::from([1, 2, 3]);
+        let mut fwd = MockInputSink::default();
+
+        release_all_touches(&mut active, &mut fwd);
+
+        assert!(active.is_empty());
+        assert_eq!(fwd.0.iter().filter(|c| c.as_str() == "frame").count(), 1, "exactly one trailing frame, not one per touch");
+        for id in [1, 2, 3] {
+            assert!(fwd.0.contains(&format!("up({id})")), "expected an up({id}) call, got {:?}", fwd.0);
+        }
+    }
+
+    #[test]
+    fn release_all_touches_on_an_empty_set_still_sends_a_frame() {
+        let mut active = HashSet::new();
+        let mut fwd = MockInputSink::default();
+
+        release_all_touches(&mut active, &mut fwd);
+
+        assert_eq!(fwd.0, vec!["frame".to_string()]);
+    }
+
+    #[test]
+    fn scale_touch_coord_maps_the_normalized_range_onto_pixel_coordinates() {
+        assert_eq!(scale_touch_coord(0.0, 1920), 0.0);
+        assert_eq!(scale_touch_coord(0.5, 1920), 960.0);
+        // The top edge (1.0) must clamp to dimension - 1, never landing
+        // exactly on `dimension` — matching MouseMoveAbsolute's own
+        // reasoning: valid pixel coordinates run 0..dimension-1.
+        assert_eq!(scale_touch_coord(1.0, 1920), 1919.0);
+    }
+
+    #[test]
+    fn scale_touch_coord_clamps_out_of_range_input() {
+        // Real clients shouldn't send these, but a malformed/adversarial
+        // packet must never produce an out-of-bounds coordinate.
+        assert_eq!(scale_touch_coord(-0.5, 1920), 0.0);
+        assert_eq!(scale_touch_coord(2.0, 1920), 1919.0);
     }
 }
 

@@ -345,7 +345,7 @@ impl RtspServer {
             "v=0\r\n\
              o=redfog 0 0 IN IPv4 0.0.0.0\r\n\
              s=redfog-server\r\n\
-             a=x-ss-general.featureFlags:0\r\n\
+             a=x-ss-general.featureFlags:1\r\n\
              a=x-ss-general.encryptionSupported:1\r\n\
              a=x-nv-video[0].videoPort:{video_port}\r\n\
              a=x-nv-general.serverControlPort:{control_port}\r\n\

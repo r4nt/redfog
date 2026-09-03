@@ -49,7 +49,7 @@ use moonlight_common::http::pair::PairPin;
 use moonlight_common::http::{ClientIdentifier, ClientSecret};
 use moonlight_common::stream::audio::AudioConfig;
 use moonlight_common::stream::control::{
-    ActiveGamepads, KeyAction, KeyCode, KeyFlags, KeyModifiers, MouseButton, MouseButtonAction,
+    ActiveGamepads, KeyAction, KeyCode, KeyFlags, KeyModifiers, MouseButton, MouseButtonAction, TouchEventType,
 };
 use moonlight_common::stream::proto::control::input_batcher::ClientInputEvent;
 use moonlight_common::stream::tokio::MoonlightStream;
@@ -1177,6 +1177,208 @@ async fn control_channel_survives_resume_then_reconnect() {
     })
     .await
     .expect("control_channel_survives_resume_then_reconnect timed out — the control channel never recovered after resume+reconnect");
+}
+
+/// End-to-end proof that touch input actually reaches a session — the real
+/// wire protocol (`ClientInputEvent::Touch`, the reference client's own
+/// encoding), through `redfog-server`'s RTSP+ENet control channel,
+/// `redfog_moonlight::session`'s touch dispatch (`on_input`'s `TouchDown`/
+/// `TouchMotion`/`TouchUp` handling — see `session::touch_tests` for the
+/// same logic's fast, exhaustive unit coverage of edge cases this test
+/// doesn't re-cover), the real `org_kde_kwin_fake_input` Wayland protocol,
+/// and a real `kwin_wayland` compositor, landing as genuine
+/// `egui::Event::Touch` events in `redfog-test-ux` (not the `PointerMoved`/
+/// `PointerButton` egui also synthesizes alongside real touch input — see
+/// that crate's own `Event::Touch` logging, added specifically so this test
+/// can tell genuine multi-touch data apart from mouse emulation).
+///
+/// Deliberately run against a *resumed* session, not a fresh one — reusing
+/// `control_channel_survives_resume_then_reconnect`'s own connect ->
+/// handoff -> disconnect -> reconnect -> resume sequence up through
+/// `"resuming existing session for user"` — since that's the exact shape of
+/// session live touch input problems have actually been investigated
+/// against (see project history), not an incidental choice.
+#[cfg(feature = "compositor-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn touch_input_reaches_a_resumed_user_session() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
+
+        let server = TestServer::spawn();
+
+        let client_identity = ServerIdentity::generate().expect("generate client identity");
+        let client_identifier = ClientIdentifier::from_pem(pem::parse(&client_identity.cert_pem).unwrap());
+        let client_secret = ClientSecret::from_pem(pem::parse(&client_identity.private_key_pem).unwrap());
+
+        let host = MoonlightHost::<TokioHyperClient>::new("127.0.0.1".to_string(), server.http_port, Some("it-client".to_string()))
+            .expect("construct MoonlightHost");
+
+        let pin = PairPin::new_random(&RustCryptoBackend).expect("generate pin");
+        let pin_str = pin.to_string();
+        let http_port = server.http_port;
+        let submit_task = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            ureq::post(&format!("http://127.0.0.1:{http_port}/submit-pin"))
+                .send_form(&[("uniqueid", "it-client"), ("pin", &pin_str)])
+                .expect("submit-pin request");
+        });
+        host.pair(&client_identifier, &client_secret, "connection-integration-test".to_string(), pin, RustCryptoBackend)
+            .await
+            .expect("pairing must succeed");
+        submit_task.await.unwrap();
+
+        let mut settings = default_stream_settings();
+        let server_version = host.version().await.expect("server version");
+        let gfe_version = host.gfe_version().await.expect("gfe version");
+        let codec_support = host.server_codec_mode_support().await.expect("codec support");
+        settings.adjust_for_server(server_version, &gfe_version, codec_support).expect("settings compatible");
+        let crypto_backend = Arc::new(RustCryptoBackend);
+
+        // ---- First connection: Login, then handoff to a fresh User session. ----
+        let stream_config = host
+            .start_stream(1, &settings, AesKey::new_random(&RustCryptoBackend).expect("aes key"), AesIv(1), "")
+            .await
+            .expect("first launch must succeed");
+        let stream = MoonlightStream::connect(stream_config, settings.clone(), crypto_backend.clone(), video_capabilities())
+            .await
+            .expect("first stream must connect");
+        server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
+        send_input_until_seen(
+            &server.stdout_lines,
+            &stream,
+            ClientInputEvent::MouseMoveAbsolute { x: 640, y: 360, reference_width: 1280, reference_height: 720 },
+            "TESTUX[login]: pointer_moved",
+            Duration::from_secs(10),
+        )
+        .await;
+        send_input_retrying(&stream, ClientInputEvent::MouseButton { action: MouseButtonAction::Press, button: MouseButton::Left }).await;
+        send_input_retrying(&stream, ClientInputEvent::MouseButton { action: MouseButtonAction::Release, button: MouseButton::Left }).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        send_key(&stream, VK_Q, true).await;
+        send_key(&stream, VK_Q, false).await;
+        server.wait_for_stdout("TESTUX[redfog-user-0]: started", Duration::from_secs(45)).await;
+
+        // ---- Disconnect, reconnect: backgrounds the User session, shows a
+        // fresh Login. ----
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let login_started_before_resume = server.count_stdout("TESTUX[login]: started");
+        let stream_config = host
+            .start_stream(1, &settings, AesKey::new_random(&RustCryptoBackend).expect("aes key"), AesIv(1), "")
+            .await
+            .expect("second launch must succeed");
+        let stream = MoonlightStream::connect(stream_config, settings, crypto_backend, video_capabilities())
+            .await
+            .expect("second stream must connect");
+        server
+            .wait_for_new_stdout("TESTUX[login]: started", login_started_before_resume, Duration::from_secs(10))
+            .await;
+
+        // ---- Log in again as the same account — `handoff_to_user` finds
+        // the User session already backgrounded and resumes it instead of
+        // spawning fresh. ----
+        let resumed_before = server.count_stdout("resuming existing session for user");
+        send_input_until_seen(
+            &server.stdout_lines,
+            &stream,
+            ClientInputEvent::MouseMoveAbsolute { x: 640, y: 360, reference_width: 1280, reference_height: 720 },
+            "TESTUX[login]: pointer_moved",
+            Duration::from_secs(10),
+        )
+        .await;
+        send_input_retrying(&stream, ClientInputEvent::MouseButton { action: MouseButtonAction::Press, button: MouseButton::Left }).await;
+        send_input_retrying(&stream, ClientInputEvent::MouseButton { action: MouseButtonAction::Release, button: MouseButton::Left }).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        send_key(&stream, VK_Q, true).await;
+        send_key(&stream, VK_Q, false).await;
+        server.wait_for_new_stdout("resuming existing session for user", resumed_before, Duration::from_secs(10)).await;
+        // Settle time before driving input — matches
+        // `control_channel_survives_resume_then_reconnect`'s own reasoning:
+        // `handoff_to_user`'s resume path is still finishing async work
+        // (`rebuild_for_resume`, `start_streaming`) for a moment after the
+        // log line above appears.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // ---- The actual thing under test: a real one-finger drag gesture
+        // (Down -> several Move -> Up, the same shape as the live "scroll"
+        // gesture this was investigated against) reaching the *resumed*
+        // session's real Wayland client as genuine touch events. ----
+        const POINTER_ID: u32 = 1;
+        send_input_until_seen(
+            &server.stdout_lines,
+            &stream,
+            ClientInputEvent::Touch {
+                event_type: TouchEventType::Down,
+                rotation: None,
+                pointer_id: POINTER_ID,
+                x: 0.5,
+                y: 0.5,
+                pressure_or_distance: 1.0,
+                contact_area_minor: 0.0,
+                contact_area_major: 0.0,
+            },
+            "TESTUX[redfog-user-0]: touch_down",
+            Duration::from_secs(10),
+        )
+        .await;
+
+        let motion_before = server.count_stdout("TESTUX[redfog-user-0]: touch_motion");
+        for step in 1..=5 {
+            let y = 0.5 - (step as f32) * 0.05;
+            send_input_until_new_seen(
+                &server.stdout_lines,
+                &stream,
+                ClientInputEvent::Touch {
+                    event_type: TouchEventType::Move,
+                    rotation: None,
+                    pointer_id: POINTER_ID,
+                    x: 0.5,
+                    y,
+                    pressure_or_distance: 1.0,
+                    contact_area_minor: 0.0,
+                    contact_area_major: 0.0,
+                },
+                "TESTUX[redfog-user-0]: touch_motion",
+                motion_before + step - 1,
+                Duration::from_secs(10),
+            )
+            .await;
+        }
+
+        send_input_until_seen(
+            &server.stdout_lines,
+            &stream,
+            ClientInputEvent::Touch {
+                event_type: TouchEventType::Up,
+                rotation: None,
+                pointer_id: POINTER_ID,
+                x: 0.5,
+                y: 0.25,
+                pressure_or_distance: 0.0,
+                contact_area_minor: 0.0,
+                contact_area_major: 0.0,
+            },
+            "TESTUX[redfog-user-0]: touch_up",
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert_eq!(
+            server.count_stdout("TESTUX[redfog-user-0]: touch_down"),
+            1,
+            "expected exactly one touch_down for the whole gesture — a repeated Down would mean the \
+             \"stuck slot\" recovery path fired unexpectedly"
+        );
+        assert!(
+            server.count_stdout("TESTUX[redfog-user-0]: touch_motion") >= 5,
+            "expected at least 5 touch_motion events — the exact symptom this was investigated against \
+             was TouchDown immediately followed by TouchUp with zero motion in between"
+        );
+        assert_eq!(server.count_stdout("TESTUX[redfog-user-0]: touch_up"), 1, "expected exactly one touch_up for the whole gesture");
+    })
+    .await
+    .expect("touch_input_reaches_a_resumed_user_session timed out");
 }
 
 /// Regression test for a real bug found live: taking a session over from a
