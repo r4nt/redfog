@@ -15,9 +15,8 @@
 //! can't be a step partway through some other binary's own startup.
 //!
 //! Meant to run *after* `redfog-session-init`'s own privilege drop (i.e. as
-//! the session's target user, not root) — `HeadlessRuntime::start`'s own
-//! `hide_real_audio_devices` sandboxing works fine unprivileged (it never
-//! needs to re-expose anything the way GPU sandboxing does), so there's no
+//! the session's target user, not root) — the session's systemd unit already
+//! isolates `/dev/snd` and `/dev/dri` via unit mount directives, so there's no
 //! reason for this to run any more privileged than the compositor it's
 //! standing infrastructure up for.
 

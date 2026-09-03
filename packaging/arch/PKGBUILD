@@ -40,12 +40,6 @@ depends=(
     'pam'                # redfog-broker links libpam.so.0 directly for
                          # authentication -- confirmed via namcap, missing
                          # from an earlier draft of this list
-    'bubblewrap'         # every session spawn sandboxes /dev/dri down to a
-                         # single chosen render node (gpu_sandbox_argv_prefix
-                         # in redfog-broker/src/session.rs) to work around
-                         # KWin's --virtual backend having no GPU-selection
-                         # logic of its own -- unconditional, not just a
-                         # hybrid-iGPU-machine nicety, so this is a hard dep
 )
 optdepends=(
     'nvidia-utils: hardware-accelerated NVENC video encoding'

@@ -453,21 +453,11 @@ impl SessionManager {
         // `redfog-session-init <username> -- <command>...` (see its own doc
         // comment): does the *correct* uid/gid/supplementary-group drop
         // (initgroups from /etc/group, then setgid, then setuid) before
-        // exec'ing into the real payload. Used here instead of this unit's
-        // own `User=` (removed below) specifically so `bwrap`, further out
-        // in this same exec chain, runs as real root rather than already
-        // privilege-dropped — see gpu_sandbox_argv_prefix's doc comment for
-        // why that distinction matters (running bwrap unprivileged forces it
-        // into a user namespace, which remaps ownership of anything not the
-        // calling uid, e.g. root-owned `/tmp/.X11-unix` — confirmed live,
-        // this broke Xwayland with "not owned by root or us" on every
-        // single spawn once GPU-sandboxing started actually restricting
-        // /dev/dri instead of being a no-op). Deliberately does *not* open a
+        // exec'ing into the real payload. Deliberately does *not* open a
         // real PAM session (redfog-session-init no longer has that code at
         // all — see its own doc comment for why: it moves the whole process
         // tree into its own separate `pam_systemd`-created scope, breaking
-        // this unit's cgroup-based termination) — the bwrap-as-root fix
-        // never depended on a PAM session in the first place.
+        // this unit's cgroup-based termination).
         //
         // `redfog-pipewire-session` (see its own doc comment) is inserted
         // right after that privilege drop, before `dbus-run-session`/KWin:
@@ -476,10 +466,7 @@ impl SessionManager {
         // chain — so KWin's own screencast producer (and anything the
         // session later plays audio through) only ever sees this session's
         // own instance, from the very first PipeWire connection either one
-        // makes. Runs as `username` (post-privilege-drop), not root: its
-        // own `/dev/snd`-hiding sandboxing works fine unprivileged (no
-        // re-exposure step needed, unlike GPU sandboxing), same as it
-        // already does for the old shared instance.
+        // makes. Runs as `username` (post-privilege-drop), not root.
         let mut exec_start = format!(
             "{} {username} -- {} {runtime_dir} -- dbus-run-session -- {kwin_path} --virtual --width {width} --height {height} --scale 1 \
              --no-lockscreen --wayland-fd 3 --socket {socket_name} --xwayland",
@@ -489,16 +476,6 @@ impl SessionManager {
         if !payload.is_empty() {
             let session_script_path = write_session_script(&runtime_dir, socket_name, &pipewire_socket_path, &pulse_socket_path, payload)?;
             exec_start.push_str(&format!(" --exit-with-session {session_script_path}"));
-        }
-        // See gpu_sandbox_argv_prefix's doc comment. Prepended last, so it
-        // wraps everything above (including redfog-session-init and
-        // --exit-with-session) — with `User=` removed below, this unit's
-        // ExecStart runs as real root, so bwrap here does its mount-namespace
-        // setup without ever needing an unprivileged user namespace,
-        // avoiding the identity-remap problem entirely rather than working
-        // around its symptoms.
-        if let Some(prefix) = gpu_sandbox_argv_prefix() {
-            exec_start = format!("{} {exec_start}", prefix.join(" "));
         }
         let (_uid, _gid, home_dir, shell) = resolve_user(username).await?;
         // No `User=` here (unlike before) — see exec_start's own comment:
@@ -552,6 +529,9 @@ impl SessionManager {
         // own journal goes, not the server's.
         if let Ok(rules) = std::env::var("REDFOG_DEBUG_KWIN_LOGGING_RULES") {
             service_unit.push_str(&format!("Environment=QT_LOGGING_RULES={rules}\n"));
+        }
+        for directive in device_sandbox_systemd_directives(&runtime_dir) {
+            service_unit.push_str(&format!("{directive}\n"));
         }
         service_unit.push_str(&format!("ExecStart={exec_start}\n"));
 
@@ -1104,49 +1084,42 @@ fn which_kwin_wayland() -> Option<String> {
 ///
 /// Until that ships, this works around it unconditionally: every spawn
 /// hides `/dev/dri` down to a single, deliberately-chosen render node via
-/// `bwrap`, before KWin ever gets a chance to enumerate anything — the
-/// exact approach validated manually via
+/// transient systemd unit mount namespacing (`TemporaryFileSystem=` and
+/// `BindPaths=`), before KWin ever gets a chance to enumerate anything —
+/// the exact approach validated manually via
 /// `scripts/test-drm-device-sandboxing.sh` on the affected machine. Always
 /// narrowing to exactly one node, rather than only doing this on machines
 /// that look ambiguous, is deliberate: one code path, one rule, regardless
 /// of how many GPUs happen to be installed — a machine with a single GPU
-/// just narrows down to the only node that was ever there. Callers should
-/// prepend the returned argv to whatever they'd otherwise exec: `--bind /
-/// /` + `--dev-bind /dev /dev` mirror the entire real filesystem and device
-/// tree first (so nothing *else* about the session — `sudo`, process
-/// visibility, `/dev/input`, arbitrary paths — changes), `--tmpfs /dev/dri`
-/// then blanks out just that one directory, and the final `--dev-bind`
-/// re-adds only the node `select_gpu_render_node` chose. No namespace
-/// unsharing beyond the mount namespace `bwrap` always creates.
+/// just narrows down to the only node that was ever there.
+///
+/// Unlike `bwrap`, which unconditionally sets `PR_SET_NO_NEW_PRIVS` and blocks
+/// SUID elevation (preventing `sudo` in Konsole and terminal sessions),
+/// systemd transient unit file system directives set up mount namespaces without
+/// imposing `NoNewPrivileges=true`, keeping `sudo` working for the user inside
+/// the session.
 ///
 /// Also unconditionally blanks out `/dev/snd` — unrelated to the GPU
 /// narrowing above, tacked on here since it's the same sandbox and the
 /// same rationale in miniature: nothing legitimate in this session needs
 /// direct hardware audio device access at all (games/apps talk to
-/// PipeWire over its socket, never `/dev/snd` directly — same reasoning
-/// as `redfog-core::environment::hide_real_audio_devices`, which does the
-/// analogous thing for the PipeWire daemon itself), so there's no
+/// PipeWire over its socket, never `/dev/snd` directly), so there's no
 /// re-exposure step the way there is for the one GPU render node. Closes
-/// off a second path to the same class of bug that fix addresses: an app
+/// off an attack surface / leakage path: an app or WirePlumber
 /// inside the session reaching the host's real microphone or speakers
 /// via some legacy direct-ALSA route instead of going through PipeWire.
 ///
-/// Returns `None` (skip sandboxing, behave exactly as before) only when
-/// there's truly nothing to narrow to (no `/dev/dri` render nodes at all —
-/// a machine with no GPU) or when `bwrap` itself isn't installed (logged,
-/// not fatal — see its own check below).
-fn gpu_sandbox_argv_prefix() -> Option<Vec<String>> {
-    let node = select_gpu_render_node()?;
+/// Returns an empty list only when there's truly nothing to narrow to (no
+/// `/dev/dri` render nodes at all — a machine with no GPU).
+fn device_sandbox_systemd_directives(runtime_dir: &str) -> Vec<String> {
+    let mut directives = Vec::new();
 
-    let bwrap_available =
-        std::process::Command::new("bwrap").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
-    if !bwrap_available {
-        tracing::warn!(
-            "would sandbox /dev/dri down to {node} for KWin, but `bwrap` isn't installed -- skipping (install bubblewrap to enable it; KWin will \
-             see every render node on this machine and may pick the wrong one)"
-        );
-        return None;
-    }
+    // Blank out /dev/snd so no raw ALSA audio devices are visible
+    directives.push("TemporaryFileSystem=/dev/snd:dev".to_string());
+
+    let Some(node) = select_gpu_render_node() else {
+        return directives;
+    };
 
     let extra = related_dri_nodes(&node);
 
@@ -1158,38 +1131,28 @@ fn gpu_sandbox_argv_prefix() -> Option<Vec<String>> {
     };
     tracing::info!("sandboxing /dev/dri down to {node}{sibling_desc} for KWin, and hiding /dev/snd entirely (see this function's own doc comment)");
 
-    let mut argv = vec![
-        "bwrap".to_string(),
-        "--bind".to_string(),
-        "/".to_string(),
-        "/".to_string(),
-        "--dev-bind".to_string(),
-        "/dev".to_string(),
-        "/dev".to_string(),
-        "--tmpfs".to_string(),
-        "/dev/dri".to_string(),
-        "--dev-bind".to_string(),
-        node.clone(),
-        node,
-        "--tmpfs".to_string(),
-        "/dev/snd".to_string(),
-    ];
+    directives.push("TemporaryFileSystem=/dev/dri:dev".to_string());
+    directives.push(format!("BindPaths={node}"));
     if let Some(card_node) = extra.card_node {
-        argv.push("--dev-bind".to_string());
-        argv.push(card_node.clone());
-        argv.push(card_node);
+        directives.push(format!("BindPaths={card_node}"));
     }
     if !extra.by_path_links.is_empty() {
-        argv.push("--dir".to_string());
-        argv.push("/dev/dri/by-path".to_string());
-        for (link_path, target) in extra.by_path_links {
-            argv.push("--symlink".to_string());
-            argv.push(target);
-            argv.push(link_path);
+        let by_path_dir = std::path::Path::new(runtime_dir).join("dri-by-path");
+        if let Err(e) = std::fs::create_dir_all(&by_path_dir) {
+            tracing::warn!("failed to create staging dri-by-path dir {by_path_dir:?}: {e}");
+        } else {
+            for (link_path, target) in extra.by_path_links {
+                let link_name = std::path::Path::new(&link_path).file_name().unwrap_or_default();
+                let staged_link = by_path_dir.join(link_name);
+                let _ = std::fs::remove_file(&staged_link);
+                if let Err(e) = std::os::unix::fs::symlink(&target, &staged_link) {
+                    tracing::warn!("failed to create staged by-path symlink {staged_link:?} -> {target}: {e}");
+                }
+            }
+            directives.push(format!("BindPaths={}:/dev/dri/by-path", by_path_dir.display()));
         }
     }
-    argv.push("--".to_string());
-    Some(argv)
+    directives
 }
 
 /// Sibling device nodes for the same physical GPU as `render_node`, besides
