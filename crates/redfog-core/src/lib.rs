@@ -87,6 +87,18 @@ pub struct CompositorSession {
     kwin_process: Option<Child>,
     pub capture_session: CaptureSession,
     pub pipewire_node_id: u32,
+    /// This session's own PipeWire socket — for `attach()` (broker-managed
+    /// sessions), the session's own dedicated instance (see
+    /// `redfog-broker-protocol::SpawnedSession`'s doc comment); for
+    /// `spawn()` (direct-launch, standalone/dev use only — never the
+    /// concurrent-multi-user production path), still the one process-wide
+    /// shared `HeadlessRuntime` instance. Exposed so callers building the
+    /// actual video/audio `pipewiresrc`/`pipewiresink` connections know
+    /// which instance to open an `fd` against, instead of trusting the
+    /// ambient `PIPEWIRE_REMOTE` — this process serves many concurrent
+    /// sessions, so an env var can't correctly pick "the" remote per
+    /// session the way it could when there was only ever one.
+    pub pipewire_socket_path: String,
     /// Only used to build [`VideoSource::KwinNativeDmaBuf`]'s appsrc caps —
     /// see [`CompositorSession::video_source`]. Atomics (not plain `i32`)
     /// because [`Self::resize`] takes `&self` (mirroring
@@ -198,7 +210,7 @@ pub trait InputSink: Send {
 /// that property isn't otherwise relied on today (backgrounded sessions are
 /// tracked and reattached within the same server process, not across a
 /// restart of it), but this is cheap to make reversible rather than assume.
-fn maybe_die_with_parent(cmd: &mut Command) {
+pub(crate) fn maybe_die_with_parent(cmd: &mut Command) {
     if std::env::var("REDFOG_KILL_COMPOSITOR_WITH_SERVER").as_deref() == Ok("0") {
         return;
     }
@@ -361,6 +373,13 @@ impl CompositorSession {
     /// activation — see design.md's "Cross-user socket reachability")
     /// — connects to that already-existing socket instead of spawning
     /// `kwin_wayland` ourselves.
+    ///
+    /// `pipewire_socket_path`: this specific session's own PipeWire socket
+    /// (from `redfog-broker-protocol::SpawnedSession`) — not read from the
+    /// ambient `PIPEWIRE_REMOTE` env var the way `spawn()` still does,
+    /// since the caller here (`redfog-server`) is one process serving many
+    /// concurrent sessions, each with its own dedicated instance now; an
+    /// env var can't correctly resolve "the" remote per session anymore.
     pub fn attach(
         session_type: SessionType,
         socket_name: &str,
@@ -369,10 +388,10 @@ impl CompositorSession {
         height: i32,
         scale: f64,
         fps: u32,
+        pipewire_socket_path: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let runtime = default_runtime_dir();
-        let pw_sock = std::env::var("PIPEWIRE_REMOTE").unwrap_or_else(|_| "pipewire-0".to_string());
-        Self::wait_and_attach(session_type, socket_name, socket_path, width, height, scale, fps, None, &runtime, &pw_sock)
+        Self::wait_and_attach(session_type, socket_name, socket_path, width, height, scale, fps, None, &runtime, pipewire_socket_path)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -426,6 +445,7 @@ impl CompositorSession {
             kwin_process: child,
             capture_session,
             pipewire_node_id,
+            pipewire_socket_path: pw_sock.to_string(),
             width: AtomicI32::new(width),
             height: AtomicI32::new(height),
             fps,
@@ -641,14 +661,14 @@ fn spa_video_format_to_gst(format: u32) -> gst_video::VideoFormat {
 ///
 /// Caps are only rebuilt/`set_caps` when the negotiated format actually
 /// changes (first frame, or after a renegotiation) — not on every frame.
-fn spawn_kwin_native_frame_pusher(pipeline: &gst::Pipeline, node_id: u32, wayland_socket_path: PathBuf) {
+fn spawn_kwin_native_frame_pusher(pipeline: &gst::Pipeline, node_id: u32, wayland_socket_path: PathBuf, pipewire_socket_path: &str) {
     let app_src = pipeline
         .by_name(KWIN_NATIVE_APPSRC_NAME)
         .expect("a VideoSource::KwinNativeDmaBuf pipeline always names its appsrc KWIN_NATIVE_APPSRC_NAME")
         .dynamic_cast::<gst_app::AppSrc>()
         .expect("KWIN_NATIVE_APPSRC_NAME is always an appsrc");
 
-    let capture = match PipewireCapture::start(node_id, wayland_socket_path, false) {
+    let capture = match PipewireCapture::start(node_id, wayland_socket_path, pipewire_socket_path, false) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("redfog-core: failed to start native PipewireCapture: {e}");
@@ -1449,6 +1469,14 @@ pub fn make_encoder_pipeline<F>(
     fps_cap: Option<u32>,
     bitrate_kbps: u32,
     codec: VideoCodec,
+    // Only used for `VideoSource::PipeWireNode` (its `pipewiresrc` element's
+    // `fd` property, set below) and `VideoSource::KwinNativeDmaBuf` (its own
+    // separate `PipewireCapture` connection, via `spawn_kwin_native_frame_
+    // pusher`) — see `open_pipewire_fd`'s own doc comment for why an
+    // explicit path is needed at all instead of the ambient `PIPEWIRE_REMOTE`
+    // env var. Ignored for every other `VideoSource` variant (`Login`/
+    // `GstWaylandDisplay`), which never touch PipeWire at all.
+    pipewire_socket_path: &str,
     on_access_unit: F,
 ) -> gst::Pipeline
 where
@@ -1496,9 +1524,16 @@ where
     match source {
         VideoSource::Login { frame_rx, .. } => spawn_login_frame_pusher(&pipeline, frame_rx),
         VideoSource::KwinNativeDmaBuf { node_id, wayland_socket_path, .. } => {
-            spawn_kwin_native_frame_pusher(&pipeline, node_id, wayland_socket_path)
+            spawn_kwin_native_frame_pusher(&pipeline, node_id, wayland_socket_path, pipewire_socket_path)
         }
-        VideoSource::PipeWireNode(_) | VideoSource::GstWaylandDisplay { .. } => {}
+        VideoSource::PipeWireNode(_) => {
+            // See this function's own `pipewire_socket_path` doc comment
+            // for why an explicit `fd` is needed instead of the ambient
+            // `PIPEWIRE_REMOTE` env var.
+            let fd = open_pipewire_fd(pipewire_socket_path).expect("open_pipewire_fd for this session's own video capture");
+            pipeline.by_name("pipewiresrc").expect("VideoSource::PipeWireNode always names its pipewiresrc").set_property("fd", fd);
+        }
+        VideoSource::GstWaylandDisplay { .. } => {}
     }
 
     let appsink = pipeline
@@ -1576,8 +1611,13 @@ pub use kwin_capture::nvenc_session::VideoCodec;
 /// GStreamer pipeline at all on this path). Only `VideoSource::
 /// KwinNativeDmaBuf` is supported — always the case for `NvencDirect`, see
 /// `CompositorSession::video_source`.
+///
+/// `pipewire_socket_path`: see `open_pipewire_fd`'s own doc comment — this
+/// session's own dedicated PipeWire instance, not the ambient
+/// `PIPEWIRE_REMOTE` env var.
 pub fn make_cuda_direct_encoder_session(
     source: VideoSource,
+    pipewire_socket_path: &str,
     bitrate_kbps: u32,
     codec: VideoCodec,
     on_access_unit: impl Fn(Vec<u8>, bool, std::time::Instant) + Send + Sync + 'static,
@@ -1585,7 +1625,7 @@ pub fn make_cuda_direct_encoder_session(
     let VideoSource::KwinNativeDmaBuf { node_id, wayland_socket_path, width, height, fps } = source else {
         panic!("make_cuda_direct_encoder_session only supports VideoSource::KwinNativeDmaBuf");
     };
-    CudaDirectEncoderSession::spawn(node_id, wayland_socket_path, width, height, fps, bitrate_kbps, codec, on_access_unit)
+    CudaDirectEncoderSession::spawn(node_id, wayland_socket_path, pipewire_socket_path.to_string(), width, height, fps, bitrate_kbps, codec, on_access_unit)
 }
 
 /// A per-session virtual audio sink: apps in the compositor session play
@@ -1606,6 +1646,12 @@ pub fn make_cuda_direct_encoder_session(
 pub struct AudioLoopback {
     pub sink_name: String,
     pub capture_name: String,
+    /// The instance this loopback lives on — kept here (not just passed to
+    /// `spawn()` and forgotten) so `make_audio_pipeline` can open its own
+    /// `fd`-based connection for the in-process `pipewiresrc` element
+    /// without every caller having to separately thread this same path
+    /// through again.
+    pipewire_socket_path: String,
     process: Child,
 }
 
@@ -1620,10 +1666,10 @@ pub struct AudioLoopback {
 /// in a real graph dump, and this file already favors shelling out and
 /// checking raw output/exit status over pulling in a JSON crate or a
 /// PipeWire client library binding just for this one thing.
-fn wait_for_pipewire_node(name: &str, timeout: Duration) -> bool {
+fn wait_for_pipewire_node(pipewire_socket_path: &str, name: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if let Ok(output) = Command::new("pw-dump").output() {
+        if let Ok(output) = Command::new("pw-dump").env("PIPEWIRE_REMOTE", pipewire_socket_path).output() {
             if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(name) {
                 return true;
             }
@@ -1635,7 +1681,15 @@ fn wait_for_pipewire_node(name: &str, timeout: Duration) -> bool {
 
 impl AudioLoopback {
     /// Spawn a loopback named after `session_name` (e.g. the compositor's
-    /// socket name, to keep it unique per session).
+    /// socket name, to keep it unique per session), on `pipewire_socket_path`
+    /// — this session's own dedicated PipeWire instance (see
+    /// `redfog-broker-protocol::SpawnedSession`'s doc comment), not
+    /// whatever the calling process's own ambient `PIPEWIRE_REMOTE` happens
+    /// to be: `redfog-server` is one process serving many concurrent
+    /// sessions, so every subprocess this spawns (`pw-loopback`,
+    /// `pw-metadata`, and `wait_for_pipewire_node`'s own `pw-dump`) gets
+    /// this path set explicitly via `.env()`, safe regardless of whatever
+    /// else is running concurrently in this same process.
     ///
     /// Only ever called for `SessionType::User` — Login uses
     /// `make_silent_audio_pipeline` instead of a real `AudioLoopback`, so it
@@ -1651,11 +1705,12 @@ impl AudioLoopback {
     /// audio on a sink nothing captures from anymore — confirmed live as
     /// the root cause of a bug where a User session's audio would go
     /// silent forever after any quit-and-reconnect.
-    pub fn spawn(session_name: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn spawn(session_name: &str, pipewire_socket_path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let sink_name = format!("redfog-audio-sink-{session_name}");
         let capture_name = format!("redfog-audio-capture-{session_name}");
 
         let process = Command::new("pw-loopback")
+            .env("PIPEWIRE_REMOTE", pipewire_socket_path)
             .arg("-n")
             .arg(format!("redfog-audio-{session_name}"))
             .arg("--capture-props")
@@ -1680,10 +1735,10 @@ impl AudioLoopback {
         // hard failure on timeout: proceeding anyway (possibly racy again)
         // is still strictly better than this session never starting at all
         // over a slow-to-register loopback.
-        if !wait_for_pipewire_node(&sink_name, Duration::from_secs(5)) {
+        if !wait_for_pipewire_node(pipewire_socket_path, &sink_name, Duration::from_secs(5)) {
             eprintln!("redfog-core: pw-loopback's sink node {sink_name} didn't appear in pw-dump within 5s — continuing anyway, but this session's audio routing may race");
         }
-        if !wait_for_pipewire_node(&capture_name, Duration::from_secs(5)) {
+        if !wait_for_pipewire_node(pipewire_socket_path, &capture_name, Duration::from_secs(5)) {
             eprintln!("redfog-core: pw-loopback's capture node {capture_name} didn't appear in pw-dump within 5s — continuing anyway, but this session's audio capture may fail to find it");
         }
 
@@ -1701,6 +1756,7 @@ impl AudioLoopback {
         // `pw-metadata` is missing or this particular PipeWire build wires
         // default-node selection differently.
         match Command::new("pw-metadata")
+            .env("PIPEWIRE_REMOTE", pipewire_socket_path)
             .args(["-n", "default", "0", "default.configured.audio.sink", &format!(r#"{{"name":"{sink_name}"}}"#)])
             .output()
         {
@@ -1718,6 +1774,7 @@ impl AudioLoopback {
         Ok(Self {
             sink_name,
             capture_name,
+            pipewire_socket_path: pipewire_socket_path.to_string(),
             process,
         })
     }
@@ -1776,7 +1833,29 @@ const AUDIO_ENCODE_TAIL: &str = "! audioconvert ! audioresample \
      ! appsink name=sink sync=false";
 
 fn audio_pipeline_description(capture_name: &str, client_name: &str) -> String {
-    format!("pipewiresrc target-object={capture_name} client-name={client_name} do-timestamp=true {AUDIO_ENCODE_TAIL}")
+    format!("pipewiresrc name=audiosrc target-object={capture_name} client-name={client_name} do-timestamp=true {AUDIO_ENCODE_TAIL}")
+}
+
+/// Opens a fresh connection to `pipewire_socket_path` and hands back its raw
+/// fd, ready to set on a `pipewiresrc`/`pipewiresink` element's `fd`
+/// property — the in-process-GStreamer-element counterpart to
+/// `AudioLoopback::spawn`'s `.env("PIPEWIRE_REMOTE", ...)` on each
+/// subprocess it spawns. Needed for the exact same reason: `redfog-server`
+/// is one process serving many concurrent sessions, each with its own
+/// PipeWire instance now, so the ambient `PIPEWIRE_REMOTE` env var can't
+/// correctly resolve "the" remote for any one in-process element anymore —
+/// unlike a subprocess, an in-process element has no per-invocation
+/// environment of its own to set this on. `into_raw_fd()`, not keeping the
+/// `UnixStream` alive ourselves: PipeWire's own `pw_context_connect_fd`
+/// (what the C plugin behind `fd` calls internally) takes ownership of the
+/// fd, same convention every other fd-passing PipeWire client uses (e.g.
+/// `xdg-desktop-portal`'s screen-sharing handoff) — keeping our own
+/// `UnixStream` around too would double-close it.
+pub fn open_pipewire_fd(pipewire_socket_path: &str) -> Result<std::os::fd::RawFd, String> {
+    use std::os::fd::IntoRawFd;
+    UnixStream::connect(pipewire_socket_path)
+        .map(|stream| stream.into_raw_fd())
+        .map_err(|e| format!("failed to connect to PipeWire socket {pipewire_socket_path:?}: {e}"))
 }
 
 /// `audiotestsrc wave=silence`, not a real capture source at all — used for
@@ -1827,11 +1906,21 @@ where
 /// Capture -> Opus encode pipeline for network streaming: `pipewiresrc`
 /// targeting an [`AudioLoopback`]'s capture side -> stereo 48kHz -> Opus.
 /// Delivers one encoded Opus packet per callback invocation.
+///
+/// Panics if it can't open a connection to `loopback`'s own PipeWire
+/// instance: by the time this runs, `AudioLoopback::spawn` already proved
+/// that exact same socket path was reachable (it's how the loopback itself
+/// got created), so a failure here means something changed operational
+/// assumptions mid-session, not a normal/recoverable-at-this-layer
+/// condition.
 pub fn make_audio_pipeline<F>(loopback: &AudioLoopback, client_name: &str, on_packet: F) -> gst::Pipeline
 where
     F: Fn(Vec<u8>) + Send + Sync + 'static,
 {
-    build_audio_pipeline(&audio_pipeline_description(&loopback.capture_name, client_name), on_packet)
+    let pipeline = build_audio_pipeline(&audio_pipeline_description(&loopback.capture_name, client_name), on_packet);
+    let fd = open_pipewire_fd(&loopback.pipewire_socket_path).expect("open_pipewire_fd for AudioLoopback's own instance");
+    pipeline.by_name("audiosrc").expect("audio pipeline always names its pipewiresrc audiosrc").set_property("fd", fd);
+    pipeline
 }
 
 /// [`make_audio_pipeline`] counterpart for the Login stage — see

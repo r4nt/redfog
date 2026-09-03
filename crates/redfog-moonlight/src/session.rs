@@ -1069,11 +1069,27 @@ impl SessionManager {
         // `HeadlessLogin` arm), so the *same* server-wide `video_encoder`
         // config must still fall back to a real GStreamer encoder there.
         let source = compositor.video_source(Some(video_encoder));
+        // Falls back to the ambient `PIPEWIRE_REMOTE` (the one shared
+        // instance) when this compositor has no dedicated socket of its own
+        // — see `SpawnedCompositor::pipewire_socket_path`'s doc comment for
+        // which backends that's true for. Threaded into both branches below
+        // so their own `pipewiresrc`/`PipewireCapture` connections reach
+        // *this* session's own instance instead of whatever the ambient env
+        // var happens to resolve to — see `redfog_core::open_pipewire_fd`'s
+        // own doc comment for why that can't be trusted anymore:
+        // `redfog-server` is one process serving many concurrent sessions,
+        // each with its own instance now.
+        let pipewire_socket_path = compositor
+            .pipewire_socket_path()
+            .map(str::to_string)
+            .or_else(|| std::env::var("PIPEWIRE_REMOTE").ok())
+            .unwrap_or_else(|| "pipewire-0".to_string());
         let mut cuda_direct_session = None;
         let video_pipeline = if video_encoder == redfog_core::VideoEncoder::NvencDirect
             && matches!(source, redfog_core::VideoSource::KwinNativeDmaBuf { .. })
         {
-            let session = redfog_core::make_cuda_direct_encoder_session(source, initial_bitrate_kbps, codec, on_video_access_unit);
+            let session =
+                redfog_core::make_cuda_direct_encoder_session(source, &pipewire_socket_path, initial_bitrate_kbps, codec, on_video_access_unit);
             cuda_direct_session = Some(Arc::new(session));
             // `NvencDirect` has no GStreamer pipeline at all — this empty
             // placeholder exists only so the rest of this type's machinery
@@ -1099,6 +1115,7 @@ impl SessionManager {
                 fps_cap,
                 initial_bitrate_kbps,
                 codec,
+                &pipewire_socket_path,
                 on_video_access_unit,
             )
         };
@@ -1417,13 +1434,12 @@ impl SessionManager {
         // never calls this at all (it reuses the existing `RunningSession`
         // outright) — see `reconcile_video_pipeline` for that path instead.
         let codec = origin.codec;
-        // `audio_loopback` is created by the caller, before the compositor —
-        // see the caller's own comment for why: an app inside the session
-        // (Chrome, concretely) can start probing PipeWire for output devices
-        // as soon as the compositor is up, and if our own pw-loopback sink
-        // doesn't exist yet at that moment, some apps never retry and just
-        // never produce a Stream/Output/Audio node for the rest of their
-        // process lifetime.
+        // `audio_loopback` (`None` for Login — see
+        // `make_silent_audio_pipeline`'s doc comment) is created by the
+        // caller, *after* the compositor for `SessionType::User` — see the
+        // caller's own comment on why that ordering is required now (needs
+        // this specific session's own PipeWire socket path, which the
+        // compositor's own spawn is what brings into existence).
         //
         // `fps == 0` (shouldn't happen from a real client — parse_mode's
         // fallback is 60 — but defensively) means uncapped, same as never
@@ -2150,21 +2166,36 @@ impl SessionManager {
             None => {
                 tracing::info!("handoff_to_user: no backgrounded session for {username}, spawning a fresh user compositor");
                 let spawn_start = std::time::Instant::now();
-                // Spawned before spawn_user_compositor, not after — so
-                // nothing the compositor launches can get a head start on
-                // our own pw-loopback sink existing in the graph. Real
-                // hardening (a genuine race exists for anything that starts
-                // automatically alongside the desktop), but NOT confirmed to
-                // explain the ~50/50 intermittent-audio bug this project
-                // actually hit: that bug reproduced even when Chrome was
-                // started manually, long after the session was already up
-                // and this ordering had long since settled — see
-                // `AudioLoopback::spawn`'s doc comment for the bug that
-                // ordering fix turned out to be.
-                let audio_loopback = AudioLoopback::spawn("redfog-user-0")
-                    .map_err(|e| format!("failed to spawn audio loopback for redfog-user-0: {e}"))?;
                 let (compositor, resolved_username, broker_session_id) = self.spawn_user_compositor(width, height, fps, &reported).await?;
                 tracing::info!("handoff_to_user: spawn_user_compositor for {resolved_username} finished after {:?}", spawn_start.elapsed());
+                // Spawned *after* the compositor now, not before — this
+                // used to be reversed (a deliberate hardening — nothing the
+                // compositor launches should get a head start on our own
+                // pw-loopback sink existing — though never confirmed to fix
+                // the actual bug it was aimed at) but per-session PipeWire
+                // instances forced it back: `AudioLoopback::spawn` now needs
+                // *this specific session's* PipeWire socket path, which
+                // doesn't exist until the compositor itself has been
+                // spawned (its systemd unit is what starts that instance —
+                // see `redfog-pipewire-session`'s own doc comment). The
+                // original race this ordering guarded against is now
+                // structurally impossible anyway: that same instance is
+                // started earlier in the *same* exec chain, strictly before
+                // KWin (and anything KWin launches, Chrome included) can
+                // possibly run at all — not "usually earlier", guaranteed.
+                //
+                // Falls back to the ambient `PIPEWIRE_REMOTE` (the one
+                // shared instance) when this compositor has no dedicated
+                // socket of its own — see `SpawnedCompositor::
+                // pipewire_socket_path`'s doc comment for which backends
+                // that's true for.
+                let pipewire_socket_path = compositor
+                    .pipewire_socket_path()
+                    .map(str::to_string)
+                    .or_else(|| std::env::var("PIPEWIRE_REMOTE").ok())
+                    .unwrap_or_else(|| "pipewire-0".to_string());
+                let audio_loopback = AudioLoopback::spawn("redfog-user-0", &pipewire_socket_path)
+                    .map_err(|e| format!("failed to spawn audio loopback for redfog-user-0: {e}"))?;
                 let generation = self.next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let selected = reported.and_then(|r| r.selected);
                 (

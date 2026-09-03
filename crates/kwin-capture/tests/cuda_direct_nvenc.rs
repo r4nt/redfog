@@ -87,7 +87,7 @@ async fn cuda_direct_nvenc_encode_glxgears_test() {
 
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
     eprintln!("Starting CudaDirectEncoderSession (DMA-BUF -> CUDA -> NVENC, no GStreamer)...");
-    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, WIDTH, HEIGHT, FPS, BITRATE_KBPS, VideoCodec::H264, move |data, is_keyframe, _capture_instant| {
+    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), WIDTH, HEIGHT, FPS, BITRATE_KBPS, VideoCodec::H264, move |data, is_keyframe, _capture_instant| {
         let _ = tx.send((data, is_keyframe));
     });
 

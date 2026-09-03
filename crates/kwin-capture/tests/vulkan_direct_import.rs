@@ -362,7 +362,7 @@ async fn vulkan_direct_import_glxgears_test() {
 
     eprintln!("Starting native Pipewire capture...");
     let capture =
-        kwin_capture::pipewire_capture::PipewireCapture::start(node_id, socket_path, false).unwrap();
+        kwin_capture::pipewire_capture::PipewireCapture::start(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap(), false).unwrap();
 
     let mut frame = None;
     for _ in 0..60 {

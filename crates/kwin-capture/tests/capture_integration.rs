@@ -63,7 +63,7 @@ async fn kwin_native_pipewire_capture_glxgears_test() {
 
     // 4. Start our native PipeWire capture
     eprintln!("Starting native Pipewire capture...");
-    let capture = kwin_capture::pipewire_capture::PipewireCapture::start(node_id, socket_path, false).unwrap();
+    let capture = kwin_capture::pipewire_capture::PipewireCapture::start(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap(), false).unwrap();
 
     // 5. Measure FPS over 5 seconds
     eprintln!("Measuring FPS for 5 seconds...");

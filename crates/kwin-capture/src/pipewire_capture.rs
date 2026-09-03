@@ -53,18 +53,32 @@ impl PipewireCapture {
     /// `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` env vars, which can't disambiguate
     /// between concurrent sessions in a multi-session server.
     ///
+    /// `pipewire_socket_path`: same reasoning as `wayland_socket_path`, but
+    /// for the actual PipeWire *stream* connection this makes below (a
+    /// separate connection from the throwaway EGL one) — connected via an
+    /// already-open `fd` (`connect_fd_rc`), not the ambient `PIPEWIRE_REMOTE`
+    /// env var / ambient default socket (`connect_rc(None)`, what this used
+    /// to do): a process serving multiple concurrent sessions, each with its
+    /// own PipeWire instance, can't let an env var pick "the" one anymore.
+    ///
     /// `prefer_linear`: restrict DMA-BUF negotiation to the driver's
     /// `DRM_FORMAT_MOD_LINEAR` (0) modifier alternative only, instead of
     /// whatever it prefers (usually a proprietary tiled mode — see
     /// `cuda_import.rs`'s doc comment for why the direct-CUDA-import path
     /// needs this and the GL/`glupload` path doesn't).
-    pub fn start(target_node_id: u32, wayland_socket_path: PathBuf, prefer_linear: bool) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn start(
+        target_node_id: u32,
+        wayland_socket_path: PathBuf,
+        pipewire_socket_path: &str,
+        prefer_linear: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (frame_tx, frame_rx) = channel::<CapturedFrame>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
+        let pipewire_socket_path = pipewire_socket_path.to_string();
 
         let thread = std::thread::spawn(move || {
-            if let Err(e) = Self::run_loop(target_node_id, wayland_socket_path, prefer_linear, frame_tx, thread_shutdown) {
+            if let Err(e) = Self::run_loop(target_node_id, wayland_socket_path, &pipewire_socket_path, prefer_linear, frame_tx, thread_shutdown) {
                 eprintln!("Pipewire background loop failed: {e}");
             }
         });
@@ -75,6 +89,7 @@ impl PipewireCapture {
     fn run_loop(
         target_node_id: u32,
         wayland_socket_path: PathBuf,
+        pipewire_socket_path: &str,
         prefer_linear: bool,
         frame_tx: std::sync::mpsc::Sender<CapturedFrame>,
         shutdown: Arc<AtomicBool>,
@@ -83,7 +98,11 @@ impl PipewireCapture {
 
         let mainloop = pw::main_loop::MainLoopRc::new(None)?;
         let context = pw::context::ContextRc::new(&mainloop, None)?;
-        let core = context.connect_rc(None)?;
+        // See `start`'s own doc comment for why this connects via an
+        // explicit fd instead of `connect_rc(None)`.
+        let stream = std::os::unix::net::UnixStream::connect(pipewire_socket_path)
+            .map_err(|e| format!("failed to connect to PipeWire socket {pipewire_socket_path:?}: {e}"))?;
+        let core = context.connect_fd_rc(std::os::fd::OwnedFd::from(stream), None)?;
 
         let stream = pw::stream::StreamBox::new(
             &core,

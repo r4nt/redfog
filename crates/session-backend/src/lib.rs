@@ -134,6 +134,24 @@ impl SpawnedCompositor {
     /// `encoder`: see `redfog_core::CompositorSession::video_source`'s doc
     /// comment — only the `Kwin` variant actually uses it (to decide between
     /// `PipeWireNode` and `KwinNativeDmaBuf`); every other variant ignores it.
+    /// This compositor's own PipeWire socket, if it has one — only `Kwin`
+    /// does (see `redfog_core::CompositorSession::pipewire_socket_path`'s
+    /// doc comment: a dedicated per-session instance for a broker-spawned
+    /// session, or the one process-wide shared instance for a direct-spawn
+    /// dev/standalone session). `GstWaylandDisplay`'s compositor *is* its
+    /// own `waylanddisplaysrc` element — no PipeWire involved at all — and
+    /// `HeadlessLogin` never touches PipeWire either (see
+    /// `redfog_core::make_silent_audio_pipeline`'s doc comment). Callers
+    /// that need *some* PipeWire socket regardless of backend (there's only
+    /// ever one caller: spawning this session's `AudioLoopback`) fall back
+    /// to the ambient `PIPEWIRE_REMOTE`/shared instance when this is `None`.
+    pub fn pipewire_socket_path(&self) -> Option<&str> {
+        match self {
+            Self::Kwin(session) => Some(&session.pipewire_socket_path),
+            Self::GstWaylandDisplay { .. } | Self::HeadlessLogin { .. } => None,
+        }
+    }
+
     pub fn video_source(&self, encoder: Option<redfog_core::VideoEncoder>) -> VideoSource {
         match self {
             Self::Kwin(session) => session.video_source(encoder),
@@ -503,11 +521,12 @@ pub async fn spawn_user_compositor_via_broker(
             )
             .await
             .map_err(|e| format!("failed to send SpawnSession to broker: {e}"))?;
-            let wayland_socket_path = match read_response(&mut reader).await.map_err(|e| format!("failed to read SpawnSession response: {e}"))? {
-                BrokerResponse::SpawnSession(Ok(spawned)) => spawned.wayland_socket_path,
-                BrokerResponse::SpawnSession(Err(e)) => return Err(format!("broker failed to spawn session: {e}")),
-                other => return Err(format!("unexpected broker response to SpawnSession: {other:?}")),
-            };
+            let (wayland_socket_path, pipewire_socket_path) =
+                match read_response(&mut reader).await.map_err(|e| format!("failed to read SpawnSession response: {e}"))? {
+                    BrokerResponse::SpawnSession(Ok(spawned)) => (spawned.wayland_socket_path, spawned.pipewire_socket_path),
+                    BrokerResponse::SpawnSession(Err(e)) => return Err(format!("broker failed to spawn session: {e}")),
+                    other => return Err(format!("unexpected broker response to SpawnSession: {other:?}")),
+                };
 
             CompositorSession::attach(
                 SessionType::User(username.to_string()),
@@ -517,6 +536,7 @@ pub async fn spawn_user_compositor_via_broker(
                 height as i32,
                 1.0,
                 fps,
+                &pipewire_socket_path,
             )
             .map(SpawnedCompositor::Kwin)
             .map_err(|e| format!("failed to attach to broker-spawned session: {e}"))

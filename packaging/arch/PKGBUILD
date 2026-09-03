@@ -14,7 +14,7 @@
 # Build with: cd packaging/arch && makepkg -si
 
 pkgname=redfog-git
-pkgver=r97.d4c2f16
+pkgver=r98.f0dd61c
 pkgrel=1
 pkgdesc="Moonlight/GameStream-compatible game streaming server for KDE Plasma on Wayland"
 arch=('x86_64')
@@ -75,42 +75,65 @@ options=('!lto')
 # depending on that symref actually pointing at it locally.
 #
 # Set REDFOG_PKG_FROM_HEAD=1 (in the environment before invoking makepkg)
-# to package from HEAD/@ instead -- for locally test-building not-yet-
-# merged work without first moving the main bookmark forward just to make
-# a build possible. Pinned to HEAD's exact commit hash (#commit=...), not
-# a bare git+file:// URL: this repo is jj-colocated, so git's own HEAD is
-# normally *detached* (jj doesn't use git branches for its own working-copy
-# tracking) -- confirmed live that cloning a detached HEAD over file://
-# doesn't follow it at all, silently falling back to some other branch
-# instead (here, right back to main) with no error either way.
+# to build directly from this checkout's own working tree instead -- for
+# locally test-building not-yet-merged work without first moving the main
+# bookmark forward just to make a build possible. No `source=` entry, no
+# git/jj involved at all: every function below just `cd`s straight into
+# `$startdir/../..` and builds it in place, exactly like a plain local
+# directory (or an already-extracted tarball) would, using its own
+# existing `target/` dir. This deliberately isn't a git+file://...#commit=
+# pin: that was tried and abandoned -- confirmed live that a jj-colocated
+# repo's git HEAD only advances when something explicitly operates on a
+# commit (`jj describe`, concretely), not merely by virtue of a commit
+# being the current working-copy commit (@), so a hash resolved once up
+# front kept going stale mid-session with no error, just a clone missing
+# the very files this PKGBUILD was just edited to add.
 if [ -n "$REDFOG_PKG_FROM_HEAD" ]; then
-    _head_commit="$(git -C "$startdir/../.." rev-parse HEAD)"
-    source=("redfog::git+file://$startdir/../..#commit=$_head_commit")
+    source=()
+    sha256sums=()
 else
     source=("redfog::git+file://$startdir/../..#branch=main")
+    sha256sums=('SKIP')
 fi
-sha256sums=('SKIP')
+
+# Not a plain variable assigned once above: `$srcdir` isn't actually set
+# yet at this point in the script (makepkg only exports it once it starts
+# calling pkgver()/prepare()/etc, well after this top-level part runs) --
+# confirmed live, `_redfog_src="$srcdir/redfog"` up here silently captured
+# an empty $srcdir, sending every function's `cd` to a literal "/redfog".
+# A function, called fresh from inside each of those, evaluates $srcdir at
+# the right time instead.
+_cd_redfog_src() {
+    if [ -n "$REDFOG_PKG_FROM_HEAD" ]; then
+        cd "$startdir/../.."
+    else
+        cd "$srcdir/redfog"
+    fi
+}
 
 pkgver() {
-    cd "$srcdir/redfog"
+    _cd_redfog_src
     printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 prepare() {
-    cd "$srcdir/redfog"
+    _cd_redfog_src
     # pam-sys (a real dependency, via redfog-broker's PAM integration) needs
     # a bindgen bump not yet published upstream; moonlight-common-rust is
     # dev-only (redfog-moonlight's own tests, never linked into anything
     # shipped here) but `cargo fetch` still wants it present in vendor/ to
     # resolve the full workspace lockfile. See this script's own comments
     # for exactly why each one is patched instead of just version-bumped.
+    # Idempotent (checks for an already-present checkout first) -- safe to
+    # run directly against the real vendor/ dir in REDFOG_PKG_FROM_HEAD
+    # mode, not just a throwaway VCS-cloned copy.
     ./scripts/fetch-patched-deps.sh
     export RUSTUP_TOOLCHAIN=stable
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-    cd "$srcdir/redfog"
+    _cd_redfog_src
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
     # Only the real production binaries -- not the dev/test tools (viewer,
@@ -137,7 +160,7 @@ build() {
 }
 
 package() {
-    cd "$srcdir/redfog"
+    _cd_redfog_src
 
     install -Dm755 target/release/redfog-server       "$pkgdir/usr/bin/redfog-server"
     install -Dm755 target/release/redfog-broker       "$pkgdir/usr/bin/redfog-broker"

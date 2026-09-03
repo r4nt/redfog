@@ -167,6 +167,7 @@ impl CudaDirectEncoderSession {
     pub fn spawn(
         node_id: u32,
         wayland_socket_path: PathBuf,
+        pipewire_socket_path: String,
         width: u32,
         height: u32,
         fps: u32,
@@ -188,6 +189,7 @@ impl CudaDirectEncoderSession {
             if let Err(e) = run(
                 node_id,
                 wayland_socket_path,
+                &pipewire_socket_path,
                 width,
                 height,
                 fps,
@@ -273,6 +275,7 @@ impl Drop for CudaDirectEncoderSession {
 fn run(
     node_id: u32,
     wayland_socket_path: PathBuf,
+    pipewire_socket_path: &str,
     width: u32,
     height: u32,
     fps: u32,
@@ -283,7 +286,7 @@ fn run(
     reconfig: &Mutex<Option<PendingReconfig>>,
     on_access_unit: &(impl Fn(Vec<u8>, bool, std::time::Instant) + Send + Sync + 'static),
 ) -> Result<(), String> {
-    let capture = PipewireCapture::start(node_id, wayland_socket_path, false)
+    let capture = PipewireCapture::start(node_id, wayland_socket_path, pipewire_socket_path, false)
         .map_err(|e| format!("PipewireCapture::start: {e}"))?;
 
     let mut fps = fps;

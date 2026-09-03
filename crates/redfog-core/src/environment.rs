@@ -231,6 +231,14 @@ impl HeadlessRuntime {
         let debug_pipewire = std::env::var_os("REDFOG_DEBUG_PIPEWIRE_LOG").is_some();
         let mut pipewire_cmd = hide_real_audio_devices("pipewire");
         pipewire_cmd.env("XDG_RUNTIME_DIR", &runtime_dir).env("PIPEWIRE_CONFIG_DIR", &pipewire_config_dir);
+        // See `maybe_die_with_parent`'s own doc comment (written for
+        // `kwin_wayland`, equally true here): without this, a killed/crashed
+        // owner of this `HeadlessRuntime` (this process, or — new since a
+        // dedicated `redfog-pipewire-session` binary started reusing this
+        // function per-session — a process that's since `exec()`'d into
+        // something else entirely) leaks pipewire/wireplumber/pipewire-pulse
+        // forever, since `Drop` never runs on a killed process either way.
+        crate::maybe_die_with_parent(&mut pipewire_cmd);
         if debug_pipewire {
             pipewire_cmd.arg("-v").arg("-v").stdout(Stdio::inherit()).stderr(Stdio::inherit());
         } else {
@@ -246,6 +254,7 @@ impl HeadlessRuntime {
         wireplumber_cmd.env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("PIPEWIRE_REMOTE", &pipewire_socket)
             .env("PIPEWIRE_CONFIG_DIR", &pipewire_config_dir);
+        crate::maybe_die_with_parent(&mut wireplumber_cmd);
         if debug_pipewire {
             wireplumber_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
         } else {
@@ -259,6 +268,7 @@ impl HeadlessRuntime {
             .env("PIPEWIRE_CONFIG_DIR", &pipewire_config_dir)
             .env_remove("PULSE_SERVER")
             .env_remove("PULSE_RUNTIME_PATH");
+        crate::maybe_die_with_parent(&mut pipewire_pulse_cmd);
         if debug_pipewire {
             pipewire_pulse_cmd.arg("-v").stdout(Stdio::inherit()).stderr(Stdio::inherit());
         } else {

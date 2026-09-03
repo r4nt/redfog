@@ -105,6 +105,18 @@ pub struct SpawnedSession {
     /// Path to the Wayland socket `redfog-server`'s `InputForwarder` and
     /// `CompositorSession`-equivalent capture code should connect to.
     pub wayland_socket_path: String,
+    /// Path to *this session's own* PipeWire socket — a dedicated
+    /// `pipewire`+`wireplumber` pair the broker spawns as part of this same
+    /// session (not `redfog-server`'s old process-wide shared instance).
+    /// `redfog-server` connects to this explicitly (via an already-opened
+    /// fd, not the ambient `PIPEWIRE_REMOTE` env var — it's one process
+    /// serving many concurrent sessions, each needing a different remote)
+    /// for both its own video capture and for spawning this session's
+    /// `AudioLoopback`. Session-scoped rather than shared specifically to
+    /// close a real security gap: a single shared instance meant every
+    /// concurrent user's audio fought over the same PipeWire "default
+    /// sink," with no isolation between different users' sessions at all.
+    pub pipewire_socket_path: String,
 }
 
 /// Serializes `request` as one JSON line and writes it to the stream

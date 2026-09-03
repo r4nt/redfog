@@ -128,7 +128,10 @@ async fn handle_connection(
                 let result = sessions
                     .spawn(&session_id, &username, width, height, &socket_name, &payload)
                     .await
-                    .map(|wayland_socket_path| redfog_broker_protocol::SpawnedSession { wayland_socket_path });
+                    .map(|spawned| redfog_broker_protocol::SpawnedSession {
+                        wayland_socket_path: spawned.wayland_socket_path,
+                        pipewire_socket_path: spawned.pipewire_socket_path,
+                    });
                 BrokerResponse::SpawnSession(result)
             }
             BrokerRequest::SpawnPayload { session_id, username, socket_path, runtime_dir, argv, env } => {
