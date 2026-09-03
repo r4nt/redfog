@@ -112,13 +112,18 @@ pub enum SpawnedCompositor {
         width: u32,
         height: u32,
         /// A live handle to the same connection the reader thread reads
-        /// frames from — `try_clone()`'d again by `input_sink()` for
-        /// writing input events back the other way (see
-        /// `HeadlessLoginInputSink`). Kept here (not just handed off
-        /// entirely to the reader thread) so `terminate()` can
-        /// `shutdown()` it to stop that thread cleanly.
+        /// frames from, and the writer thread (see `input_tx`) writes input
+        /// to. Kept here (not just handed off entirely to those threads) so
+        /// `terminate()`/`kill_best_effort()` can `shutdown()` it to stop
+        /// both cleanly — `shutdown()` on any one `try_clone()`'d fd
+        /// affects the whole underlying socket, unblocking a pending
+        /// `read()`/`write()` on any of them.
         input_stream: UnixStream,
         reader_thread: Option<std::thread::JoinHandle<()>>,
+        /// `input_sink()` hands out clones of this — see
+        /// `HeadlessLoginInputSink`'s doc comment for why forwarding must
+        /// never block the caller directly on the socket itself.
+        input_tx: std::sync::mpsc::Sender<redfog_login_protocol::render::LoginInputEvent>,
     },
 }
 
@@ -187,10 +192,7 @@ impl SpawnedCompositor {
                 let element = pipeline.by_name("waylanddisplaysrc").ok_or("waylanddisplaysrc not found in the video pipeline")?;
                 Ok(Box::new(gst_backend::GstInputSink::new(element)))
             }
-            Self::HeadlessLogin { input_stream, .. } => {
-                let stream = input_stream.try_clone().map_err(|e| format!("failed to clone login frame stream: {e}"))?;
-                Ok(Box::new(HeadlessLoginInputSink { stream }))
-            }
+            Self::HeadlessLogin { input_tx, .. } => Ok(Box::new(HeadlessLoginInputSink { tx: input_tx.clone() })),
         }
     }
 
@@ -280,25 +282,41 @@ impl SpawnedCompositor {
 /// LoginInputEvent`], for it to apply to its own UI state directly (there's
 /// no compositor/XKB left to do keymap translation, so `redfog-login`
 /// itself maps evdev keycodes to characters — see its own doc comments).
+///
+/// Sends onto an unbounded channel rather than writing straight to the
+/// socket itself — confirmed live as a real, whole-server-freezing bug:
+/// `redfog_moonlight::session::SessionManager::on_input` holds `self.
+/// shared`'s `Mutex` for its entire body, including the call into this
+/// trait's methods. A previous version of this type wrote directly to a
+/// cloned `UnixStream` right there, so the moment `redfog-login` ever
+/// stopped draining its end (e.g. busy handling the logout that made this
+/// event's own destination go away), that blocking `write()` call hung
+/// forever *while still holding `shared`'s lock* — freezing every other
+/// session's audio/video callbacks, RTSP/HTTP handling, and `/log-out`
+/// itself along with it, since all of those also need that same lock.
+/// `spawn_login_compositor`'s own dedicated writer thread owns the actual
+/// socket and does the (still blocking, but now fully isolated) write —
+/// nothing about a stalled `redfog-login` can propagate back into a
+/// caller's critical section anymore.
 struct HeadlessLoginInputSink {
-    stream: UnixStream,
+    tx: std::sync::mpsc::Sender<redfog_login_protocol::render::LoginInputEvent>,
 }
 
 impl InputSink for HeadlessLoginInputSink {
     fn keyboard_key(&mut self, keycode: u32, pressed: bool) {
-        let _ = redfog_login_protocol::render::write_input(&mut self.stream, &redfog_login_protocol::render::LoginInputEvent::KeyboardKey { keycode, pressed });
+        let _ = self.tx.send(redfog_login_protocol::render::LoginInputEvent::KeyboardKey { keycode, pressed });
     }
     fn pointer_motion(&mut self, dx: f64, dy: f64) {
-        let _ = redfog_login_protocol::render::write_input(&mut self.stream, &redfog_login_protocol::render::LoginInputEvent::MouseMoveRelative { dx, dy });
+        let _ = self.tx.send(redfog_login_protocol::render::LoginInputEvent::MouseMoveRelative { dx, dy });
     }
     fn pointer_motion_absolute(&mut self, x: f64, y: f64) {
-        let _ = redfog_login_protocol::render::write_input(&mut self.stream, &redfog_login_protocol::render::LoginInputEvent::MouseMoveAbsolute { x, y });
+        let _ = self.tx.send(redfog_login_protocol::render::LoginInputEvent::MouseMoveAbsolute { x, y });
     }
     fn button(&mut self, button: u32, pressed: bool) {
-        let _ = redfog_login_protocol::render::write_input(&mut self.stream, &redfog_login_protocol::render::LoginInputEvent::MouseButton { button, pressed });
+        let _ = self.tx.send(redfog_login_protocol::render::LoginInputEvent::MouseButton { button, pressed });
     }
     fn axis(&mut self, axis: u32, value: f64) {
-        let _ = redfog_login_protocol::render::write_input(&mut self.stream, &redfog_login_protocol::render::LoginInputEvent::MouseAxis { axis, value });
+        let _ = self.tx.send(redfog_login_protocol::render::LoginInputEvent::MouseAxis { axis, value });
     }
 }
 
@@ -443,6 +461,31 @@ pub fn spawn_login_compositor(login_app: &[String], width: u32, height: u32, gen
         }
     });
 
+    // See `HeadlessLoginInputSink`'s doc comment for why this exists as a
+    // dedicated thread at all: isolates its (still blocking) `write_input`
+    // call from every caller of `InputSink`'s methods, so a stalled
+    // `redfog-login` can only ever back up this one thread's channel, never
+    // block whatever lock the caller happens to be holding. Exits once
+    // every `Sender` (the one below, plus every clone `input_sink()` has
+    // handed out) is dropped, or once `write_input` itself errors (e.g.
+    // after `terminate()`/`kill_best_effort()`'s `shutdown()`) — no
+    // `JoinHandle` kept for it, matching `kill_best_effort`'s own
+    // "fine to leave a thread to notice EOF on its own" philosophy elsewhere
+    // in this function; joining it here would risk deadlocking on a sender
+    // clone that's still alive in a caller's `RunningSession` at the exact
+    // moment `terminate()` runs (see `SessionManager::discard_running_
+    // session`'s ordering).
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<redfog_login_protocol::render::LoginInputEvent>();
+    let writer_stream = stream.try_clone().map_err(|e| format!("failed to clone login frame stream: {e}"))?;
+    std::thread::spawn(move || {
+        let mut writer = writer_stream;
+        for event in input_rx {
+            if redfog_login_protocol::render::write_input(&mut writer, &event).is_err() {
+                break; // redfog-login gone, or its socket shut down for teardown
+            }
+        }
+    });
+
     Ok(SpawnedCompositor::HeadlessLogin {
         child,
         frame_rx: Arc::new(Mutex::new(Some(frame_rx))),
@@ -450,6 +493,7 @@ pub fn spawn_login_compositor(login_app: &[String], width: u32, height: u32, gen
         height,
         input_stream: stream,
         reader_thread: Some(reader_thread),
+        input_tx,
     })
 }
 
