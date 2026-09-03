@@ -4307,6 +4307,7 @@ dependencies = [
  "kwin-capture",
  "libc",
  "nix",
+ "redfog-test-cleanup",
  "wayland-backend",
  "wayland-client",
  "wayland-scanner",
