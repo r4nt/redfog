@@ -14,11 +14,21 @@
 //! — the latter would silently reinterpret tiled bytes as if they were
 //! row-major, producing garbage.
 //!
-//! `import_array` only works on GPUs where
-//! [`CudaImporter::dma_buf_array_import_supported`] is true (Ampere+ —
-//! confirmed false on this dev machine's Turing RTX 2080, where
+//! `import_array` only works where
+//! [`CudaImporter::dma_buf_array_import_supported`] is true — confirmed
+//! false on this dev machine's Turing RTX 2080 (where
 //! `cuExternalMemoryGetMappedMipmappedArray` reliably fails with
-//! `CUDA_ERROR_UNKNOWN`). On older hardware, use
+//! `CUDA_ERROR_UNKNOWN`), but *also* confirmed false (driver 610.57.04,
+//! queried directly via `cuDeviceGetAttribute`, independent of this crate)
+//! on a GeForce RTX 4070 Ti (Ada, compute 8.9) with modeset and Resizable
+//! BAR both enabled. So this isn't purely an "Ampere+" architecture gate as
+//! once assumed here — the common factor across both false results is that
+//! they're GeForce parts, not datacenter/professional (Quadro/RTX-
+//! workstation) ones, which is where NVIDIA has actually validated CUDA
+//! DMA-BUF interop. Treat the Vulkan-bridge fallback below as the expected,
+//! likely-permanent path on GeForce hardware, not a Turing-specific
+//! workaround — don't be surprised if newer GeForce cards report false too.
+//! On GPUs where it's false, use
 //! [`crate::vulkan_bridge::VulkanBridge::detile_dmabuf_to_linear_fd`] first
 //! to detile the frame into a linear buffer via a plain GPU copy command,
 //! then hand *that* fd to [`CudaImporter::import_linear`] instead — the
@@ -63,7 +73,11 @@ impl CudaImporter {
     /// Whether this GPU/driver supports importing a dma-buf directly as a
     /// tiled `CUarray` via [`CudaImporter::import_array`] — `false` means
     /// callers need the [`crate::vulkan_bridge`] fallback instead. Queries
-    /// `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` (Ampere+ only).
+    /// `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` — despite the name, this
+    /// isn't purely an architecture check; see this module's doc comment.
+    /// Observed `false` on GeForce cards across generations (Turing RTX
+    /// 2080, Ada RTX 4070 Ti), likely because CUDA DMA-BUF interop is only
+    /// validated on datacenter/professional GPUs.
     pub fn dma_buf_array_import_supported(&self) -> Result<bool, DriverError> {
         let supported = self.ctx.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED)?;
         Ok(supported != 0)

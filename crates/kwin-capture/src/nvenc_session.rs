@@ -1,8 +1,9 @@
 //! Production wrapper around the DMA-BUF -> CUDA -> NVENC path validated by
 //! `tests/cuda_direct_nvenc.rs`: a background thread that captures via
 //! `PipewireCapture`, imports each frame into CUDA (directly as a tiled
-//! array on Ampere+, or via `vulkan_bridge`'s detile-to-linear-buffer bridge
-//! on older GPUs — see `cuda_import`'s doc comment), and drives NVENC
+//! array where the driver reports DMA-BUF array import support, or via
+//! `vulkan_bridge`'s detile-to-linear-buffer bridge otherwise (not simply
+//! an Ampere+ vs. older-GPU split) — see `cuda_import`'s doc comment), and drives NVENC
 //! directly, with no GStreamer involved in the video leg at all.
 //!
 //! Picture-type decision (`enablePTD`) is left *off* for both codecs — we
