@@ -329,18 +329,48 @@ fn pump(state: &mut State, queue: &mut wayland_client::EventQueue<State>, conn: 
     queue.blocking_dispatch(state).ok();
 }
 
-/// Find a mode whose dimensions are within 8px of (w, h). KDE may snap widths.
+/// Find a mode whose dimensions exactly match (w, h) — deliberately no
+/// tolerance (an earlier version accepted anything within 8px, "KDE may
+/// snap widths"). Confirmed live this is a real bug, not a defensive
+/// nicety: `CompositorSession::resize` (`redfog-core`) unconditionally
+/// stores whatever `w`/`h` was *requested* into the atomics `video_source()`
+/// reads to size the next `CudaDirectEncoderSession` — it has no way to
+/// know this found a merely-nearby existing mode instead of an exact one.
+/// A within-8px match (e.g. a 1602-wide client landing on an existing
+/// 1600-wide mode) left the compositor's real output at the old size
+/// forever while the encoder believed the new one, so `run_encoder`'s own
+/// exact-match frame check (`nvenc_session.rs`) dropped every single frame
+/// permanently — not "a couple of frames while settling" as intended, an
+/// unrecoverable silent stall. A virtual output (`kwin_wayland --virtual`)
+/// has no real hardware timing/EDID constraints to snap against, so
+/// forcing an exact custom mode via `set_custom_modes` below (the "not
+/// found" branch) is expected to actually succeed exactly, not just
+/// approximately — and if it somehow doesn't, the existing "closest mode"
+/// fallback in `set_output_mode` still applies, just later than before.
 fn find_mode(modes: &HashMap<ObjectId, (KdeOutputDeviceModeV2, i32, i32)>, w: i32, h: i32)
     -> Option<KdeOutputDeviceModeV2>
 {
     modes.values()
         .filter(|(_, mw, mh)| *mw > 0 && *mh > 0)
-        .find(|(_, mw, mh)| (*mw - w).abs() <= 8 && (*mh - h).abs() <= 8)
+        .find(|(_, mw, mh)| *mw == w && *mh == h)
         .map(|(proxy, _, _)| proxy.clone())
 }
 
 /// Apply a mode change on the virtual output. Two-step when the mode doesn't exist yet:
 /// set_custom_modes (replaces any prior custom mode) then mode() (activates it).
+///
+/// Returns the *actually applied* `(width, height)` — confirmed live this
+/// can genuinely differ from the requested `w`/`h`, not just via
+/// `find_mode`'s own matching tolerance (removed, see its doc comment): KWin
+/// itself can snap a requested custom-mode width (e.g. `1602` came back as
+/// an existing/created `1600`-wide mode, reproduced directly against a real
+/// `kwin_wayland --virtual` instance, independent of any tolerance in this
+/// file). Callers MUST use this return value as the resolution the capture
+/// stream will actually produce from here on — not the `w`/`h` they asked
+/// for — or whatever spawns the next encoder against the old assumption
+/// (`CompositorSession::resize`) ends up permanently mismatched against
+/// reality, silently dropping every frame forever (`nvenc_session.rs`'s
+/// exact-match frame check has no tolerance of its own).
 fn set_output_mode(
     state: &mut State,
     queue: &mut wayland_client::EventQueue<State>,
@@ -349,26 +379,32 @@ fn set_output_mode(
     w: i32,
     h: i32,
     fps: u32,
-) {
+) -> (i32, i32) {
     let (Some(device), Some(mgmt)) = (state.our_device.clone(), state.output_management.clone())
     else {
         eprintln!("capture: set_output_mode: no device or management object");
-        return;
+        return (w, h);
     };
 
-    // Skip if current mode already matches and we have already disabled other outputs.
+    // Skip only if the current mode is an *exact* match and we have already
+    // disabled other outputs — see `find_mode`'s doc comment for why this
+    // dropped the same within-8px tolerance it used to have.
     let already_correct = state.has_configured_outputs && state.current_mode_id
         .as_ref()
         .and_then(|id| state.modes.get(id))
-        .map(|(_, mw, mh)| (*mw - w).abs() <= 8 && (*mh - h).abs() <= 8)
+        .map(|(_, mw, mh)| *mw == w && *mh == h)
         .unwrap_or(false);
     if already_correct {
-        return;
+        return (w, h);
     }
 
     // If no existing mode matches, add a custom one (set_custom_modes replaces any prior).
-    let target = if let Some(m) = find_mode(&state.modes, w, h) {
-        m
+    // `target` found via `find_mode` is always an *exact* match (it requires
+    // equality now, see its doc comment), so `(w, h)` is the real applied
+    // resolution in every branch except the final "closest mode" fallback,
+    // which tracks its own real `(mw, mh)` explicitly.
+    let (target, actual_w, actual_h) = if let Some(m) = find_mode(&state.modes, w, h) {
+        (m, w, h)
     } else {
         let mode_list = mgmt.create_mode_list(qh, ());
         mode_list.set_resolution(w as u32, h as u32);
@@ -389,21 +425,23 @@ fn set_output_mode(
         queue.roundtrip(state).ok();
 
         match find_mode(&state.modes, w, h) {
-            Some(m) => m,
+            Some(m) => (m, w, h),
             None => {
-                eprintln!("capture: custom mode {w}x{h} not found after set_custom_modes. Available modes:");
+                eprintln!("capture: custom mode {w}x{h} not found after set_custom_modes — KWin likely snapped/rounded it. Available modes:");
                 for (id, (_, mw, mh)) in &state.modes {
                     eprintln!("  - {id:?}: {mw}x{mh}");
                 }
-                // Try finding the closest mode as a fallback
+                // Try finding the closest mode as a fallback — the one place
+                // the applied resolution can genuinely differ from what was
+                // requested, so `mw`/`mh` (not `w`/`h`) are what's returned.
                 if let Some((proxy, mw, mh)) = state.modes.values()
                     .filter(|(_, mw, mh)| *mw > 0 && *mh > 0)
                     .min_by_key(|(_, mw, mh)| (*mw - w).abs() + (*mh - h).abs())
                 {
                     eprintln!("capture: falling back to closest mode {mw}x{mh}");
-                    proxy.clone()
+                    (proxy.clone(), *mw, *mh)
                 } else {
-                    return;
+                    return (w, h);
                 }
             }
         }
@@ -431,6 +469,7 @@ fn set_output_mode(
     state.config_done = false;
     while !state.config_done { pump(state, queue, conn); }
     state.has_configured_outputs = true;
+    (actual_w, actual_h)
 }
 
 fn create_stream(
@@ -476,7 +515,13 @@ fn create_stream(
     queue.roundtrip(state).ok();
     eprintln!("capture: stream+device ready, node={:?}", state.node_id);
 
-    set_output_mode(state, queue, qh, conn, w, h, fps);
+    // Initial connect-time resolution — not fed back to the caller today
+    // (unlike the runtime `resize()` path below, which now is): typically a
+    // fixed, "nice" default (1920x1080 etc.) rather than an arbitrary
+    // client-requested value, so less exposed to the odd-width snapping
+    // this function's own doc comment describes. Worth wiring through if
+    // that ever stops holding.
+    let _ = set_output_mode(state, queue, qh, conn, w, h, fps);
     state.node_id
 }
 
@@ -484,9 +529,14 @@ fn create_stream(
 
 // ── public API ────────────────────────────────────────────────────────────────
 
+/// A resize request: target `(w, h)`, plus a reply channel carrying back
+/// whatever `(w, h)` the compositor actually applied — see
+/// `set_output_mode`'s doc comment for why that can genuinely differ.
+type ResizeRequest = (i32, i32, mpsc::Sender<(i32, i32)>);
+
 pub struct CaptureSession {
     node_id:     u32,
-    resize_tx:   mpsc::Sender<(i32, i32, mpsc::Sender<()>)>,
+    resize_tx:   mpsc::Sender<ResizeRequest>,
     should_stop: Arc<AtomicBool>,
     thread:      Option<std::thread::JoinHandle<()>>,
 }
@@ -514,7 +564,7 @@ impl CaptureSession {
         let node_id = create_stream(&mut state, &mut queue, &qh, &conn, width, height, scale, fps)
             .ok_or("virtual output stream failed")?;
 
-        let (resize_tx, resize_rx) = mpsc::channel::<(i32, i32, mpsc::Sender<()>)>();
+        let (resize_tx, resize_rx) = mpsc::channel::<ResizeRequest>();
         let should_stop = Arc::new(AtomicBool::new(false));
         let should_stop_thread = should_stop.clone();
 
@@ -551,8 +601,11 @@ impl CaptureSession {
 
                 while let Ok((w, h, reply_tx)) = resize_rx.try_recv() {
                     eprintln!("capture: resizing to {w}x{h}");
-                    set_output_mode(&mut state, &mut queue, &qh, &conn, w, h, fps);
-                    let _ = reply_tx.send(());
+                    let applied = set_output_mode(&mut state, &mut queue, &qh, &conn, w, h, fps);
+                    if applied != (w, h) {
+                        eprintln!("capture: resize to {w}x{h} actually applied as {}x{}", applied.0, applied.1);
+                    }
+                    let _ = reply_tx.send(applied);
                 }
             }
         });
@@ -566,12 +619,19 @@ impl CaptureSession {
 
 
 
-    /// Request the virtual output to change resolution.
-    /// This blocks until the compositor has successfully applied the mode change.
-    pub fn resize(&self, w: i32, h: i32) {
+    /// Request the virtual output to change resolution. Blocks until the
+    /// compositor has applied *some* mode change, and returns the
+    /// resolution it actually applied — which is NOT guaranteed to be
+    /// `(w, h)` (see `set_output_mode`'s doc comment: KWin can snap/round a
+    /// requested custom-mode width). Falls back to returning `(w, h)`
+    /// unchanged only if the background thread is already gone (the whole
+    /// session is shutting down, so the value is moot).
+    pub fn resize(&self, w: i32, h: i32) -> (i32, i32) {
         let (reply_tx, reply_rx) = mpsc::channel();
         if self.resize_tx.send((w, h, reply_tx)).is_ok() {
-            let _ = reply_rx.recv();
+            reply_rx.recv().unwrap_or((w, h))
+        } else {
+            (w, h)
         }
     }
 }

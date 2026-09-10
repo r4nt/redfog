@@ -461,20 +461,41 @@ impl CompositorSession {
     }
 
     /// Resizes the virtual output and, once the compositor has confirmed it
-    /// (see `CaptureSession::resize`, which blocks until then), records the
-    /// new size so a subsequent `video_source()` call reports it — a
-    /// resolution-change reconnect always rebuilds the whole video pipeline
-    /// (a fresh `CudaDirectEncoderSession`, spawned with whatever
-    /// `video_source()` returns at that point) immediately after calling
-    /// this, and that encoder validates every incoming frame's dimensions
-    /// against the size it was told to expect (see `kwin-capture`'s
-    /// `run_encoder`). Before this existed, that check compared against the
-    /// session's original construction-time size forever, so it rejected
-    /// every correctly-resized frame after any resize.
+    /// (see `CaptureSession::resize`, which blocks until then), records
+    /// what it actually applied so a subsequent `video_source()` call
+    /// reports the truth — a resolution-change reconnect always rebuilds
+    /// the whole video pipeline (a fresh `CudaDirectEncoderSession`, spawned
+    /// with whatever `video_source()` returns at that point) immediately
+    /// after calling this, and that encoder validates every incoming
+    /// frame's dimensions against the size it was told to expect (see
+    /// `kwin-capture`'s `run_encoder`). Before this existed, that check
+    /// compared against the session's original construction-time size
+    /// forever, so it rejected every correctly-resized frame after any
+    /// resize.
+    ///
+    /// Deliberately stores `CaptureSession::resize`'s *return* value here,
+    /// not the `width`/`height` this was called with — confirmed live
+    /// (`kwin-capture`'s `set_output_mode` doc comment has the full story)
+    /// that KWin's virtual output can snap/round a requested custom-mode
+    /// width, so the two can genuinely differ. An earlier version of this
+    /// method stored the requested values unconditionally, on the
+    /// assumption that `CaptureSession::resize` blocking until "confirmed"
+    /// meant confirmed *exactly* — it didn't, and every frame the real
+    /// compositor produced afterward got silently, permanently dropped by
+    /// the encoder's exact-match check above, with no recovery.
     pub fn resize(&self, width: i32, height: i32) {
-        self.capture_session.resize(width, height);
-        self.width.store(width, Ordering::Relaxed);
-        self.height.store(height, Ordering::Relaxed);
+        let (applied_width, applied_height) = self.capture_session.resize(width, height);
+        self.width.store(applied_width, Ordering::Relaxed);
+        self.height.store(applied_height, Ordering::Relaxed);
+    }
+
+    /// The resolution `video_source()` is currently reporting — i.e. what
+    /// `resize()` last confirmed was *actually* applied, not necessarily
+    /// what any caller last asked for. Lets a caller that just called
+    /// `resize()` (and rebuilt a pipeline around it) record the truth in
+    /// its own bookkeeping instead of blindly re-storing its own request.
+    pub fn resolution(&self) -> (i32, i32) {
+        (self.width.load(Ordering::Relaxed), self.height.load(Ordering::Relaxed))
     }
 
 

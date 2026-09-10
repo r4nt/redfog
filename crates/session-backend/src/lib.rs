@@ -275,6 +275,20 @@ impl SpawnedCompositor {
         }
     }
 
+    /// The resolution this compositor's `video_source()` is currently
+    /// reporting. For `Kwin`, this can differ from whatever `resize()` was
+    /// last called with — see `CompositorSession::resolution`'s doc
+    /// comment — so a caller that just resized should read this back
+    /// afterward rather than assume its own request was honored exactly.
+    /// Fixed for the other two variants, which never resize live (see
+    /// `resize`'s own doc comment).
+    pub fn resolution(&self) -> (i32, i32) {
+        match self {
+            Self::Kwin(session) => session.resolution(),
+            Self::GstWaylandDisplay { width, height, .. } => (*width, *height),
+            Self::HeadlessLogin { width, height, .. } => (*width as i32, *height as i32),
+        }
+    }
 }
 
 /// [`InputSink`] for [`SpawnedCompositor::HeadlessLogin`] — ships each call

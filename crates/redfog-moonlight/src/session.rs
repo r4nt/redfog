@@ -1392,8 +1392,24 @@ impl SessionManager {
         // already matches, so a same-size call is a cheap no-op rather than
         // a real hotplug/reconfiguration event.
         let resized = session.compositor.as_ref().is_some_and(|c| c.resize(wanted_width as i32, wanted_height as i32));
+        // The resolution actually in effect afterward — NOT necessarily
+        // `(wanted_width, wanted_height)`. `SpawnedCompositor::resize`
+        // (Kwin) can only ever apply what the compositor itself was
+        // willing to give it (confirmed live: an odd requested width can
+        // come back snapped/rounded), so this reads back the truth via
+        // `resolution()` rather than assuming the request was honored
+        // exactly — `build_video_pipeline` below independently does the
+        // same thing internally (via `video_source()`), so this is just
+        // making this method's own `session.width`/`height` bookkeeping
+        // agree with what the encoder it just built actually targets,
+        // instead of silently drifting from it.
+        let (actual_width, actual_height) = session
+            .compositor
+            .as_ref()
+            .map(|c| c.resolution())
+            .unwrap_or((wanted_width as i32, wanted_height as i32));
         tracing::info!(
-            "handoff_to_user reconcile: resize to {wanted_width}x{wanted_height} {}",
+            "handoff_to_user reconcile: resize to {wanted_width}x{wanted_height} {} (actual: {actual_width}x{actual_height})",
             if resized { "applied" } else { "not supported by this compositor backend, resolution unchanged" }
         );
 
@@ -1412,8 +1428,8 @@ impl SessionManager {
         );
         session.video_pipeline = video_pipeline;
         session.cuda_direct_session = cuda_direct_session;
-        session.width = wanted_width;
-        session.height = wanted_height;
+        session.width = actual_width as u32;
+        session.height = actual_height as u32;
         session.fps = wanted_fps;
         session.codec = wanted_codec;
         session
