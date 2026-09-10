@@ -26,11 +26,13 @@ pub struct AnnouncedParams {
     /// The codec the *client* actually picked (from its own supported
     /// formats intersected with our advertised `ServerCodecModeSupport` —
     /// see pairing.rs) — not something we choose. Defaults to H.264 if the
-    /// attribute is missing (very old/minimal clients) or names a codec we
-    /// don't support (currently only AV1 — see `redfog_core::VideoCodec`'s
-    /// doc comment for why that's not implemented yet): a client that never
-    /// actually negotiated H.264 support wouldn't have gotten this far in
-    /// the first place, since `ServerCodecModeSupport` always advertises it.
+    /// attribute is missing (very old/minimal clients) or names AV1 while
+    /// `RtspServer::av1_supported` is false (this GPU/driver doesn't
+    /// actually support NVENC AV1 encode — see
+    /// `redfog_core::av1_encode_supported`'s doc comment): a client that
+    /// never actually negotiated H.264 support wouldn't have gotten this
+    /// far in the first place, since `ServerCodecModeSupport` always
+    /// advertises it.
     pub codec: redfog_core::VideoCodec,
 }
 
@@ -116,6 +118,13 @@ pub struct RtspServer {
     /// why each request is now its own TCP connection) is enough to keep
     /// `Session:` consistent across SETUP/PLAY.
     pub session_id: String,
+    /// Whether this GPU/driver's NVENC actually supports AV1 encode
+    /// (`redfog_core::av1_encode_supported()`, computed once at server
+    /// startup) — gates both the `sdp()` AV1 marker and `parse_announce`'s
+    /// acceptance of a client's AV1 pick. A plain field rather than a call
+    /// to the (GPU-probing, hard to unit-test) global function directly, so
+    /// both code paths stay testable without a real GPU.
+    pub av1_supported: bool,
 }
 
 impl RtspServer {
@@ -293,11 +302,16 @@ impl RtspServer {
                 // moonlight-common-rust's own SDP builder, `sdp/client.rs`:
                 // this is what a real client sets after intersecting our
                 // advertised `ServerCodecModeSupport` with its own decode
-                // capabilities). 2 (AV1) falls back to H.264 rather than
-                // silently mis-selecting an unsupported codec — see
+                // capabilities). The `self.av1_supported` guard on "2" is
+                // defensive, not load-bearing — a client shouldn't pick AV1
+                // if we didn't advertise it via `ServerCodecModeSupport`/
+                // `sdp()`'s own AV1 marker, but don't silently mis-select
+                // an unsupported codec if one does anyway; falls back to
+                // H.264 same as an unrecognized value — see
                 // `AnnouncedParams::codec`'s doc comment.
                 codec = match value.trim() {
                     "1" => redfog_core::VideoCodec::Hevc,
+                    "2" if self.av1_supported => redfog_core::VideoCodec::Av1,
                     _ => redfog_core::VideoCodec::H264,
                 };
             }
@@ -341,6 +355,19 @@ impl RtspServer {
         // correctly in that path even without this line, which is why the
         // gap wasn't caught by this crate's own dev-dependency-driven
         // integration tests until tested against real clients.
+        //
+        // `a=rtpmap:98 AV1/90000` — the AV1 analogue of the HEVC line
+        // above, same two-layer relationship to `/serverinfo`'s
+        // `ServerCodecModeSupport`: confirmed against real
+        // `moonlight-common-c` (`RtspConnection.c`), which searches the
+        // DESCRIBE response for the literal substring `"AV1/90000"` to
+        // decide AV1 is offered at all, and against real Sunshine
+        // (`rtsp.cpp`'s `cmd_describe`), which emits this exact line. Only
+        // included when `av1_supported` — unlike the HEVC line above,
+        // which is unconditional because every GPU this server runs on is
+        // assumed capable of *some* HEVC path, AV1 needs Ada Lovelace+
+        // NVENC specifically, so this can't be a static literal.
+        let av1_line = if self.av1_supported { "a=rtpmap:98 AV1/90000\r\n" } else { "" };
         format!(
             "v=0\r\n\
              o=redfog 0 0 IN IPv4 0.0.0.0\r\n\
@@ -350,7 +377,8 @@ impl RtspServer {
              a=x-nv-video[0].videoPort:{video_port}\r\n\
              a=x-nv-general.serverControlPort:{control_port}\r\n\
              a=x-nv-general.serverAudioPort:{audio_port}\r\n\
-             sprop-parameter-sets=AAAAAU\r\n",
+             sprop-parameter-sets=AAAAAU\r\n\
+             {av1_line}",
             video_port = self.video_port,
             control_port = self.control_port,
             audio_port = self.audio_port,
@@ -373,7 +401,12 @@ mod tests {
             default_fps: 60,
             handler: Arc::new(NoopRtspHandler),
             session_id: "deadbeef".to_string(),
+            av1_supported: false,
         }
+    }
+
+    fn server_with_av1() -> RtspServer {
+        RtspServer { av1_supported: true, ..server() }
     }
 
     #[tokio::test]
@@ -432,9 +465,26 @@ mod tests {
     }
 
     #[test]
-    fn announce_falls_back_to_h264_for_unsupported_av1_bit_stream_format() {
+    fn announce_falls_back_to_h264_for_av1_bit_stream_format_when_unsupported() {
         let body = "a=x-nv-vqos[0].bitStreamFormat:2\r\n";
         let params = server().parse_announce(body.as_bytes());
         assert_eq!(params.codec, redfog_core::VideoCodec::H264);
+    }
+
+    #[test]
+    fn announce_parses_av1_bit_stream_format_when_supported() {
+        let body = "a=x-nv-vqos[0].bitStreamFormat:2\r\n";
+        let params = server_with_av1().parse_announce(body.as_bytes());
+        assert_eq!(params.codec, redfog_core::VideoCodec::Av1);
+    }
+
+    #[test]
+    fn sdp_omits_av1_marker_when_unsupported() {
+        assert!(!server().sdp().contains("AV1/90000"));
+    }
+
+    #[test]
+    fn sdp_includes_av1_marker_when_supported() {
+        assert!(server_with_av1().sdp().contains("a=rtpmap:98 AV1/90000"));
     }
 }

@@ -8,7 +8,7 @@
 //! session doesn't exercise the same system-bus/logind path a real
 //! deployment does).
 
-use kwin_capture::nvenc_session::{CudaDirectEncoderSession, VideoCodec};
+use kwin_capture::nvenc_session::{av1_encode_supported, CudaDirectEncoderSession, VideoCodec};
 
 fn fd_count() -> usize {
     std::fs::read_dir("/proc/self/fd").unwrap().count()
@@ -230,4 +230,73 @@ async fn hevc_survives_many_frames_and_request_keyframe_produces_a_real_idr() {
 
     drop(session);
     assert!(got_requested_keyframe, "request_keyframe() never produced a real keyframe for HEVC");
+}
+
+/// AV1 counterpart to the HEVC test above — same manual-PTD POC/refPicFlag
+/// treatment was applied to AV1 by analogy (see `nvenc_session.rs`'s
+/// `manual_poc`/`codec_params`), on the theory NVENC might reject a
+/// manually-typed AV1 P-frame the same way it originally did for HEVC. This
+/// is the live check for whether that theory holds — needs Ada Lovelace+
+/// NVENC specifically, not just any CUDA-capable GPU, hence the separate
+/// `av1_encode_supported()` gate below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn av1_survives_many_frames_and_request_keyframe_produces_a_real_idr() {
+    redfog_test_cleanup::ensure_active();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
+
+    if !av1_encode_supported() {
+        eprintln!("NVENC on this GPU doesn't support AV1 (needs Ada Lovelace+) — skipping av1_survives_many_frames_and_request_keyframe_produces_a_real_idr");
+        return;
+    }
+
+    let runtime_dir = std::env::temp_dir().join(format!("redfog-it-av1-idr-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::env::set_var("REDFOG_RUNTIME_DIR", &runtime_dir);
+    std::env::set_var("REDFOG_ALWAYS_SOFTWARE", "0");
+
+    let _dbus_session = redfog_core::ensure_private_dbus_session();
+    let _headless_runtime = redfog_core::HeadlessRuntime::start(runtime_dir).unwrap();
+
+    eprintln!("Spawning KWin running glxgears...");
+    let compositor =
+        session_backend::spawn_user_compositor_direct(session_backend::Backend::Kwin, "user", &["glxgears".to_string()], 1280, 720, 60).unwrap();
+    let node_id = match compositor.video_source(None) {
+        redfog_core::VideoSource::PipeWireNode(node) => node,
+        _ => panic!("expected a PipeWireNode video source"),
+    };
+    let socket_path = match &compositor {
+        session_backend::SpawnedCompositor::Kwin(session) => session.socket_path.clone(),
+        _ => panic!("expected a Kwin-backed compositor"),
+    };
+    let _compositor_guard = KillCompositorOnDrop(compositor);
+
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
+    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), 1280, 720, 60, 5_000, VideoCodec::Av1, move |data, is_keyframe, _capture_instant| {
+        let _ = tx.send((data, is_keyframe));
+    });
+
+    let mut saw_initial_keyframe = false;
+    for _ in 0..30 {
+        let (_, is_keyframe) = rx.recv_timeout(std::time::Duration::from_secs(3)).expect("no frame within 3s — encoder thread likely crashed");
+        saw_initial_keyframe |= is_keyframe;
+    }
+    assert!(saw_initial_keyframe, "never saw the initial keyframe");
+
+    session.request_keyframe();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut got_requested_keyframe = false;
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok((_, is_keyframe)) if is_keyframe => {
+                got_requested_keyframe = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => panic!("no frame received while waiting for the requested keyframe"),
+        }
+    }
+
+    drop(session);
+    assert!(got_requested_keyframe, "request_keyframe() never produced a real keyframe for AV1");
 }

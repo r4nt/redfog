@@ -60,10 +60,12 @@ use std::thread::JoinHandle;
 
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
     NV_ENC_BUFFER_FORMAT,
+    NV_ENC_CODEC_AV1_GUID,
     NV_ENC_CODEC_H264_GUID,
     NV_ENC_CODEC_HEVC_GUID,
     NV_ENC_INPUT_RESOURCE_TYPE,
     NV_ENC_PARAMS_RC_MODE,
+    NV_ENC_PIC_PARAMS_AV1,
     NV_ENC_PIC_PARAMS_HEVC,
     NV_ENC_PIC_TYPE,
     NV_ENC_PRESET_P4_GUID,
@@ -77,18 +79,18 @@ use crate::vulkan_bridge::{BridgedImage, VulkanBridge};
 
 const GOP_LENGTH: u32 = 300;
 
-/// Which codec NVENC actually produces. Deliberately just the two variants
-/// this GPU generation (Turing) can encode at all — `encode_guids` is
-/// checked live against whichever this resolves to, so an unsupported
-/// choice fails with a clear error rather than silently encoding the wrong
-/// thing. A third `Av1` variant would extend `codec_guid`/the `run()` match
-/// below the same way once it's actually needed on hardware that supports
-/// it (Ada Lovelace+) — not added speculatively now.
+/// Which codec NVENC actually produces. `encode_guids` is checked live
+/// against whichever this resolves to (`run_encoder`, and see
+/// `av1_encode_supported` below for the same check done standalone), so an
+/// unsupported choice fails with a clear error rather than silently
+/// encoding the wrong thing — this is how `Av1` degrades cleanly on
+/// pre-Ada Lovelace hardware, where NVENC simply doesn't list its GUID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoCodec {
     #[default]
     H264,
     Hevc,
+    Av1,
 }
 
 impl VideoCodec {
@@ -96,8 +98,29 @@ impl VideoCodec {
         match self {
             VideoCodec::H264 => NV_ENC_CODEC_H264_GUID,
             VideoCodec::Hevc => NV_ENC_CODEC_HEVC_GUID,
+            VideoCodec::Av1 => NV_ENC_CODEC_AV1_GUID,
         }
     }
+}
+
+/// Whether this GPU/driver's NVENC can encode AV1 at all (Ada Lovelace+
+/// only) — drives whether the server advertises AV1 to clients at all (see
+/// `redfog-moonlight`'s `pairing`/`rtsp` modules). Cheap after the first
+/// call: opens the same shared primary CUDA context `run_encoder` uses and
+/// just lists encode GUIDs, no session/config/init, and the result is
+/// cached for the life of the process — repeated `/serverinfo` requests
+/// don't reprobe the GPU.
+pub fn av1_encode_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        (|| -> Result<bool, String> {
+            let cuda_ctx = cudarc016::driver::CudaContext::new(0).map_err(|e| format!("{e:?}"))?;
+            let encoder = Encoder::initialize_with_cuda(cuda_ctx).map_err(|e| format!("{e:?}"))?;
+            let guids = encoder.get_encode_guids().map_err(|e| format!("{e:?}"))?;
+            Ok(guids.contains(&NV_ENC_CODEC_AV1_GUID))
+        })()
+        .unwrap_or(false)
+    })
 }
 
 /// fps/bitrate/codec, requested via [`CudaDirectEncoderSession::reconfigure`]
@@ -383,10 +406,17 @@ fn run_encoder(
         config.rcParams.set_enableAQ(1);
         // repeatSPSPPS lives on a codec-specific union member (h264Config vs
         // hevcConfig) — same field name/semantics on both, just a different
-        // struct.
+        // struct. `NV_ENC_CONFIG_AV1` has no such field at all (confirmed by
+        // reading the SDK's struct definition directly, and independently
+        // by `gst-inspect-1.0 nvav1enc` having no `repeat-sequence-header`
+        // property either) — AV1's OBU framing apparently doesn't have the
+        // same "parameter sets separate from slice data" split H.264/HEVC
+        // do, so there's nothing to repeat here. Left as a no-op rather than
+        // omitted entirely so this stays an exhaustive, visible match.
         match codec {
             VideoCodec::H264 => unsafe { config.encodeCodecConfig.h264Config.set_repeatSPSPPS(1) },
             VideoCodec::Hevc => unsafe { config.encodeCodecConfig.hevcConfig.set_repeatSPSPPS(1) },
+            VideoCodec::Av1 => {}
         }
     }
 
@@ -409,12 +439,16 @@ fn run_encoder(
 
     let mut registered: HashMap<i64, RegisteredFrame<'_>> = HashMap::new();
     let mut frame_index: u64 = 0;
-    // HEVC-only — see this module's doc comment: NVENC requires a
+    // HEVC and AV1 only — see this module's doc comment: NVENC requires a
     // client-supplied, monotonically-increasing display POC per frame when
     // handling picture type decisions manually, resetting at every IDR
     // (standard video-coding convention: an IDR flushes the reference
     // picture buffer, so POC continuity across one has no meaning).
-    let mut hevc_poc: u32 = 0;
+    // `NV_ENC_PIC_PARAMS_AV1` exposes the exact same `displayPOCSyntax`/
+    // `refPicFlag` fields as `NV_ENC_PIC_PARAMS_HEVC`, so this reuses the
+    // HEVC fix by analogy — unconfirmed whether NVENC's AV1 encoder has the
+    // same manual-PTD rejection bug HEVC did, needs live verification.
+    let mut manual_poc: u32 = 0;
 
     // Diagnostic-only: the *actual* delivered/encoded frame rate,
     // independent of the `fps` parameter above (which only feeds NVENC's
@@ -543,9 +577,9 @@ fn run_encoder(
         let picture_type =
             if want_keyframe { NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR } else { NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_P };
         if want_keyframe {
-            hevc_poc = 0;
-        } else if codec == VideoCodec::Hevc {
-            hevc_poc += 1;
+            manual_poc = 0;
+        } else if matches!(codec, VideoCodec::Hevc | VideoCodec::Av1) {
+            manual_poc += 1;
         }
 
         let input_resource = registered.get_mut(&frame.buffer_identity).unwrap();
@@ -560,7 +594,7 @@ fn run_encoder(
                 vulkan_bridge.unwrap().lock().unwrap().refresh(bridged).map_err(|e| format!("VulkanBridge::refresh: {e}"))?;
             }
         }
-        // HEVC-only: NVENC's own docs (`NV_ENC_PIC_PARAMS_HEVC`) say
+        // HEVC and AV1 only: NVENC's own docs (`NV_ENC_PIC_PARAMS_HEVC`) say
         // `displayPOCSyntax` is "required to be set if client is handling
         // the picture type decision" and `refPicFlag` matters whenever PTD
         // is off — see this module's doc comment for how omitting these
@@ -568,9 +602,21 @@ fn run_encoder(
         // forever) was the real cause of `encode_picture` rejecting every
         // manually-typed HEVC P-frame. H.264's own per-picture params have
         // no such requirement — `None` there is correct, not an oversight.
-        let codec_params = (codec == VideoCodec::Hevc).then(|| {
-            CodecPictureParams::Hevc(NV_ENC_PIC_PARAMS_HEVC { displayPOCSyntax: hevc_poc, refPicFlag: 1, ..Default::default() })
-        });
+        // `NV_ENC_PIC_PARAMS_AV1` has the identical two fields, applied here
+        // by the same reasoning.
+        let codec_params = match codec {
+            VideoCodec::Hevc => Some(CodecPictureParams::Hevc(NV_ENC_PIC_PARAMS_HEVC {
+                displayPOCSyntax: manual_poc,
+                refPicFlag: 1,
+                ..Default::default()
+            })),
+            VideoCodec::Av1 => Some(CodecPictureParams::Av1(NV_ENC_PIC_PARAMS_AV1 {
+                displayPOCSyntax: manual_poc,
+                refPicFlag: 1,
+                ..Default::default()
+            })),
+            VideoCodec::H264 => None,
+        };
         session
             .encode_picture(
                 input_resource,

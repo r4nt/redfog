@@ -150,6 +150,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(s) if !s.is_empty() => s.parse::<redfog_core::VideoEncoder>()?,
         _ => redfog_core::detect_video_encoder(),
     };
+    // Probes NVENC's own encode GUIDs once (Ada Lovelace+ only) — gates
+    // whether AV1 gets advertised to clients at all, in both
+    // `PairingServer::server_info` and `RtspServer::sdp`/`parse_announce`
+    // below. Cached for the life of the process (see
+    // `av1_encode_supported`'s own doc comment), so this one call here is
+    // the only GPU probe, not a per-request one.
+    let av1_supported = redfog_core::av1_encode_supported();
 
     // The login screen's session picker (see redfog_login_protocol's own
     // doc comment for why redfog-login reads this same file directly
@@ -202,6 +209,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         https_port,
         rtsp_port,
         launch_handler: session_manager.clone(),
+        av1_supported,
     });
 
     let rtsp_server = Arc::new(RtspServer {
@@ -214,6 +222,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         default_fps: 60,
         handler: session_manager.clone(),
         session_id: format!("{:016X}", rand::random::<u64>()),
+        av1_supported,
     });
 
     let control_server = ControlServer {

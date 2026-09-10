@@ -161,16 +161,19 @@ pub enum VideoSink {
     /// Raw BGRx frames for local display — [`make_pipeline`]'s only
     /// consumer, the `viewer` debug tool. No encoding at all.
     LocalDisplay,
-    /// H.264- or HEVC-encoded access units for network streaming —
+    /// H.264-, HEVC-, or AV1-encoded access units for network streaming —
     /// [`make_encoder_pipeline`]'s only consumer, the real Moonlight server.
     /// `codec`: the client already committed to this at RTSP ANNOUNCE time
     /// (it initializes its decoder accordingly right then) — every arm
     /// below must actually emit that bitstream format, Login stage
     /// included, or a real client's decoder chokes on a mismatch it has no
     /// way to recover from mid-connection. `VideoEncoder::Vulkan` has no
-    /// HEVC encoder element to reach for (no `vulkanh265enc` exists), so
-    /// those arms panic on `VideoCodec::Hevc` same as the existing
-    /// never-implemented combinations below.
+    /// HEVC or AV1 encoder element to reach for (no `vulkanh265enc`/
+    /// `vulkanav1enc` exist), so those arms panic on `VideoCodec::Hevc`/
+    /// `VideoCodec::Av1` same as the existing never-implemented
+    /// combinations below — safe for `Av1` specifically only because the
+    /// Login stage (the one place a codec choice truly can't be avoided)
+    /// always uses `VideoEncoder::Software` instead, never `Vulkan`.
     Encode { encoder: VideoEncoder, bitrate_kbps: u32, codec: VideoCodec },
 }
 
@@ -628,6 +631,24 @@ impl StreamingEngine {
 /// lifetime; exits cleanly whenever either side goes away (`frame_rx`
 /// disconnects when the socket reader thread exits, `push_buffer` errors
 /// once the pipeline itself is torn down).
+///
+/// `set_pts` — confirmed live to be load-bearing for AV1 specifically, not
+/// decorative: every buffer pushed here used to go out with
+/// `GST_CLOCK_TIME_NONE` (no PTS at all), which `openh264enc`/`x265enc`/
+/// `nvh264enc`/`nvh265enc` all tolerate fine, but `av1enc` doesn't — it
+/// silently stops producing *any* output after encoding exactly the first
+/// frame (not slow, not degraded — a hard stall, reproduced independently
+/// outside this pipeline: a plain `videotestsrc` into the same `av1enc`
+/// properties streams continuously for as long as it's fed real PTS values,
+/// but wiring `do-timestamp`-less buffers the way `appsrc` defaults to
+/// reproduces the identical one-frame-then-nothing stall). Root cause
+/// wasn't chased into `av1enc`'s own internals (likely its realtime
+/// rate-control needing a real frame duration to schedule anything past the
+/// first frame) — the fix is just to always supply one, which every other
+/// encoder element here was already implicitly forgiving of. `start.elapsed()`
+/// gives strictly increasing, real-time-paced values without needing the
+/// pipeline's own clock/base-time (this thread has no easy access to
+/// either), which is all `av1enc` needed to unblock.
 fn spawn_login_frame_pusher(pipeline: &gst::Pipeline, frame_rx: std::sync::mpsc::Receiver<Vec<u8>>) {
     let app_src = pipeline
         .by_name("login-appsrc")
@@ -635,11 +656,13 @@ fn spawn_login_frame_pusher(pipeline: &gst::Pipeline, frame_rx: std::sync::mpsc:
         .dynamic_cast::<gst_app::AppSrc>()
         .expect("login-appsrc is always an appsrc");
     std::thread::spawn(move || {
+        let start = std::time::Instant::now();
         for frame in frame_rx {
             let mut buffer = gst::Buffer::with_size(frame.len()).expect("buffer allocation");
             {
                 let buffer_mut = buffer.get_mut().expect("freshly allocated buffer is never shared");
                 buffer_mut.copy_from_slice(0, &frame).expect("buffer sized exactly for frame");
+                buffer_mut.set_pts(gst::ClockTime::from_nseconds(start.elapsed().as_nanos() as u64));
             }
             if app_src.push_buffer(buffer).is_err() {
                 break; // pipeline gone/EOS
@@ -1200,6 +1223,30 @@ fn software_encoder_element(codec: VideoCodec, bitrate_kbps: u32) -> String {
              ! video/x-h265,stream-format=byte-stream,alignment=au \
              ! appsink name=sink sync=false"
         ),
+        // `av1enc` (libaom) is the only realtime-capable software AV1 path
+        // available (confirmed via `gst-inspect-1.0`: `rav1e` isn't
+        // packaged, `svtav1enc` is only secondary-ranked) — required, not
+        // optional, despite being markedly heavier than x265/openh264:
+        // the Login stage always uses `VideoEncoder::Software` with
+        // whatever codec the client negotiated (see `session.rs`'s
+        // `build_video_pipeline`), so if a client picks AV1, this is the
+        // only thing standing between "Login screen renders" and "Login
+        // screen crashes". `usage-profile=realtime`/`cpu-used=10` (the
+        // fastest end of libaom's 0-10 range) trade quality for speed the
+        // same way `speed-preset=ultrafast` does for x265; unlike
+        // H.264/HEVC, AV1 has no Annex-B-style byte-stream — its wire
+        // format is `obu-stream`/`alignment=tu`, confirmed via
+        // `gst-inspect-1.0 av1enc`'s src pad template. `av1parse` mirrors
+        // `h265parse` above (parameter-set/sequence-header repetition
+        // before every IDR) — included defensively by analogy; whether
+        // AV1 actually needs it wasn't independently confirmed live and
+        // should be checked against real keyframe-recovery behavior.
+        VideoCodec::Av1 => format!(
+            "av1enc name={ENCODER_ELEMENT_NAME} usage-profile=realtime cpu-used=10 \
+                     end-usage=cbr keyframe-max-dist=300 target-bitrate={bitrate_kbps} \
+             ! video/x-av1,stream-format=obu-stream,alignment=tu \
+             ! appsink name=sink sync=false"
+        ),
     }
 }
 
@@ -1210,14 +1257,30 @@ fn software_encoder_element(codec: VideoCodec, bitrate_kbps: u32) -> String {
 /// kbit/sec), so no per-codec property differences to account for beyond
 /// the element/caps names themselves.
 fn nvenc_encoder_element(codec: VideoCodec, bitrate_kbps: u32) -> String {
-    let (element, caps) = match codec {
-        VideoCodec::H264 => ("nvh264enc", "video/x-h264"),
-        VideoCodec::Hevc => ("nvh265enc", "video/x-h265"),
+    // `nvav1enc` has no `repeat-sequence-header` property at all (confirmed
+    // via `gst-inspect-1.0 nvav1enc`, and independently by
+    // `NV_ENC_CONFIG_AV1` having no `repeatSPSPPS`-equivalent field in the
+    // NVENC SDK itself — see `kwin_capture::nvenc_session`'s
+    // `encodeCodecConfig` match) — including it in the pipeline string
+    // would fail pipeline construction at runtime ("no property named..."),
+    // so it's part of the codec-specific property set here, not the shared
+    // one every codec used to get unconditionally.
+    let (element, caps, extra_props) = match codec {
+        VideoCodec::H264 => ("nvh264enc", "video/x-h264", "repeat-sequence-header=true "),
+        VideoCodec::Hevc => ("nvh265enc", "video/x-h265", "repeat-sequence-header=true "),
+        VideoCodec::Av1 => ("nvav1enc", "video/x-av1", ""),
+    };
+    // AV1 has no Annex-B-style byte-stream — `obu-stream`/`alignment=tu` is
+    // its actual wire format (confirmed via `gst-inspect-1.0 nvav1enc`'s
+    // src pad template), unlike H.264/HEVC's `byte-stream`/`alignment=au`.
+    let stream_caps = match codec {
+        VideoCodec::H264 | VideoCodec::Hevc => "stream-format=byte-stream,alignment=au",
+        VideoCodec::Av1 => "stream-format=obu-stream,alignment=tu",
     };
     format!(
         "{element} name={ENCODER_ELEMENT_NAME} zerolatency=true tune=ultra-low-latency \
-                    rc-mode=cbr repeat-sequence-header=true gop-size=300 bitrate={bitrate_kbps} \
-         ! {caps},stream-format=byte-stream,alignment=au \
+                    rc-mode=cbr {extra_props}gop-size=300 bitrate={bitrate_kbps} \
+         ! {caps},{stream_caps} \
          ! appsink name=sink sync=false"
     )
 }
@@ -1239,6 +1302,17 @@ fn vulkan_encoder_element(codec: VideoCodec, bitrate_kbps: u32) -> String {
         VideoCodec::Hevc => panic!(
             "VideoEncoder::Vulkan has no HEVC encoder element (no vulkanh265enc exists) — \
              use VideoEncoder::Software or VideoEncoder::Nvenc for HEVC"
+        ),
+        // No `vulkanav1enc` exists either (confirmed via `gst-inspect-1.0`),
+        // same treatment as `Hevc` above. Unlike `Hevc`, this is never
+        // actually reachable for the Login stage (Login always forces
+        // `VideoEncoder::Software`, never `Vulkan` — see `session.rs`'s
+        // `build_video_pipeline`), only for a User-stage session with
+        // `VideoEncoder::Vulkan` explicitly configured; `Software`'s own
+        // `Av1` arm is the one that had to actually work, not this one.
+        VideoCodec::Av1 => panic!(
+            "VideoEncoder::Vulkan has no AV1 encoder element (no vulkanav1enc exists) — \
+             use VideoEncoder::Software or VideoEncoder::Nvenc for AV1"
         ),
     }
 }
@@ -1624,6 +1698,10 @@ pub fn set_encoder_bitrate(pipeline: &gst::Pipeline, bitrate_kbps: u32) {
 pub use kwin_capture::nvenc_session::CudaDirectEncoderSession;
 /// Same re-export reasoning as `CudaDirectEncoderSession` above.
 pub use kwin_capture::nvenc_session::VideoCodec;
+/// Same re-export reasoning as `CudaDirectEncoderSession` above — lets
+/// `redfog-moonlight` gate AV1 advertisement/negotiation on real hardware
+/// support without a direct `kwin-capture` dependency.
+pub use kwin_capture::nvenc_session::av1_encode_supported;
 
 /// [`VideoEncoder::NvencDirect`] counterpart to [`make_encoder_pipeline`] —
 /// same `source`/`bitrate_kbps`/`on_access_unit` shape, but returns a
@@ -2158,6 +2236,124 @@ mod tests {
         );
         let el = gst::parse_launch(&desc).unwrap_or_else(|e| panic!("pipeline failed to parse: {e}\n{desc}"));
         assert!(el.dynamic_cast::<gst::Pipeline>().is_ok(), "pipeline description: {desc}");
+    }
+
+    /// Same reasoning/precedent as the H.264 case right above (only
+    /// `Software` parses offline without a live PipeWire node — `Nvenc`
+    /// needs a real DMABuf negotiation upstream) — this is the one that
+    /// actually matters for AV1: a real `gst::parse_launch` syntax check
+    /// for `av1enc`'s realtime property names/enum values
+    /// (`usage-profile=realtime`, `end-usage=cbr`, etc.) and the
+    /// `av1parse`/`obu-stream` caps, none of which a plain string-contains
+    /// assertion would catch a typo in.
+    #[test]
+    fn pipewire_pipeline_description_parses_for_software_av1_encoder() {
+        gst::init().expect("gst::init");
+        let desc = video_pipeline_description(
+            &VideoSource::PipeWireNode(999_999),
+            "parse-check",
+            120,
+            &VideoSink::Encode { encoder: VideoEncoder::Software, bitrate_kbps: 10_000, codec: VideoCodec::Av1 },
+        );
+        let el = gst::parse_launch(&desc).unwrap_or_else(|e| panic!("pipeline failed to parse: {e}\n{desc}"));
+        assert!(el.dynamic_cast::<gst::Pipeline>().is_ok(), "pipeline description: {desc}");
+    }
+
+    /// `nvav1enc` has no `repeat-sequence-header` property (confirmed via
+    /// `gst-inspect-1.0`) — this guards the property-string split in
+    /// `nvenc_encoder_element` that keeps it off the AV1 arm, since a
+    /// regression there would only surface as a runtime "no property
+    /// named..." pipeline-construction failure, not a compile error.
+    #[test]
+    fn nvenc_av1_element_has_no_repeat_sequence_header_property() {
+        let desc = nvenc_encoder_element(VideoCodec::Av1, 10_000);
+        assert!(desc.contains("nvav1enc"), "pipeline description: {desc}");
+        assert!(desc.contains("video/x-av1,stream-format=obu-stream,alignment=tu"), "pipeline description: {desc}");
+        assert!(!desc.contains("repeat-sequence-header"), "pipeline description: {desc}");
+        // Still present for H.264/HEVC — guards against the split
+        // accidentally dropping it for codecs that need it.
+        assert!(nvenc_encoder_element(VideoCodec::H264, 10_000).contains("repeat-sequence-header=true"));
+        assert!(nvenc_encoder_element(VideoCodec::Hevc, 10_000).contains("repeat-sequence-header=true"));
+    }
+
+    #[test]
+    #[should_panic(expected = "no AV1 encoder element")]
+    fn vulkan_av1_element_panics() {
+        vulkan_encoder_element(VideoCodec::Av1, 10_000);
+    }
+
+    /// Real, live reproduction of the actual Login-stage path — a real
+    /// `make_encoder_pipeline` call (the exact function `session.rs` uses),
+    /// fed real RGBA frames at 30fps through `login-appsrc` the same way
+    /// `redfog-login`'s own socket-reader thread does, for long enough that
+    /// a stall or real-time-performance problem (not just a parse/structure
+    /// one) would show up as missing/late access units. This is exactly
+    /// what caught a real bug live: this pipeline used to produce exactly
+    /// one AV1 access unit and then nothing, ever — `av1enc` stalling dead
+    /// without a PTS on pushed buffers (see `spawn_login_frame_pusher`'s doc
+    /// comment for the fix and why H.264/HEVC never exposed it) — which is
+    /// also the literal, user-reported symptom this test guards against:
+    /// AV1 negotiated successfully but the Login screen never came up.
+    /// `pipewire_pipeline_description_parses_for_software_av1_encoder`
+    /// above only proves the pipeline *parses*, which wasn't enough to
+    /// catch this — parsing says nothing about runtime behavior with a
+    /// live, un-timestamped `appsrc` feed.
+    #[test]
+    fn login_software_av1_pipeline_runs_and_keeps_up() {
+        gst::init().expect("gst::init");
+        const WIDTH: u32 = 1280;
+        const HEIGHT: u32 = 720;
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (au_tx, au_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
+
+        let pipeline = make_encoder_pipeline(
+            VideoSource::Login { frame_rx, width: WIDTH, height: HEIGHT },
+            "test-client",
+            VideoEncoder::Software,
+            Some(30),
+            10_000,
+            VideoCodec::Av1,
+            "",
+            move |data, is_keyframe, _capture_instant| {
+                let _ = au_tx.send((data, is_keyframe));
+            },
+        );
+        pipeline.set_state(gst::State::Playing).expect("set Playing");
+
+        // Push real RGBA frames at 30fps in the background, same as
+        // `spawn_login_frame_pusher`'s real sender (`redfog-login`'s socket
+        // reader thread) does.
+        std::thread::spawn(move || {
+            let frame = vec![0x80u8; (WIDTH * HEIGHT * 4) as usize];
+            for _ in 0..90 {
+                if frame_tx.send(frame.clone()).is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(33));
+            }
+        });
+
+        let mut access_units = 0;
+        let mut got_keyframe = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok((data, is_keyframe)) => {
+                    assert!(!data.is_empty(), "encoded access unit was empty");
+                    got_keyframe |= is_keyframe;
+                    access_units += 1;
+                }
+                Err(_) => {} // no frame in this window, keep waiting until deadline
+            }
+        }
+
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(access_units > 0, "no AV1 access units produced by the Login/Software pipeline at all");
+        assert!(got_keyframe, "never saw a keyframe among {access_units} AV1 access units");
+        // ~3s of real pushed frames at 30fps within the 5s window above —
+        // loose floor (not 90), just enough to catch "produces almost
+        // nothing" without being a flaky exact-fps assertion.
+        assert!(access_units >= 30, "only {access_units} access units in 5s — Login/Software AV1 pipeline isn't keeping up");
     }
 
     /// Real, live pipeline test — the whole reason `videorate` shipped

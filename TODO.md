@@ -123,10 +123,9 @@ against a real client).
 - [ ] Gamepad/controller input. `control.rs` decodes keyboard + mouse
       only; every other input event type (including all gamepad packets)
       hits `_ => None` and is silently dropped.
-- [ ] HDR, AV1. `<IsHdrSupported>0</IsHdrSupported>` is hardcoded. Video
-      itself now does both H.264 and HEVC (see "recently fixed" below) —
-      AV1 isn't implemented, and testing it needs Ada Lovelace+ hardware
-      (the first NVIDIA generation with AV1 encode support).
+- [ ] HDR. `<IsHdrSupported>0</IsHdrSupported>` is hardcoded. Video itself
+      now does H.264, HEVC, and AV1 (see "recently fixed" below) — none of
+      it HDR/Main10, just SDR 8-bit.
 - [ ] HiDPI passthrough. KWin's virtual output is spawned with
       `--scale 1` hardcoded; never scales.
 - [ ] Live resolution/fps *re*negotiation (i.e. changing it mid-session,

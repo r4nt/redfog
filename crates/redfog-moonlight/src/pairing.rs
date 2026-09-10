@@ -111,6 +111,14 @@ pub struct PairingServer {
     pub https_port: u16,
     pub rtsp_port: u16,
     pub launch_handler: Arc<dyn LaunchHandler>,
+    /// Whether this GPU/driver's NVENC actually supports AV1 encode
+    /// (`redfog_core::av1_encode_supported()`, computed once at server
+    /// startup) — gates the `SCM_AV1_MAIN8` bit in `server_info`'s
+    /// `ServerCodecModeSupport`. A plain field rather than calling the
+    /// (GPU-probing) global function directly from `server_info`, so this
+    /// stays unit-testable without a real GPU — same reasoning as
+    /// `RtspServer::av1_supported`.
+    pub av1_supported: bool,
 }
 
 impl PairingServer {
@@ -280,6 +288,16 @@ impl PairingServer {
         // clients treat HEVC as unsupported regardless of this bitmask.
         // `1869449984` matches Sunshine's own hardcoded value for "HEVC
         // active" (`nvhttp.cpp`) rather than a guessed number.
+        //
+        // 0x00010000 additionally advertises AV1 (`SCM_AV1_MAIN8`,
+        // confirmed against `moonlight-common-c`'s `Limelight.h` — a
+        // "Sunshine extension" bit, unlike the base `SCM_H264`/`SCM_HEVC`
+        // ones), included only when `self.av1_supported` — unlike HEVC,
+        // which every GPU this server targets is assumed to handle *some*
+        // way (NVENC, or the `x265enc`/software fallback), AV1 genuinely
+        // isn't available at all below Ada Lovelace, so this can't be a
+        // static literal the way `257` is.
+        let codec_mode_support = 257 | if self.av1_supported { 0x00010000 } else { 0 };
         // The 4th version component negative marks us "Sunshine-like" to real
         // clients (moonlight-common-rust's `ServerVersion::new`: `server_type
         // = Sunshine` iff this component is negative) — confirmed against
@@ -296,7 +314,7 @@ impl PairingServer {
     <GfeVersion>3.23.0.74</GfeVersion>
     <uniqueid>{server_id}</uniqueid>
     <MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>
-    <ServerCodecModeSupport>257</ServerCodecModeSupport>
+    <ServerCodecModeSupport>{codec_mode_support}</ServerCodecModeSupport>
     <HttpsPort>{https_port}</HttpsPort>
     <ExternalPort>{http_port}</ExternalPort>
     <mac>00:00:00:00:00:00</mac>

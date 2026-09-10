@@ -11,34 +11,20 @@
 //! production can't drift apart the way they briefly did when this file
 //! used to duplicate the whole capture/import/encode loop by hand.
 
-use kwin_capture::nvenc_session::{CudaDirectEncoderSession, VideoCodec};
+use kwin_capture::nvenc_session::{av1_encode_supported, CudaDirectEncoderSession, VideoCodec};
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 const FPS: u32 = 60;
 const BITRATE_KBPS: u32 = 5_000;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cuda_direct_nvenc_encode_glxgears_test() {
-    // See capture_integration.rs's identical call for why this is here.
-    redfog_test_cleanup::ensure_active();
-    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
-
-    // `CudaDirectEncoderSession::spawn` isolates setup failures to its own
-    // background thread rather than surfacing a `Result` here (see its own
-    // doc comment), so a missing GPU wouldn't fail fast — it'd instead show
-    // up as a confusing "no encoded access unit received within 2s" panic
-    // below, after already paying for a real KWin/glxgears spawn. Check for
-    // a CUDA-capable GPU directly first, matching
-    // `nvenc_two_sessions_same_process.rs`'s equivalent guard — this crate's
-    // tests otherwise can't run at all on hardware/CI without an NVIDIA GPU
-    // (e.g. GH Actions' hosted runners).
-    if cudarc016::driver::CudaContext::new(0).is_err() {
-        eprintln!("no CUDA-capable GPU available — skipping cuda_direct_nvenc_encode_glxgears_test");
-        return;
-    }
-
-    let runtime_dir = std::env::temp_dir().join(format!("redfog-it-cuda-nvenc-{}", uuid::Uuid::new_v4()));
+/// Shared by both tests below — spawns KWin+glxgears, runs
+/// `CudaDirectEncoderSession` against it for 15s, and asserts real access
+/// units (including at least one keyframe) arrived at a sustained >=45fps.
+/// Codec-parameterized so the AV1 test below can't drift from the H.264 one
+/// this was extracted from.
+async fn run_cuda_direct_nvenc_test(codec: VideoCodec) {
+    let runtime_dir = std::env::temp_dir().join(format!("redfog-it-cuda-nvenc-{}-{}", format!("{codec:?}").to_lowercase(), uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&runtime_dir).unwrap();
     std::env::set_var("REDFOG_RUNTIME_DIR", &runtime_dir);
     std::env::set_var("REDFOG_ALWAYS_SOFTWARE", "0");
@@ -86,8 +72,8 @@ async fn cuda_direct_nvenc_encode_glxgears_test() {
     let _compositor_guard = KillCompositorOnDrop(compositor);
 
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
-    eprintln!("Starting CudaDirectEncoderSession (DMA-BUF -> CUDA -> NVENC, no GStreamer)...");
-    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), WIDTH, HEIGHT, FPS, BITRATE_KBPS, VideoCodec::H264, move |data, is_keyframe, _capture_instant| {
+    eprintln!("Starting CudaDirectEncoderSession (DMA-BUF -> CUDA -> NVENC, no GStreamer, codec={codec:?})...");
+    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), WIDTH, HEIGHT, FPS, BITRATE_KBPS, codec, move |data, is_keyframe, _capture_instant| {
         let _ = tx.send((data, is_keyframe));
     });
 
@@ -109,7 +95,7 @@ async fn cuda_direct_nvenc_encode_glxgears_test() {
         }
         if window_start.elapsed() >= std::time::Duration::from_secs(5) {
             let fps = window_frames as f64 / window_start.elapsed().as_secs_f64();
-            eprintln!("CUDA-DIRECT NVENC FPS: {fps:.2} ({window_frames} frames, {frame_count} access units so far)");
+            eprintln!("CUDA-DIRECT NVENC FPS ({codec:?}): {fps:.2} ({window_frames} frames, {frame_count} access units so far)");
             window_start = std::time::Instant::now();
             window_frames = 0;
         }
@@ -117,9 +103,52 @@ async fn cuda_direct_nvenc_encode_glxgears_test() {
 
     drop(session);
 
-    eprintln!("Total: {frame_count} access units encoded (keyframe seen: {got_keyframe}).");
+    eprintln!("Total ({codec:?}): {frame_count} access units encoded (keyframe seen: {got_keyframe}).");
     assert!(frame_count > 0, "no encoded access units produced");
     assert!(got_keyframe, "never received a keyframe among {frame_count} access units");
     let overall_fps = frame_count as f64 / test_start.elapsed().as_secs_f64();
     assert!(overall_fps >= 45.0, "expected at least 45 FPS, got {overall_fps:.2}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cuda_direct_nvenc_encode_glxgears_test() {
+    // See capture_integration.rs's identical call for why this is here.
+    redfog_test_cleanup::ensure_active();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
+
+    // `CudaDirectEncoderSession::spawn` isolates setup failures to its own
+    // background thread rather than surfacing a `Result` here (see its own
+    // doc comment), so a missing GPU wouldn't fail fast — it'd instead show
+    // up as a confusing "no encoded access unit received within 2s" panic
+    // below, after already paying for a real KWin/glxgears spawn. Check for
+    // a CUDA-capable GPU directly first, matching
+    // `nvenc_two_sessions_same_process.rs`'s equivalent guard — this crate's
+    // tests otherwise can't run at all on hardware/CI without an NVIDIA GPU
+    // (e.g. GH Actions' hosted runners).
+    if cudarc016::driver::CudaContext::new(0).is_err() {
+        eprintln!("no CUDA-capable GPU available — skipping cuda_direct_nvenc_encode_glxgears_test");
+        return;
+    }
+
+    run_cuda_direct_nvenc_test(VideoCodec::H264).await;
+}
+
+/// AV1 counterpart — needs Ada Lovelace+ NVENC specifically, not just any
+/// CUDA-capable GPU, hence the separate `av1_encode_supported()` gate
+/// (rather than the plain `CudaContext::new(0)` check above). This is the
+/// live sustained-framerate check for the AV1 path — the FPS floor inside
+/// `run_cuda_direct_nvenc_test` is exactly what would catch NVENC AV1
+/// falling behind in a way the unit-tested pipeline-string checks in
+/// `redfog-core` never could.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cuda_direct_nvenc_encode_glxgears_av1_test() {
+    redfog_test_cleanup::ensure_active();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
+
+    if !av1_encode_supported() {
+        eprintln!("NVENC on this GPU doesn't support AV1 (needs Ada Lovelace+) — skipping cuda_direct_nvenc_encode_glxgears_av1_test");
+        return;
+    }
+
+    run_cuda_direct_nvenc_test(VideoCodec::Av1).await;
 }
