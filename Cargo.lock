@@ -4341,6 +4341,7 @@ dependencies = [
  "aes-gcm",
  "bytes",
  "cbc",
+ "embedded-graphics",
  "fec-rs",
  "form_urlencoded",
  "gethostname 0.5.0",
@@ -4372,6 +4373,7 @@ dependencies = [
  "session-backend",
  "sha2",
  "socket2 0.6.4",
+ "tiny-skia",
  "tokio",
  "tokio-enet",
  "tokio-rustls",
@@ -4393,6 +4395,7 @@ dependencies = [
 name = "redfog-server"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "gethostname 0.5.0",
  "gstreamer 0.21.3",
  "rand",

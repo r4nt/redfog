@@ -115,6 +115,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind_addr: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
+    // Generated once here (not per-request) since it never changes for the
+    // life of the process — see `boxart::generate`'s doc comment.
+    let box_art_png = bytes::Bytes::from(redfog_moonlight::boxart::generate(&hostname));
 
     let state_dir = redfog_moonlight::tls::default_state_dir();
     let identity = ServerIdentity::load_or_create(&state_dir).map_err(|e| format!("failed to load server identity: {e}"))?;
@@ -210,6 +213,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         rtsp_port,
         launch_handler: session_manager.clone(),
         av1_supported,
+        box_art_png,
     });
 
     let rtsp_server = Arc::new(RtspServer {

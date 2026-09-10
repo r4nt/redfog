@@ -1,3 +1,4 @@
+pub mod boxart;
 pub mod clients;
 pub mod crypto;
 pub mod tls;

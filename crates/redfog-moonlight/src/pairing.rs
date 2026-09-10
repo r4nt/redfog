@@ -21,8 +21,9 @@ use tokio::net::TcpListener;
 use crate::clients::ClientManager;
 use crate::tls::ServerIdentity;
 
-/// Fixed single-entry app list for this iteration — no app scanning.
-pub const APP_NAME: &str = "Desktop";
+/// Fixed single-entry app list for this iteration — no app scanning. The
+/// entry's title is this server's own hostname (`PairingServer::hostname`),
+/// not a fixed string — see `app_list_body`.
 pub const APP_ID: u32 = 1;
 
 /// (width, height, refresh_rate). A few common resolutions the client can
@@ -119,6 +120,11 @@ pub struct PairingServer {
     /// stays unit-testable without a real GPU — same reasoning as
     /// `RtspServer::av1_supported`.
     pub av1_supported: bool,
+    /// The PNG served from `/appasset` — see `boxart::generate`'s doc
+    /// comment. Generated once at server startup (from this same
+    /// `hostname`) and stored as plain bytes rather than regenerated per
+    /// request, since it never changes for the life of the process.
+    pub box_art_png: Bytes,
 }
 
 impl PairingServer {
@@ -253,7 +259,7 @@ impl PairingServer {
         match path.as_str() {
             "/serverinfo" => self.server_info(&params, https, client_cert_fingerprint.as_deref(), local_addr.ip()),
             "/applist" => self.app_list(),
-            "/appasset" => app_asset(),
+            "/appasset" => self.app_asset(),
             "/pair" => self.pair(&params).await,
             "/unpair" => self.unpair(&params),
             "/launch" => self.launch(&params, local_addr.ip(), client_key, peer.ip()).await,
@@ -340,7 +346,36 @@ impl PairingServer {
     }
 
     fn app_list(&self) -> Response<Full<Bytes>> {
-        xml_response(app_list_body())
+        xml_response(app_list_body(&self.hostname))
+    }
+
+    /// Real clients fetch this themselves for box art (constructing the URL
+    /// from `/applist`'s `<ID>`) whether or not we ever advertise support
+    /// for it — this isn't optional/best-effort the way it might look.
+    /// Confirmed live: with no handler here at all, this fell through to
+    /// `not_found()` (an empty body, no `Content-Type`) — harmless for a
+    /// browser-based client (just a broken-image placeholder), but a
+    /// plausible crash for a native client's image decoder fed zero bytes
+    /// instead of a real image. `box_art_png` (see `boxart::generate`) is
+    /// enough to fix that: this server only ever lists one fixed `App`
+    /// (see `APP_ID`), so there's nothing to actually look up any of
+    /// `appid`/`AssetType`/`AssetIdx` against.
+    ///
+    /// `Cache-Control: no-store` — confirmed live to matter: a browser-based
+    /// client (moonlight-web) kept showing a stale box art image across
+    /// server restarts with a genuinely updated `box_art_png`, because this
+    /// response previously carried no cache directive at all and the
+    /// browser cached it anyway. The image is cheap to regenerate/re-fetch
+    /// (a few KB, generated once at startup — see `boxart::generate`), so
+    /// there's no real cost to always serving it fresh, and doing so is
+    /// what keeps every client (not just this one observed case) honest
+    /// about ever actually picking up a hostname/design change.
+    fn app_asset(&self) -> Response<Full<Bytes>> {
+        Response::builder()
+            .header("Content-Type", "image/png")
+            .header("Cache-Control", "no-store")
+            .body(Full::new(self.box_art_png.clone()))
+            .unwrap()
     }
 
     async fn pair(&self, params: &HashMap<String, String>) -> Response<Full<Bytes>> {
@@ -624,30 +659,10 @@ fn xml_response(body: impl Into<String>) -> Response<Full<Bytes>> {
 /// only push an entry once <App> is seen. A stray text node from indentation
 /// whitespace between <root> and <App> fires before any app exists, throwing
 /// NoSuchElementException and crashing the client's app-list polling thread.
-fn app_list_body() -> String {
+fn app_list_body(app_name: &str) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><App><AppTitle>{APP_NAME}</AppTitle><ID>{APP_ID}</ID><IsHdrSupported>0</IsHdrSupported></App></root>"#
+        r#"<?xml version="1.0" encoding="utf-8"?><root status_code="200"><App><AppTitle>{app_name}</AppTitle><ID>{APP_ID}</ID><IsHdrSupported>0</IsHdrSupported></App></root>"#
     )
-}
-
-/// Real clients fetch this themselves for box art (constructing the URL
-/// from `/applist`'s `<ID>`) whether or not we ever advertise support for
-/// it — this isn't optional/best-effort the way it might look. Confirmed
-/// live: with no handler here at all, this fell through to `not_found()`
-/// (an empty body, no `Content-Type`) — harmless for a browser-based
-/// client (just a broken-image placeholder), but a plausible crash for a
-/// native client's image decoder fed zero bytes instead of a real image.
-/// A single static 1x1 transparent PNG regardless of `appid`/`AssetType`/
-/// `AssetIdx` is enough to fix that: this server only ever lists one
-/// fixed `App` (see `APP_NAME`/`APP_ID`), so there's nothing to actually
-/// look up any of those params against.
-static PLACEHOLDER_BOXART_PNG: &[u8] = include_bytes!("../assets/placeholder-boxart.png");
-
-fn app_asset() -> Response<Full<Bytes>> {
-    Response::builder()
-        .header("Content-Type", "image/png")
-        .body(Full::new(Bytes::from_static(PLACEHOLDER_BOXART_PNG)))
-        .unwrap()
 }
 
 fn bad_request(message: String) -> Response<Full<Bytes>> {
@@ -718,7 +733,7 @@ mod tests {
     /// thread dies. Confirmed live via `adb logcat` against a real device.
     #[test]
     fn app_list_body_has_no_whitespace_between_structural_tags() {
-        let body = app_list_body();
+        let body = app_list_body("test-hostname");
         assert!(
             body.contains(r#"<root status_code="200"><App>"#),
             "found whitespace/text between <root> and <App>, which crashes real clients: {body}"

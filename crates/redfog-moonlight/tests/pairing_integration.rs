@@ -47,6 +47,8 @@ async fn real_client_pairs_and_lists_apps() {
         https_port,
         rtsp_port: pick_free_port(),
         launch_handler: Arc::new(NoopLaunchHandler),
+        av1_supported: false,
+        box_art_png: redfog_moonlight::boxart::generate("test-server").into(),
     });
 
     let bind_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -93,5 +95,16 @@ async fn real_client_pairs_and_lists_apps() {
     assert!(host.is_paired().await.expect("is_paired"), "server must report the client as paired");
 
     let apps = host.app_list().await.expect("app_list");
-    assert!(apps.iter().any(|a| a.title == "Desktop"), "applist must contain the Desktop entry, got: {apps:?}");
+    assert!(apps.iter().any(|a| a.title == "test-server"), "applist must contain an entry titled after this server's hostname, got: {apps:?}");
+
+    // Regression test for a real live bug: moonlight-web kept showing a
+    // stale box art image across server restarts because this response
+    // carried no cache directive at all and the browser cached it anyway
+    // — see `PairingServer::app_asset`'s doc comment.
+    let asset_response = ureq::get(&format!("http://127.0.0.1:{http_port}/appasset")).call().expect("appasset request");
+    assert_eq!(
+        asset_response.header("Cache-Control"),
+        Some("no-store"),
+        "/appasset must tell clients never to cache this image, or a stale one can survive a server restart"
+    );
 }

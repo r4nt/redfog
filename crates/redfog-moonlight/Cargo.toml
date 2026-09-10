@@ -57,6 +57,12 @@ uuid = { version = "1", features = ["v4"] }
 mdns-sd = "0.13"
 gethostname = "0.5"
 
+# boxart.rs: same pure-Rust, no-GPU/no-font-file rendering approach
+# redfog-login::ui already uses (tiny-skia for shapes, embedded-graphics's
+# built-in bitmap fonts for text) -- see that module's own doc comment.
+tiny-skia = "0.11"
+embedded-graphics = "0.8"
+
 # Real production use (unlike the dev-dependencies libc/nix below, which
 # stay separate -- these are for udp_sender.rs's sendmmsg batching
 # specifically, see that file's own doc comment): libc for the raw
