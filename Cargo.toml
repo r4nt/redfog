@@ -9,6 +9,7 @@ members = [
     "crates/redfog-server",
     "crates/redfog-broker",
     "crates/redfog-broker-protocol",
+    "crates/redfog-watchdog",
     "crates/redfog-login-protocol",
     "crates/redfog-session-init",
     "crates/redfog-pair",

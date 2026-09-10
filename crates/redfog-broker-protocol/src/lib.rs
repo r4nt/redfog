@@ -20,7 +20,16 @@ pub enum BrokerRequest {
     /// is KWin's `--socket` value — the caller's choice, not the broker's,
     /// since it also becomes the session's `WAYLAND_DISPLAY` (which the
     /// caller's own `CompositorSession`-equivalent bookkeeping keys off of).
-    SpawnSession { session_id: String, username: String, width: u32, height: u32, socket_name: String, payload: Vec<String> },
+    /// `password`: a real PAM session (opened inside `redfog-session-init`,
+    /// see its own doc comment) needs it to authenticate — a fresh,
+    /// independent PAM transaction from whatever `Authenticate` call the
+    /// caller already made, since `pam_kwallet5.so`'s session hook can only
+    /// unlock with a password its own `auth` hook captured moments earlier
+    /// on that *same* transaction. Sent over this same channel `Authenticate`
+    /// already carries a password over; never forwarded to
+    /// `redfog-session-init` as an argv (see its own doc comment for why —
+    /// argv is readable by any local user via `/proc/<pid>/cmdline`).
+    SpawnSession { session_id: String, username: String, password: String, width: u32, height: u32, socket_name: String, payload: Vec<String> },
     /// For backends where the *caller* (not the broker) already created and
     /// owns the compositor/Wayland socket — e.g. redfog-moonlight embedding
     /// a `gst-wayland-display` pipeline directly in its own process, unlike

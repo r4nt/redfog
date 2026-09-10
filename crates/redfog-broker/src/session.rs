@@ -1,12 +1,20 @@
-//! Spawns a target user's compositor session via templated systemd
-//! `.socket`/`.service` units — see design.md's "Cross-user socket
-//! reachability" section for why: KWin must run as the target user, but the
-//! Wayland socket's permissions need to be controlled independently of
-//! that, so systemd binds it (via `SocketUser=`) and hands KWin the already-
-//! listening fd (`--wayland-fd`), rather than KWin calling `bind()` itself.
+//! Spawns a target user's compositor session as a real PAM/logind-managed
+//! session (`spawn_via_pam`) — see design.md's "Cross-user socket
+//! reachability" section for why the Wayland socket itself is still
+//! pre-bound via a small, per-session transient `.socket` unit: KWin must
+//! run as the target user, but the socket's permissions need to be
+//! controlled independently of that, so systemd binds it (via
+//! `SocketUser=`) and hands KWin the already-listening fd (`--wayland-fd`),
+//! rather than KWin calling `bind()` itself. Everything else about the
+//! session (privilege drop, mount-namespace sandboxing, environment,
+//! process lifetime tracking) goes through a real PAM session and a
+//! transient `systemd-run`-started service instead of a hand-templated
+//! persistent unit file — see `spawn_via_pam`'s own doc comment for the
+//! full picture and what's been confirmed live along the way.
 //!
-//! Writing unit files into `/run/systemd/system/` and reloading/starting
-//! them needs the `org.freedesktop.systemd1.manage-unit-files` and
+//! Writing the `.socket` unit file into `/run/systemd/system/` and
+//! reloading/starting it needs the
+//! `org.freedesktop.systemd1.manage-unit-files` and
 //! `org.freedesktop.systemd1.manage-units` polkit actions respectively —
 //! see design.md for how those get scoped to the broker's own service user
 //! without granting root.
@@ -21,6 +29,56 @@ use std::time::Duration;
 use tokio::process::Child;
 
 const UNIT_DIR: &str = "/run/systemd/system";
+
+/// Dedicated PAM service name `spawn_via_pam` opens its real session
+/// against, from inside `redfog-session-init` (see that crate's own doc
+/// comment). Real auth *and* session-open on the same PAM handle —
+/// required for `pam_kwallet5.so` to work at all, since its session hook
+/// can only unlock with a password its own auth hook captured moments
+/// earlier on that same transaction.
+///
+/// **Not** `session include system-login`: that already has a bare
+/// `-session optional pam_systemd.so` line, and including it *as well as*
+/// this file's own customized `pam_systemd.so desktop=redfog type=wayland`
+/// line would run the module twice on one transaction — untested,
+/// unnecessary risk, so the session phase is written out explicitly
+/// instead (borrowing `pam_loginuid.so`/`pam_keyinit.so force revoke` from
+/// `system-login`, since `pam_systemd`'s own man page recommends
+/// `pam_loginuid` run first for correct session-id accounting).
+///
+/// `desktop=redfog`/`type=wayland` are `pam_systemd.so` module arguments,
+/// not a `pam_putenv` call — directly setting `Desktop=redfog`/
+/// `Type=wayland` as real logind session properties. **Confirmed live**
+/// (`scripts/verify-pam-systemd-desktop-property.sh`): `loginctl
+/// show-session -p Desktop` reports exactly the configured value for a
+/// session opened this way. `Desktop=redfog` (alongside `Service=
+/// redfog-session`, which falls out for free from using this dedicated
+/// service) is the marker `redfog-watchdog`'s sweep filters on, to
+/// distinguish redfog's own sessions from an operator's real desktop/SSH
+/// login.
+const PAM_SESSION_SERVICE: &str = "redfog-session";
+
+/// Writes (unconditionally — this file is entirely redfog-owned, not
+/// user-customizable, so always overwriting keeps it self-healing rather
+/// than silently drifting from whatever this binary actually expects)
+/// `/etc/pam.d/redfog-session`. Called once at broker startup.
+pub fn ensure_pam_session_service() -> Result<(), String> {
+    let path = format!("/etc/pam.d/{PAM_SESSION_SERVICE}");
+    tracing::info!("writing {path}");
+    std::fs::write(
+        &path,
+        "auth       include     system-auth\n\
+         auth       optional    pam_kwallet5.so\n\
+         account    include     system-auth\n\
+         password   include     system-auth\n\
+         session    optional    pam_loginuid.so\n\
+         session    optional    pam_keyinit.so    force revoke\n\
+         session    optional    pam_limits.so\n\
+         session    optional    pam_systemd.so    desktop=redfog type=wayland\n\
+         session    optional    pam_kwallet5.so   auto_start\n",
+    )
+    .map_err(|e| format!("failed to write {path}: {e}"))
+}
 
 /// Registers `PR_SET_PDEATHSIG(SIGKILL)` on the about-to-exec child so the
 /// kernel kills it the moment this broker process dies for any reason (not
@@ -159,9 +217,22 @@ mod die_with_parent_tests {
 }
 
 enum ActiveSession {
-    /// Persistent, templated `.socket`/`.service` unit files — see
-    /// `spawn_via_systemd`.
-    Systemd { unit_name: String },
+    /// A real PAM/logind-managed session — see `spawn_via_pam`. No `Child`
+    /// handle: the actual `kwin_wayland`-chain process is forked/exec'd by
+    /// PID1 itself (`systemd-run`, invoked without `--scope`, only *asks*
+    /// PID1 to start a transient service over D-Bus and exits again almost
+    /// immediately once that start job completes — it never execs into
+    /// the target process the way `systemd-run --scope` does), so there's
+    /// nothing meaningful for this process to hold a `Child` for.
+    /// `logind_session_id` (reported back by `redfog-session-init` once
+    /// `pam_open_session` succeeds — see that crate's own doc comment) is
+    /// both how `terminate()` kills the whole tree (`loginctl kill-session
+    /// <id> --kill-whom=all`) and how `is_session_alive` checks liveness
+    /// (`loginctl list-sessions`), the same way `Scoped`'s own
+    /// `logind_session_id_for` fallback already does for the case where a
+    /// session ends up migrated into a real logind session it wasn't
+    /// originally registered under.
+    Pam { logind_session_id: String },
     /// `REDFOG_BROKER_FAKE_SPAWN` mode — see `spawn()`. Deliberately a bare
     /// tracked child, no scope: this path never nests a wrapper process
     /// (unlike `Scoped`'s spawn sites), so there's nothing a plain
@@ -223,6 +294,7 @@ impl SessionManager {
         &self,
         session_id: &str,
         username: &str,
+        password: &str,
         width: u32,
         height: u32,
         socket_name: &str,
@@ -245,7 +317,7 @@ impl SessionManager {
             }
             Err(_) => username.to_string(),
         };
-        self.spawn_via_systemd(session_id, &username, width, height, socket_name, payload).await
+        self.spawn_via_pam(session_id, &username, password, width, height, socket_name, payload).await
     }
 
     /// Bypasses systemd entirely: spawns `kwin_wayland` directly as the
@@ -269,7 +341,7 @@ impl SessionManager {
         // This session's own dedicated PipeWire instance — see
         // `SpawnedSession`'s doc comment for why it's no longer the one
         // process-wide shared one. Routed through `redfog-pipewire-session`
-        // below (same helper `spawn_via_systemd` uses) rather than
+        // below (same helper `spawn_via_pam` uses) rather than
         // hand-spawning `pipewire`/`wireplumber`/`pipewire-pulse` here
         // directly, so this test-only path exercises the exact same
         // bring-up code as production instead of a second, divergent copy
@@ -338,10 +410,72 @@ impl SessionManager {
         Ok(SpawnResult { wayland_socket_path, pipewire_socket_path })
     }
 
-    async fn spawn_via_systemd(
+    /// Replaces the old `spawn_via_systemd`: spawns the target user's
+    /// compositor as a real PAM/logind-managed session instead of a
+    /// hand-rolled cgroup tracked via persistent unit files. See this
+    /// module's own doc comment and the session-lifecycle design notes for
+    /// the full picture; in short:
+    ///
+    /// - The Wayland socket is still pre-bound via a small, per-session
+    ///   `.socket` unit (`ListenStream=`/`SocketUser=`/`SocketMode=0660`,
+    ///   unchanged in shape from before), name-matched with a `.service`
+    ///   unit — **both still written as real files** to `UNIT_DIR`, same
+    ///   as the original `spawn_via_systemd`. This is a walk-back from an
+    ///   earlier draft of this function that tried to avoid writing the
+    ///   `.service` file at all (`systemd-run` + linking to the `.socket`
+    ///   via its `Sockets=` property instead of unit-file name-matching):
+    ///   **confirmed live**, twice
+    ///   (`scripts/verify-transient-socket-unit-property.sh`), that this
+    ///   doesn't work at all on this systemd version (261) — starting a
+    ///   `.socket` unit refuses outright unless its name-matched `.service`
+    ///   is already a *loaded* unit ("Socket service X.service not loaded,
+    ///   refusing"), and `Sockets=` isn't even a settable property via
+    ///   `systemd-run --property=` in the first place ("Unknown
+    ///   assignment"). A transient unit only becomes "loaded" at the moment
+    ///   `systemd-run` actually starts it — by which point the `.socket`
+    ///   unit needs to already be bound — so there's no ordering that makes
+    ///   this work without a real `.service` file on disk ahead of time.
+    /// - What *did* shrink, and stays shrunk: the `.service` unit's own
+    ///   `Environment=` block. `HOME`/`SHELL`/`USER`/`LOGNAME`/`PWD` and
+    ///   `WorkingDirectory=` are no longer hand-set here — `redfog-session-
+    ///   init`'s own real PAM session (`Client::open_session()`) sets the
+    ///   former directly via an independent NSS lookup (confirmed by
+    ///   reading the `pam` crate's own `initialize_environment` source, not
+    ///   assumed) and it `chdir()`s for the latter itself. `XDG_RUNTIME_DIR`
+    ///   is **not** similarly droppable, despite normally being one of
+    ///   `pam_systemd.so`'s own jobs: this crate's `Client` API never reads
+    ///   PAM's own internal env list back (`pam_getenvlist`) into the
+    ///   process's real environment, and even if it did, `pam_systemd`'s
+    ///   own value would be the user's *real* `/run/user/<uid>` — not this
+    ///   session's own private, per-spawn sandbox `runtime_dir`, which is
+    ///   the one actually wanted here — so it stays explicit below, same as
+    ///   before.
+    /// - No inherited pipe fd for the password or the reported-back logind
+    ///   session id, despite the original plan draft assuming one:
+    ///   **confirmed live** that `systemd-run` (and, by the same
+    ///   mechanism, a plain `systemctl start` of a unit file — neither
+    ///   forks the target process directly) has no generic way to hand an
+    ///   arbitrary caller-owned fd into a service's exec step at all
+    ///   (`systemd-run --help` offers only `--pipe` for stdio, fds 0-2,
+    ///   nothing like `--fd=`; a unit file has no equivalent directive
+    ///   either). Both instead go through short-lived, root-owned
+    ///   (`0600`) files inside this session's own `runtime_dir` — see
+    ///   `redfog-session-init`'s own doc comment for the exact handshake
+    ///   and why that's an equivalent (not weaker) exposure window to a
+    ///   pipe would have been.
+    /// - The mount-namespace sandboxing (`TemporaryFileSystem=`/
+    ///   `BindPaths=`, see `device_sandbox_systemd_directives`) goes back
+    ///   to being plain lines inside the `.service` unit file, exactly as
+    ///   before `ef61854` first introduced them there — **confirmed live**
+    ///   (`scripts/verify-sandbox-survives-pam.sh`) that this sandboxing
+    ///   survives `pam_open_session`'s later cgroup migration regardless of
+    ///   which mechanism (unit file vs. `systemd-run --property=`) applied
+    ///   it in the first place.
+    async fn spawn_via_pam(
         &self,
         session_id: &str,
         username: &str,
+        password: &str,
         width: u32,
         height: u32,
         socket_name: &str,
@@ -379,9 +513,7 @@ impl SessionManager {
 
         let broker_user = current_username().map_err(|e| format!("failed to determine broker's own username: {e}"))?;
 
-        let socket_unit = format!(
-            "[Socket]\nListenStream={wayland_socket_path}\nSocketUser={broker_user}\nSocketMode=0660\n"
-        );
+        let socket_unit = format!("[Socket]\nListenStream={wayland_socket_path}\nSocketUser={broker_user}\nSocketMode=0660\n");
         let kwin_path = which_kwin_wayland().unwrap_or_else(|| "kwin_wayland".to_string());
         // This session's own dedicated PipeWire instance — see
         // `SpawnedSession`'s doc comment for why it's no longer
@@ -426,7 +558,7 @@ impl SessionManager {
         // ("Permission denied" — the failed lookup was on the *parent*, not
         // the target). `default_runtime_dir()` itself is never chmod'd by
         // anything, so — unlike the two grants added further down after
-        // `.service` starts — this one's safe to grant this early.
+        // the socket unit starts — this one's safe to grant this early.
         //
         // `redfog-server`'s own identity needs the exact same thing, for
         // the exact same reason (reaching this session's Wayland socket,
@@ -438,26 +570,42 @@ impl SessionManager {
         }
         // dbus-run-session gives KWin (and whatever it spawns via
         // --exit-with-session, e.g. plasmashell) its own private, ephemeral
-        // D-Bus session bus — without this, a systemd service running as
-        // `username` falls back to that user's *real* D-Bus session bus
+        // D-Bus session bus — without this, the session (running as
+        // `username`) falls back to that user's *real* D-Bus session bus
         // (the well-known /run/user/<uid>/bus), which already has a real
         // plasmashell registered on org.kde.plasmashell if the user has an
         // actual desktop session running. Confirmed live: klimek's real
         // desktop already owns that name. The direct-spawn path
         // (`CompositorSession::spawn`) doesn't need this itself since
         // `redfog-server`'s own `ensure_private_dbus_session()` already
-        // wraps its *entire* process tree — but this systemd unit is a
-        // separate process tree that never goes through that.
+        // wraps its *entire* process tree — but this session is a separate
+        // process tree that never goes through that.
         let session_init_path = session_init_path()?;
         let pipewire_session_path = pipewire_session_path()?;
+
+        // Secure secret passing — see `spawn_via_pam`'s own doc comment and
+        // `redfog-session-init`'s for why a short-lived, root-owned 0600
+        // file (not an inherited pipe fd) is used for both directions.
+        // Written *inside* `runtime_dir` (not `/tmp` directly) so both ends
+        // agree on the path via nothing but the already-known
+        // `runtime_dir`, and so cleanup happens automatically whenever the
+        // session's own runtime dir is eventually cleaned up even if
+        // something crashes before either side removes its own file.
+        let password_file_path = format!("{runtime_dir}/pam-password");
+        std::fs::write(&password_file_path, password).map_err(|e| format!("failed to write {password_file_path}: {e}"))?;
+        std::fs::set_permissions(&password_file_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("failed to chmod {password_file_path}: {e}"))?;
+        let session_id_report_path = format!("{runtime_dir}/pam-session-id");
+        let _ = std::fs::remove_file(&session_id_report_path); // stale leftover, defensive only -- runtime_dir is freshly created above
+
         // `redfog-session-init <username> -- <command>...` (see its own doc
-        // comment): does the *correct* uid/gid/supplementary-group drop
-        // (initgroups from /etc/group, then setgid, then setuid) before
-        // exec'ing into the real payload. Deliberately does *not* open a
-        // real PAM session (redfog-session-init no longer has that code at
-        // all — see its own doc comment for why: it moves the whole process
-        // tree into its own separate `pam_systemd`-created scope, breaking
-        // this unit's cgroup-based termination).
+        // comment): opens the real PAM session (auth + `pam_open_session`,
+        // registering a genuine logind session and unlocking KWallet via
+        // `pam_kwallet5.so` — see `ensure_pam_session_service`), reports
+        // the resulting logind session id back (polled for below), then
+        // does the *correct* uid/gid/supplementary-group drop (initgroups
+        // from /etc/group, then setgid, then setuid) before exec'ing into
+        // the real payload.
         //
         // `redfog-pipewire-session` (see its own doc comment) is inserted
         // right after that privilege drop, before `dbus-run-session`/KWin:
@@ -477,35 +625,16 @@ impl SessionManager {
             let session_script_path = write_session_script(&runtime_dir, socket_name, &pipewire_socket_path, &pulse_socket_path, payload)?;
             exec_start.push_str(&format!(" --exit-with-session {session_script_path}"));
         }
-        let (_uid, _gid, home_dir, shell) = resolve_user(username).await?;
-        // No `User=` here (unlike before) — see exec_start's own comment:
-        // this unit now runs as root throughout, with redfog-session-init
-        // (inside the ExecStart chain) doing the actual privilege drop. No
-        // PAM session opened at all, so the entire process tree stays
-        // inside this unit's own cgroup, and a plain `systemctl stop`
-        // reliably kills all of it, the same as before this unit ever
-        // involved redfog-session-init at all.
-        //
-        // Explicit HOME/USER/LOGNAME/SHELL below, unlike before: systemd's
-        // own `User=` directive used to set these automatically (an NSS
-        // lookup for the target user), for free, before the process ever
-        // started. `setuid()`/`setgid()` (what redfog-session-init does
-        // instead) only ever change process credentials, never environment
-        // variables — without these, every KDE/Qt app in the session
-        // inherited whatever HOME/SHELL this unit started with as root
-        // (unset, in practice), confirmed live twice: every app tried to
-        // read/write config under a literal `/.config/...` instead of the
-        // real home directory, and konsole couldn't find `""` as a shell
-        // and silently fell back to a default instead of the target user's
-        // real one.
+
+        // No `User=`/`WorkingDirectory=`/`Environment=HOME=` etc: this unit
+        // runs as root throughout, same as before redfog-session-init ever
+        // existed — it does the actual privilege drop (and, now, opens the
+        // real PAM session) inside the ExecStart chain instead. See this
+        // function's own doc comment for exactly which Environment= lines
+        // are no longer needed here vs. which still are.
         let mut service_unit = format!(
             "[Service]\n\
              Type=simple\n\
-             WorkingDirectory={home_dir}\n\
-             Environment=HOME={home_dir}\n\
-             Environment=SHELL={shell}\n\
-             Environment=USER={username}\n\
-             Environment=LOGNAME={username}\n\
              Environment=XDG_RUNTIME_DIR={runtime_dir}\n\
              Environment=PIPEWIRE_REMOTE={pipewire_socket_path}\n\
              Environment=PULSE_SERVER=unix:{pulse_socket_path}\n\
@@ -519,7 +648,9 @@ impl SessionManager {
              Environment=KDE_SESSION_VERSION=6\n\
              Environment=XDG_DATA_DIRS=/usr/local/share:/usr/share\n\
              Environment=XDG_CONFIG_DIRS=/etc/xdg\n\
-             Environment=XDG_MENU_PREFIX=plasma-\n"
+             Environment=XDG_MENU_PREFIX=plasma-\n\
+             Environment=REDFOG_SESSION_PASSWORD_FILE={password_file_path}\n\
+             Environment=REDFOG_SESSION_ID_REPORT_FILE={session_id_report_path}\n"
         );
         // TEMPORARY debugging aid: kwin_wayland's own logging is otherwise
         // silent about most of what it does. `kwin_screencast` is the
@@ -539,19 +670,15 @@ impl SessionManager {
         let service_unit_path = PathBuf::from(UNIT_DIR).join(format!("{unit_name}.service"));
         std::fs::write(&socket_unit_path, socket_unit).map_err(|e| format!("failed to write {socket_unit_path:?}: {e}"))?;
         std::fs::write(&service_unit_path, service_unit).map_err(|e| format!("failed to write {service_unit_path:?}: {e}"))?;
-
         run_systemctl(&["daemon-reload"]).await?;
         // The name-matching between a .socket and .service unit only
         // triggers the service *lazily*, on the socket's first incoming
-        // connection attempt (confirmed against `man systemd.socket`'s
-        // Service= docs, and live: starting only the .service left KWin
-        // trying to use an fd 3 that was never actually passed, failing
-        // with "Failed to add 3 fd to display"). KWin is the one listening
-        // on this socket, not connecting to it, so it must start
-        // immediately regardless of whether anything has connected yet —
-        // start the .socket explicitly first (binding it), then the
-        // .service (which then picks up the already-bound fd via
-        // LISTEN_FDS on its own startup, not through the lazy path).
+        // connection attempt — KWin is the one *listening* on this socket,
+        // not connecting to it, so it must start immediately regardless of
+        // whether anything has connected yet: start the .socket explicitly
+        // first (binding it), then the .service (which then picks up the
+        // already-bound fd via LISTEN_FDS on its own startup, not through
+        // the lazy path).
         run_systemctl(&["start", &format!("{unit_name}.socket")]).await?;
         // Starting the .socket unit is what actually creates the socket
         // file on disk (ListenStream= binds it), so this grant can only
@@ -564,14 +691,37 @@ impl SessionManager {
         // `redfog-server`'s own `CaptureSession::connect` (a *third* identity,
         // distinct from both the broker/root and `username`) needs the same
         // grant on this same file — see `redfog_server_user`'s doc comment.
-        // Confirmed live this is real, not hypothetical: with no dedicated
-        // `redfog` system user (redfog-server running as root instead), this
-        // was a non-issue (root bypasses DAC checks entirely) — packaging
-        // this with `User=redfog` in `redfog-server.service` surfaced it.
         if let Some(server_user) = redfog_server_user() {
             grant_acl(&server_user, &wayland_socket_path, "rw", "connect to").await;
         }
-        run_systemctl(&["start", &format!("{unit_name}.service")]).await?;
+        if let Err(e) = run_systemctl(&["start", &format!("{unit_name}.service")]).await {
+            let _ = std::fs::remove_file(&password_file_path);
+            return Err(e);
+        }
+
+        // Wait for redfog-session-init to report the real logind session
+        // id it ended up with, once pam_open_session succeeded — same
+        // polling pattern already used below (and elsewhere in this
+        // function) for the Wayland/PipeWire sockets appearing.
+        let session_id_report_path_buf = PathBuf::from(&session_id_report_path);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let logind_session_id = loop {
+            if let Ok(id) = std::fs::read_to_string(&session_id_report_path_buf) {
+                let id = id.trim();
+                if !id.is_empty() {
+                    break id.to_string();
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(format!(
+                    "redfog-session-init for {unit_name} did not report a logind session id within 15s (did pam_open_session fail? check \
+                     journalctl -u {unit_name}.service)"
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        let _ = std::fs::remove_file(&session_id_report_path_buf);
+        tracing::info!("spawn_via_pam: {unit_name} reported logind session id {logind_session_id}");
 
         // Wait for this session's own PipeWire socket to actually exist
         // before granting `redfog-server` cross-uid access to it — and
@@ -609,10 +759,7 @@ impl SessionManager {
             grant_acl(&server_user, &pipewire_socket_path, "rw", "connect to").await;
         }
 
-        self.active
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), ActiveSession::Systemd { unit_name });
+        self.active.lock().unwrap().insert(session_id.to_string(), ActiveSession::Pam { logind_session_id });
         Ok(SpawnResult { wayland_socket_path, pipewire_socket_path })
     }
 
@@ -620,7 +767,7 @@ impl SessionManager {
     /// already created and owns (e.g. redfog-moonlight embedding a
     /// `gst-wayland-display` pipeline directly in its own process), then
     /// spawns `argv` (with `env` applied) as that user pointed at it —
-    /// unlike `spawn_via_systemd`, which creates the whole compositor
+    /// unlike `spawn_via_pam`, which creates the whole compositor
     /// runtime dir/socket itself, this one's caller already owns both. See
     /// `BrokerRequest::SpawnPayload`'s doc comment for the broader picture.
     pub async fn spawn_payload(
@@ -634,7 +781,7 @@ impl SessionManager {
     ) -> Result<(), String> {
         let (_uid, _gid, home_dir, _shell) = resolve_user(username).await?;
 
-        // Unlike spawn_via_systemd's runtime dir (which the broker creates
+        // Unlike spawn_via_pam's runtime dir (which the broker creates
         // and chowns fully to the target user), this one is owned by the
         // caller and needs to *stay* that way — grant access instead of
         // transferring ownership. A default ACL (`-d`) is required too,
@@ -695,14 +842,14 @@ impl SessionManager {
     pub async fn is_session_alive(&self, session_id: &str) -> bool {
         // `Child::try_wait` is synchronous and non-blocking, so the
         // Child-backed cases resolve (and, if dead, get removed) entirely
-        // under one lock. The `Systemd` case can't: checking it needs an
-        // async `systemctl is-active` call, so it only reads the unit name
-        // here and finishes the check (and any cleanup) after the lock is
-        // released, below.
+        // under one lock. The `Pam` case can't: checking it needs an async
+        // `loginctl` call, so it only reads the logind session id here and
+        // finishes the check (and any cleanup) after the lock is released,
+        // below.
         enum Peek {
             Alive,
             DeadChild,
-            NeedsSystemdCheck(String),
+            NeedsLoginctlCheck(String),
             Unknown,
         }
         let peek = {
@@ -714,7 +861,7 @@ impl SessionManager {
                         _ => Peek::DeadChild,
                     }
                 }
-                Some(ActiveSession::Systemd { unit_name }) => Peek::NeedsSystemdCheck(unit_name.clone()),
+                Some(ActiveSession::Pam { logind_session_id }) => Peek::NeedsLoginctlCheck(logind_session_id.clone()),
                 None => Peek::Unknown,
             };
             if matches!(peek, Peek::DeadChild) {
@@ -726,14 +873,24 @@ impl SessionManager {
         match peek {
             Peek::Alive => true,
             Peek::DeadChild | Peek::Unknown => false,
-            Peek::NeedsSystemdCheck(unit_name) => {
-                let alive = run_systemctl(&["is-active", "--quiet", &format!("{unit_name}.service")]).await.is_ok();
+            Peek::NeedsLoginctlCheck(logind_session_id) => {
+                // `loginctl show-session` (not `list-sessions | grep`) is
+                // the direct way to ask "does this exact session id still
+                // exist" — succeeds iff it does, regardless of state.
+                let alive = run_loginctl(&["show-session", &logind_session_id]).await.is_ok();
                 if !alive {
                     self.active.lock().unwrap().remove(session_id);
-                    // Same teardown `terminate` does for the Systemd case —
-                    // the service already stopped itself, but the socket
-                    // unit and generated unit files are still there.
+                    // Belt-and-suspenders cleanup — the session is already
+                    // gone from logind's own perspective, so this should
+                    // normally be a no-op, but the `redfog-session-<id>
+                    // .service`/`.socket` unit files this session's own
+                    // `spawn_via_pam` wrote might still be lingering (their
+                    // own process tree having escaped this unit's cgroup
+                    // the moment `pam_open_session` ran, same as
+                    // `terminate()`'s own `Pam` case below).
+                    let unit_name = format!("redfog-session-{session_id}");
                     let _ = run_systemctl(&["stop", &format!("{unit_name}.socket")]).await;
+                    let _ = run_systemctl(&["stop", &format!("{unit_name}.service")]).await;
                     let _ = std::fs::remove_file(PathBuf::from(UNIT_DIR).join(format!("{unit_name}.socket")));
                     let _ = std::fs::remove_file(PathBuf::from(UNIT_DIR).join(format!("{unit_name}.service")));
                     let _ = run_systemctl(&["daemon-reload"]).await;
@@ -838,20 +995,102 @@ impl SessionManager {
                     ),
                 }
             }
-            ActiveSession::Systemd { unit_name } => {
-                // Socket first, then service — stopping the service while
-                // its socket is still active logs a harmless but confusing
-                // "triggering units are still active" warning (confirmed
-                // live); stopping the socket first avoids it entirely.
-                run_systemctl(&["stop", &format!("{unit_name}.socket")]).await?;
-                run_systemctl(&["stop", &format!("{unit_name}.service")]).await?;
+            ActiveSession::Pam { logind_session_id } => {
+                let unit_name = format!("redfog-session-{session_id}");
+                // Graceful path first: `redfog-session-init`'s own process
+                // (parent half, after its internal fork — see that
+                // binary's own doc comment) is still this unit's tracked
+                // MainPID (it never replaced itself via `exec()`, only its
+                // forked child did), so `--kill-who=main` reaches
+                // specifically it, asking it to call `pam_close_session()`
+                // itself — the *only* thing that legally can, since PAM's
+                // own session-close bookkeeping lives on the exact
+                // `PamHandle` `pam_open_session()` was called on. Without
+                // this, `kill-session --kill-whom=all` below still reliably
+                // kills every process (confirmed live via the scope's own
+                // `Tasks: 0`), but the session itself is left listed in
+                // `loginctl list-sessions` forever, stuck
+                // `State=closing`/`Active: active (abandoned)` — logind's
+                // own `ReleaseSession()` D-Bus method (what
+                // `pam_close_session()` calls internally) exists but its
+                // own docs say it "should never be invoked directly by
+                // clients", so this has to go through the original PAM
+                // transaction, not around it.
+                let sigterm_result = run_systemctl(&["kill", "--kill-who=main", "--signal=SIGTERM", &format!("{unit_name}.service")]).await;
+                tracing::info!("terminate: systemctl kill --kill-who=main {unit_name}.service -> {sigterm_result:?}");
+                if sigterm_result.is_ok() {
+                    // Bounded wait for the parent's own graceful close
+                    // (pam_close_session + a final sweep of whatever's left
+                    // of the tree, via the scope unit — see redfog-session-
+                    // init's own doc comment) to actually finish, observed
+                    // as the session disappearing from `loginctl`. Short:
+                    // this is normally a handful of syscalls plus one D-Bus
+                    // round trip, not something that should genuinely take
+                    // seconds.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    loop {
+                        if run_loginctl(&["show-session", &logind_session_id]).await.is_err() {
+                            break; // gone -- the parent's own cleanup succeeded
+                        }
+                        if std::time::Instant::now() > deadline {
+                            tracing::warn!(
+                                "terminate: session {logind_session_id} still known to loginctl 5s after SIGTERM to {unit_name}.service's \
+                                 main pid -- falling back to a direct kill-session"
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+                // Backstop, run regardless of whether the graceful path
+                // above appeared to work: cheap and idempotent (a no-op
+                // against an already-empty/already-gone session), and
+                // covers every way the graceful path could fail to fully
+                // finish (systemctl kill itself failing, the parent not
+                // responding, or its own cleanup not fully reaching every
+                // process for some reason not yet understood).
+                let result = run_loginctl(&["kill-session", &logind_session_id, "--signal=SIGKILL", "--kill-whom=all"]).await;
+                tracing::info!("terminate: loginctl kill-session {logind_session_id} -> {result:?}");
+                let _ = run_systemctl(&["stop", &format!("{unit_name}.socket")]).await;
+                let _ = run_systemctl(&["stop", &format!("{unit_name}.service")]).await;
                 let _ = std::fs::remove_file(PathBuf::from(UNIT_DIR).join(format!("{unit_name}.socket")));
                 let _ = std::fs::remove_file(PathBuf::from(UNIT_DIR).join(format!("{unit_name}.service")));
-                run_systemctl(&["daemon-reload"]).await?;
+                let _ = run_systemctl(&["daemon-reload"]).await;
             }
         }
         tracing::info!("terminate({session_id}): done after {:?}", overall_start.elapsed());
         Ok(())
+    }
+
+    /// Drains every still-tracked session and `terminate()`s each — called
+    /// from `redfog-broker`'s own `SIGTERM` handler right before it exits.
+    /// Decided in conversation: a leftover orphaned session is worse than
+    /// disconnecting an active user across a restart, so this doesn't wait
+    /// for anything graceful on the client side first — same posture as
+    /// `redfog-moonlight`'s own `SessionManager::shutdown_all_sessions`,
+    /// which calls this indirectly via `TerminateSession` for every
+    /// session it itself knows about (this drains directly instead, since
+    /// it's the same process that owns `self.active`).
+    ///
+    /// Sequential, not concurrent: `terminate()` takes `&self` (this type
+    /// is shared via `Arc` in `main.rs`, but this method itself only ever
+    /// sees a plain `&self`), so running these concurrently would need
+    /// `tokio::spawn`, which requires `'static` futures — not worth the
+    /// extra indirection (an `Arc<Self>`-taking variant, or a `futures`
+    /// dependency just for `join_all`) for what's normally at most a
+    /// handful of sessions at shutdown time, not a hot path.
+    pub async fn terminate_all(&self) {
+        let session_ids: Vec<String> = self.active.lock().unwrap().keys().cloned().collect();
+        if session_ids.is_empty() {
+            tracing::info!("terminate_all: no active sessions");
+            return;
+        }
+        tracing::info!("terminate_all: terminating {} session(s)", session_ids.len());
+        for session_id in session_ids {
+            if let Err(e) = self.terminate(&session_id).await {
+                tracing::warn!("terminate_all: failed to terminate {session_id}: {e}");
+            }
+        }
     }
 }
 
@@ -965,10 +1204,10 @@ fn current_username() -> Result<String, String> {
 /// `%h` in a *system* unit's `WorkingDirectory=` resolves against the
 /// service manager's own context (root), not the target user, landing new
 /// sessions in `/root` instead of the target user's actual home. Used by
-/// `spawn_via_systemd` and `spawn_payload`. Note `redfog-session-init` (the
-/// actual privilege-dropping helper both of those exec into) does this
-/// same NSS lookup independently, itself, since it runs as a separate
-/// process with no access to this async fn.
+/// `spawn_payload` (`spawn_via_pam` no longer needs it directly — the real
+/// PAM session `redfog-session-init` opens sets `HOME`/`SHELL`/`USER`/
+/// `LOGNAME` itself, via its own independent NSS lookup, since it runs as
+/// a separate process with no access to this async fn).
 async fn resolve_user(username: &str) -> Result<(u32, u32, String, String), String> {
     let output = tokio::process::Command::new("getent")
         .args(["passwd", username])
@@ -1015,6 +1254,29 @@ async fn resolve_user(username: &str) -> Result<(u32, u32, String, String), Stri
 /// compositor is already fully up) — so doing it here, right before
 /// exec'ing the real payload, gets that ordering for free, no separate
 /// wait-for-socket polling needed.
+///
+/// Also the hook point for `/usr/lib/pam_kwallet_init` (from the
+/// `kwallet-pam` package — see `redfog-session-init`'s own doc comment for
+/// the full root-cause): a real KDE desktop login runs it via either a
+/// `systemd --user` unit or KDE's own XDG-autostart-phase session-startup
+/// machinery, neither of which this minimal `kwin_wayland
+/// --exit-with-session <script>` bring-up ever goes through on its own.
+/// Confirmed via that unit's own ordering
+/// (`After=plasma-kwin_wayland.service`, `Before=plasma-plasmashell.service`)
+/// that "once the compositor's up, before the real payload starts" is
+/// exactly the right point in session startup for it to run at — which
+/// this script already *is*, for the same reason
+/// `dbus-update-activation-environment` runs here. Run synchronously (not
+/// backgrounded): it's a fast one-shot handoff (reads `$PAM_KWALLET5_LOGIN`
+/// — set by `redfog-session-init`'s own PAM session-open, via
+/// `pam_getenvlist()` — and relays this shell's environment to the socket
+/// it names), and running it before the real payload starts avoids a race
+/// where an app tries to open the wallet before the handoff completes.
+/// Best-effort: no `set -e` in this script, so a failure here (e.g.
+/// `kwallet-pam` not installed, `$PAM_KWALLET5_LOGIN` unset because
+/// `pam_kwallet5.so` isn't in `/etc/pam.d/redfog-session`) just falls
+/// through to the real payload same as if this line weren't here — losing
+/// KWallet auto-unlock shouldn't lose the whole session.
 fn write_session_script(runtime_dir: &str, socket_name: &str, pipewire_socket_path: &str, pulse_socket_path: &str, payload: &[String]) -> Result<String, String> {
     fn shell_quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', r"'\''"))
@@ -1024,6 +1286,7 @@ fn write_session_script(runtime_dir: &str, socket_name: &str, pipewire_socket_pa
         "#!/bin/sh\n\
          export PULSE_SERVER=unix:{pulse_socket_path}\n\
          dbus-update-activation-environment --systemd WAYLAND_DISPLAY={socket_name} XDG_RUNTIME_DIR={runtime_dir} PIPEWIRE_REMOTE={pipewire_socket_path} PULSE_SERVER=unix:{pulse_socket_path}\n\
+         test -x /usr/lib/pam_kwallet_init && /usr/lib/pam_kwallet_init\n\
          exec {payload_cmd}\n"
     );
     let session_script_path = format!("{runtime_dir}/session-start.sh");

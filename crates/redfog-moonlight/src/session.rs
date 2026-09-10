@@ -481,6 +481,12 @@ pub struct SessionManager {
 /// `SessionManager::pending_logins`'s doc comment.
 struct PendingLoginResult {
     username: String,
+    /// Kept so `spawn_user_compositor` can forward it into the broker's
+    /// `SpawnSession` call — see that request field's own doc comment for
+    /// why: `redfog-session-init` needs a real password to open a PAM
+    /// session with `pam_kwallet5.so` in it, not just the `Authenticate`
+    /// check already done above in `handle_login_report`.
+    password: String,
     selected: Option<SelectedSession>,
 }
 
@@ -642,7 +648,7 @@ impl SessionManager {
                 .await
                 .map_err(|e| format!("failed to connect to broker at {broker_socket_path:?}: {e}"))?;
             let mut reader = BufReader::new(stream);
-            write_request(&mut reader, &BrokerRequest::Authenticate { username: username.clone(), password })
+            write_request(&mut reader, &BrokerRequest::Authenticate { username: username.clone(), password: password.clone() })
                 .await
                 .map_err(|e| format!("failed to send Authenticate to broker: {e}"))?;
             match read_response(&mut reader).await.map_err(|e| format!("failed to read Authenticate response: {e}"))? {
@@ -700,7 +706,7 @@ impl SessionManager {
             }
         };
 
-        self.pending_logins.lock().unwrap().insert(generation, PendingLoginResult { username, selected: Some(selected) });
+        self.pending_logins.lock().unwrap().insert(generation, PendingLoginResult { username, password, selected: Some(selected) });
         Ok(())
     }
 
@@ -838,6 +844,81 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Graceful-shutdown counterpart to `handle_log_out`: tells the broker
+    /// to `TerminateSession` every currently-known broker-spawned session
+    /// (active *and* backgrounded), concurrently, best-effort. Called from
+    /// `redfog-server`'s own `SIGTERM` handler right before it exits —
+    /// decided in conversation: a leftover orphaned session is worse than
+    /// disconnecting an active user across a restart, so nothing here waits
+    /// for a graceful client-side disconnect first.
+    ///
+    /// Unlike `handle_log_out`, this doesn't re-authenticate (there's no
+    /// caller-supplied password to check — this runs from a signal handler,
+    /// not a client request) and doesn't bother draining the local
+    /// `shared`/`background_sessions` bookkeeping afterward — this process
+    /// is exiting right after this returns, so nothing will ever read that
+    /// state again. If there's no broker configured at all (standalone use),
+    /// this is a no-op: nothing broker-spawned exists to tell.
+    pub async fn shutdown_all_sessions(&self) {
+        let Some(broker_socket_path) = self.config.broker_socket_path.clone() else {
+            return;
+        };
+
+        let broker_session_ids: Vec<String> = {
+            let background: Vec<String> = self.background_sessions.lock().unwrap().values().filter_map(|s| s.broker_session_id.clone()).collect();
+            let active: Vec<String> = self
+                .shared
+                .lock()
+                .unwrap()
+                .clients
+                .values()
+                .filter_map(|slot| slot.state.session().and_then(|s| s.broker_session_id.clone()))
+                .collect();
+            background.into_iter().chain(active).collect()
+        };
+        if broker_session_ids.is_empty() {
+            tracing::info!("shutdown_all_sessions: no broker-spawned sessions to terminate");
+            return;
+        }
+        tracing::info!("shutdown_all_sessions: terminating {} broker-spawned session(s)", broker_session_ids.len());
+
+        use redfog_broker_protocol::{read_response, write_request, BrokerRequest, BrokerResponse};
+        use tokio::io::BufReader;
+        use tokio::net::UnixStream;
+
+        // Spawned as separate tasks (not a sequential loop) so a slow/stuck
+        // broker call for one session doesn't delay the (bounded, 15s)
+        // timeout of any other — each `tokio::spawn` starts running
+        // immediately, so awaiting the handles below in order still means
+        // every terminate call already ran concurrently.
+        let tasks: Vec<_> = broker_session_ids.into_iter().map(|broker_session_id| {
+            let broker_socket_path = broker_socket_path.clone();
+            tokio::spawn(async move {
+                let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+                    let stream = UnixStream::connect(&broker_socket_path).await.map_err(|e| format!("failed to connect to broker: {e}"))?;
+                    let mut reader = BufReader::new(stream);
+                    write_request(&mut reader, &BrokerRequest::TerminateSession { session_id: broker_session_id.clone() })
+                        .await
+                        .map_err(|e| format!("failed to send TerminateSession to broker: {e}"))?;
+                    read_response(&mut reader).await.map_err(|e| format!("failed to read TerminateSession response: {e}"))
+                })
+                .await;
+                match outcome {
+                    Ok(Ok(BrokerResponse::TerminateSession(Ok(())))) => {
+                        tracing::info!("shutdown_all_sessions: terminated broker_session_id={broker_session_id}")
+                    }
+                    Ok(Ok(BrokerResponse::TerminateSession(Err(e)))) => tracing::warn!("shutdown_all_sessions: broker failed to terminate {broker_session_id}: {e}"),
+                    Ok(Ok(other)) => tracing::warn!("shutdown_all_sessions: unexpected broker response for {broker_session_id}: {other:?}"),
+                    Ok(Err(e)) => tracing::warn!("shutdown_all_sessions: TerminateSession round trip failed for {broker_session_id}: {e}"),
+                    Err(_) => tracing::error!("shutdown_all_sessions: TerminateSession for {broker_session_id} did not respond within 15s"),
+                }
+            })
+        }).collect();
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
     /// An owned `Arc<Self>` for moving into spawned tasks — trait methods
     /// here take plain `&self` (so `SessionManager` stays usable as a
     /// trait object across `LaunchHandler`/`RtspHandler`/`ControlEventHandler`
@@ -890,6 +971,13 @@ impl SessionManager {
         reported: &Option<PendingLoginResult>,
     ) -> Result<(SpawnedCompositor, String, Option<String>), String> {
         let username = reported.as_ref().map(|r| r.username.clone()).unwrap_or_else(|| "user".to_string());
+        // Real password, needed by the broker's `SpawnSession` call below to
+        // open a real PAM session with `pam_kwallet5.so` in it (see that
+        // request field's own doc comment) — `None` (standalone/no-broker
+        // use, or a login stage that reported nothing) falls back to empty,
+        // matching this whole method's existing `reported.is_none()`
+        // fallback posture.
+        let password = reported.as_ref().map(|r| r.password.clone()).unwrap_or_default();
         // Chosen on the login screen itself — falls back to the server's
         // own startup default (config.backend/config.user_app) when
         // nothing was ever reported in, same reasoning as `username` above.
@@ -917,7 +1005,7 @@ impl SessionManager {
             broker_socket_path,
             session_id.clone(),
             &username,
-            "",
+            &password,
             reported.is_some(),
             &user_app,
             width,

@@ -84,6 +84,15 @@ async fn secure_socket(path: &str) -> Result<(), String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
+    // REDFOG_BROKER_FAKE_SPAWN's whole point is running unprivileged, as
+    // the invoking test user, with no real PAM/systemd session spawning at
+    // all (see `SessionManager::spawn_fake`'s doc comment) — writing a
+    // system-wide `/etc/pam.d/` file would just fail outright (permission
+    // denied) for that path, and it's never actually consulted anyway.
+    if std::env::var_os("REDFOG_BROKER_FAKE_SPAWN").is_none() {
+        session::ensure_pam_session_service()?;
+    }
+
     let path = socket_path();
     if let Some(parent) = std::path::Path::new(&path).parent() {
         std::fs::create_dir_all(parent)?;
@@ -96,15 +105,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sessions = std::sync::Arc::new(session::SessionManager::new());
 
-    loop {
-        let (stream, _addr) = listener.accept().await?;
-        let sessions = sessions.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, sessions).await {
-                tracing::warn!("connection handler exited: {e}");
-            }
-        });
+    let accept_loop = async {
+        loop {
+            let (stream, _addr) = listener.accept().await?;
+            let sessions = sessions.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(stream, sessions).await {
+                    tracing::warn!("connection handler exited: {e}");
+                }
+            });
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+
+    // Decided in conversation: a leftover orphaned session is worse than
+    // disconnecting an active user across a restart — `systemctl restart`/
+    // `stop` send SIGTERM, and without this every session this broker
+    // spawned would otherwise just leak until the separate
+    // `redfog-watchdog` crash backstop's next poll caught it.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = accept_loop => { result?; }
+        _ = sigterm.recv() => {
+            tracing::info!("received SIGTERM, terminating all sessions before exiting");
+            sessions.terminate_all().await;
+            // See redfog-server's own main.rs for why this is a hard exit
+            // rather than a normal return: per-connection handler tasks
+            // (spawned above, independent of this select!'s own futures)
+            // are never told to stop, so letting the tokio Runtime unwind
+            // naturally would otherwise hang this process until systemd's
+            // own stop timeout SIGKILLs it -- confirmed live for
+            // redfog-server, same mechanism applies here.
+            std::process::exit(0);
+        }
     }
+    Ok(())
 }
 
 async fn handle_connection(
@@ -123,10 +159,10 @@ async fn handle_connection(
                 tracing::info!("authenticating user {username}");
                 BrokerResponse::Authenticate(auth::authenticate(username, password).await)
             }
-            BrokerRequest::SpawnSession { session_id, username, width, height, socket_name, payload } => {
+            BrokerRequest::SpawnSession { session_id, username, password, width, height, socket_name, payload } => {
                 tracing::info!("spawning session {session_id} for user {username} ({width}x{height})");
                 let result = sessions
-                    .spawn(&session_id, &username, width, height, &socket_name, &payload)
+                    .spawn(&session_id, &username, &password, width, height, &socket_name, &payload)
                     .await
                     .map(|spawned| redfog_broker_protocol::SpawnedSession {
                         wayland_socket_path: spawned.wayland_socket_path,

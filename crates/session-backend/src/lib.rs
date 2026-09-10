@@ -593,6 +593,7 @@ pub async fn spawn_user_compositor_via_broker(
                 &BrokerRequest::SpawnSession {
                     session_id,
                     username: username.to_string(),
+                    password: password.to_string(),
                     width,
                     height,
                     socket_name: "redfog-user-0".to_string(),

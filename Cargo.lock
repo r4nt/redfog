@@ -4412,7 +4412,9 @@ dependencies = [
 name = "redfog-session-init"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nix",
+ "pam",
 ]
 
 [[package]]
@@ -4431,6 +4433,14 @@ dependencies = [
  "redfog-login-protocol",
  "sdl2",
  "winit",
+]
+
+[[package]]
+name = "redfog-watchdog"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

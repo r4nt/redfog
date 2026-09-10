@@ -1,0 +1,22 @@
+[Unit]
+Description=redfog session crash backstop (kills orphaned sessions if redfog-server/redfog-broker die without a chance to clean up)
+Documentation=https://github.com/REPLACE_ME/redfog
+After=redfog-server.service redfog-broker.service
+# Deliberately no BindsTo=/PartOf=/Requires= on either of the other two
+# units -- that would tie this unit's own lifecycle to theirs, defeating
+# its entire purpose (it needs to keep running, and keep watching,
+# specifically when one of them is *not* running). After= here is for
+# startup ordering only (no point sweeping before either has even had a
+# chance to start once); WantedBy= below is independent of both.
+
+[Service]
+Type=simple
+# Genuinely needs root: killing another user's logind session
+# (`loginctl kill-session --kill-whom=all`) is a privileged operation, same
+# justification as redfog-broker.service's own comment.
+ExecStart=/usr/bin/redfog-watchdog
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

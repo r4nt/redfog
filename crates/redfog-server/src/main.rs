@@ -244,13 +244,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("redfog-server starting: http={http_port} https={https_port} rtsp={rtsp_port} video={video_port} control={control_port} audio={audio_port}");
 
-    tokio::try_join!(
-        async { pairing_server.clone().serve_http(bind_addr).await },
-        async { pairing_server.clone().serve_https(bind_addr).await },
-        async { rtsp_server.clone().serve(bind_addr).await },
-        async { control_server.serve(bind_addr).await },
-        async { login_report_server.serve().await },
-    )?;
+    let serve = async {
+        tokio::try_join!(
+            async { pairing_server.clone().serve_http(bind_addr).await },
+            async { pairing_server.clone().serve_https(bind_addr).await },
+            async { rtsp_server.clone().serve(bind_addr).await },
+            async { control_server.serve(bind_addr).await },
+            async { login_report_server.serve().await },
+        )
+    };
+
+    // Decided in conversation: a leftover orphaned session is worse than
+    // disconnecting an active user across a restart — `systemctl restart`/
+    // `stop` send SIGTERM, and without this every session (broker-spawned
+    // KWin/plasmashell trees included) would otherwise just leak until the
+    // separate `redfog-watchdog` crash backstop's next poll caught it.
+    // Bounded (`shutdown_all_sessions` itself already bounds each
+    // individual broker call — see its own doc comment), so a stuck broker
+    // can't hang this process's own shutdown indefinitely.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = serve => { result?; }
+        _ = sigterm.recv() => {
+            tracing::info!("received SIGTERM, terminating all sessions before exiting");
+            session_manager.shutdown_all_sessions().await;
+            // Confirmed live: returning normally from here and letting
+            // main()/the tokio Runtime unwind on their own isn't enough --
+            // systemd still had to SIGKILL this process ~10s later
+            // ("State 'stop-sigterm' timed out. Killing.") even though
+            // shutdown_all_sessions() itself had already finished in
+            // under half a second. `Runtime::drop()` blocks waiting for
+            // *every* still-running task, not just the ones reachable from
+            // this function's own `serve` future -- per-connection
+            // handlers, the mDNS discovery responder, and similar
+            // independently-`tokio::spawn`ed background tasks are never
+            // told to stop by anything above, so they just keep the whole
+            // process (and the SIGTERM-triggered shutdown) hanging
+            // indefinitely. The one thing that actually matters
+            // (terminating every session) is already done at this point --
+            // exit immediately rather than waiting on unrelated tasks that
+            // were never asked to wind down.
+            std::process::exit(0);
+        }
+    }
 
     Ok(())
 }

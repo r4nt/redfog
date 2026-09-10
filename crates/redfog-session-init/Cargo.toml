@@ -8,4 +8,6 @@ name = "redfog-session-init"
 path = "src/main.rs"
 
 [dependencies]
-nix = { version = "0.26", features = ["process", "user"] }
+nix = { version = "0.26", features = ["process", "user", "signal"] }
+pam = "0.8"
+libc = "0.2"

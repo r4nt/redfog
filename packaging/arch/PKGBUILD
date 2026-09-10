@@ -37,13 +37,22 @@ depends=(
                              # anyway, so listing just this one still covers
                              # the vulkan/nv elements too.
     'wayland'
-    'pam'                # redfog-broker links libpam.so.0 directly for
-                         # authentication -- confirmed via namcap, missing
-                         # from an earlier draft of this list
+    'pam'                # redfog-broker AND redfog-session-init both link
+                         # libpam.so.0 directly (authentication, and now
+                         # also the real session-open that lets KWallet
+                         # auto-unlock -- see /etc/pam.d/redfog-session,
+                         # written by redfog-broker itself at startup) --
+                         # confirmed via namcap, missing from an earlier
+                         # draft of this list
 )
 optdepends=(
     'nvidia-utils: hardware-accelerated NVENC video encoding'
     'plasma-workspace: plasmashell, the default User-stage session (REDFOG_USER_APP)'
+    'kwallet-pam: auto-unlocks KWallet on session spawn, the same way a normal desktop
+                  login does -- redfog-broker writes /etc/pam.d/redfog-session (which
+                  references pam_kwallet5.so) itself at startup, same pattern it already
+                  uses for the transient systemd units it generates per session; harmless,
+                  a no-op PAM line, if this package is not installed'
 )
 makedepends=('cargo' 'clang' 'git')
 provides=('redfog')
@@ -142,7 +151,8 @@ build() {
         -p redfog-broker \
         -p redfog-login \
         -p redfog-pair \
-        -p redfog-session-init
+        -p redfog-session-init \
+        -p redfog-watchdog
     # redfog-pipewire-session is a `src/bin/` target inside redfog-core, not
     # its own crate -- a separate invocation, not just another `-p` above:
     # `--bin` applies across *every* `-p` package in the same invocation,
@@ -162,9 +172,11 @@ package() {
     install -Dm755 target/release/redfog-pair         "$pkgdir/usr/bin/redfog-pair"
     install -Dm755 target/release/redfog-session-init "$pkgdir/usr/bin/redfog-session-init"
     install -Dm755 target/release/redfog-pipewire-session "$pkgdir/usr/bin/redfog-pipewire-session"
+    install -Dm755 target/release/redfog-watchdog "$pkgdir/usr/bin/redfog-watchdog"
 
     install -Dm644 packaging/arch/redfog-broker.service "$pkgdir/usr/lib/systemd/system/redfog-broker.service"
     install -Dm644 packaging/arch/redfog-server.service "$pkgdir/usr/lib/systemd/system/redfog-server.service"
+    install -Dm644 packaging/arch/redfog-watchdog.service "$pkgdir/usr/lib/systemd/system/redfog-watchdog.service"
     install -Dm644 packaging/arch/redfog.sysusers        "$pkgdir/usr/lib/sysusers.d/redfog.conf"
     install -Dm644 packaging/arch/redfog.conf            "$pkgdir/etc/redfog/redfog.conf"
 
