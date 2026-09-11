@@ -34,8 +34,14 @@ jobs:
           # live: "kwin_xwl: /tmp/.X11-unix does not exist" / "Failed to
           # establish X11 socket" without this. 1777 matches the real X11
           # convention (world-writable, sticky bit) for this directory.
-          mkdir -p /tmp/.X11-unix
-          chmod 1777 /tmp/.X11-unix
+          # `sudo`, not a plain chmod: confirmed live on ubuntu-latest that
+          # /tmp/.X11-unix already exists on the runner image, owned by
+          # someone other than the `runner` user running this step, so a
+          # plain `chmod` on it fails outright ("Operation not permitted")
+          # -- every run since (at least) 2026-09-02 failed at this exact
+          # step, before any real build/test step ever ran.
+          sudo mkdir -p /tmp/.X11-unix
+          sudo chmod 1777 /tmp/.X11-unix
 
       - name: Install NVIDIA encode/decode userspace libraries (link-time only, no GPU needed)
         # redfog-core -> kwin-capture -> nvidia-video-codec-sdk's build.rs
