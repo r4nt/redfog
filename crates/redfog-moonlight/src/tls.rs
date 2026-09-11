@@ -210,12 +210,23 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
         cert: &rustls_pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
+        match rustls::crypto::verify_tls12_signature(
             message,
             cert,
             dss,
             &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
-        )
+        ) {
+            Ok(valid) => Ok(valid),
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(_))) => {
+                // webpki only supports X.509 v3 certificates and rejects v1
+                // certificates (common on older embedded GameStream/Moonlight
+                // clients like webOS) with webpki::Error::UnsupportedCertVersion,
+                // mapped by rustls to CertificateError::Other.
+                // Fall back to manual RSA verification using x509-parser.
+                verify_tls12_rsa_fallback(message, cert, dss)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn verify_tls13_signature(
@@ -224,15 +235,157 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
         cert: &rustls_pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
+        match rustls::crypto::verify_tls13_signature(
             message,
             cert,
             dss,
             &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
-        )
+        ) {
+            Ok(valid) => Ok(valid),
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(_))) => {
+                verify_tls13_rsa_fallback(message, cert, dss)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.schemes.clone()
     }
 }
+
+/// Fallback TLS 1.2 signature verification for clients presenting X.509 v1 certificates.
+fn verify_tls12_rsa_fallback(
+    message: &[u8],
+    cert_der: &rustls_pki_types::CertificateDer<'_>,
+    dss: &rustls::DigitallySignedStruct,
+) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    use rsa::pkcs1::DecodeRsaPublicKey;
+    use rsa::{Pkcs1v15Sign, RsaPublicKey};
+    use sha2::{Digest, Sha256, Sha384, Sha512};
+
+    let (_, parsed_cert) = x509_parser::parse_x509_certificate(cert_der.as_ref())
+        .map_err(|_| rustls::CertificateError::BadEncoding)?;
+    let spki_bytes = parsed_cert
+        .tbs_certificate
+        .subject_pki
+        .subject_public_key
+        .data
+        .as_ref();
+    let public_key = RsaPublicKey::from_pkcs1_der(spki_bytes)
+        .map_err(|_| rustls::CertificateError::BadEncoding)?;
+
+    match dss.scheme {
+        rustls::SignatureScheme::RSA_PKCS1_SHA256 => {
+            const PREFIX: [u8; 19] = [
+                0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+            ];
+            let digest = Sha256::digest(message);
+            public_key
+                .verify(
+                    Pkcs1v15Sign {
+                        hash_len: Some(32),
+                        prefix: Box::new(PREFIX),
+                    },
+                    &digest,
+                    dss.signature(),
+                )
+                .map_err(|_| rustls::CertificateError::BadSignature)?;
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        rustls::SignatureScheme::RSA_PKCS1_SHA384 => {
+            const PREFIX: [u8; 19] = [
+                0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30,
+            ];
+            let digest = Sha384::digest(message);
+            public_key
+                .verify(
+                    Pkcs1v15Sign {
+                        hash_len: Some(48),
+                        prefix: Box::new(PREFIX),
+                    },
+                    &digest,
+                    dss.signature(),
+                )
+                .map_err(|_| rustls::CertificateError::BadSignature)?;
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        rustls::SignatureScheme::RSA_PKCS1_SHA512 => {
+            const PREFIX: [u8; 19] = [
+                0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40,
+            ];
+            let digest = Sha512::digest(message);
+            public_key
+                .verify(
+                    Pkcs1v15Sign {
+                        hash_len: Some(64),
+                        prefix: Box::new(PREFIX),
+                    },
+                    &digest,
+                    dss.signature(),
+                )
+                .map_err(|_| rustls::CertificateError::BadSignature)?;
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        _ => {
+            #[allow(deprecated)]
+            Err(rustls::CertificateError::UnsupportedSignatureAlgorithm.into())
+        }
+    }
+}
+
+/// Fallback TLS 1.3 signature verification for clients presenting X.509 v1 certificates.
+fn verify_tls13_rsa_fallback(
+    message: &[u8],
+    cert_der: &rustls_pki_types::CertificateDer<'_>,
+    dss: &rustls::DigitallySignedStruct,
+) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    use rsa::pkcs1::DecodeRsaPublicKey;
+    use rsa::pss::VerifyingKey;
+    use rsa::signature::Verifier;
+    use rsa::RsaPublicKey;
+    use sha2::{Sha256, Sha384, Sha512};
+
+    let (_, parsed_cert) = x509_parser::parse_x509_certificate(cert_der.as_ref())
+        .map_err(|_| rustls::CertificateError::BadEncoding)?;
+    let spki_bytes = parsed_cert
+        .tbs_certificate
+        .subject_pki
+        .subject_public_key
+        .data
+        .as_ref();
+    let public_key = RsaPublicKey::from_pkcs1_der(spki_bytes)
+        .map_err(|_| rustls::CertificateError::BadEncoding)?;
+
+    match dss.scheme {
+        rustls::SignatureScheme::RSA_PSS_SHA256 => {
+            let vk = VerifyingKey::<Sha256>::new(public_key);
+            let sig = rsa::pss::Signature::try_from(dss.signature())
+                .map_err(|_| rustls::CertificateError::BadSignature)?;
+            vk.verify(message, &sig)
+                .map_err(|_| rustls::CertificateError::BadSignature)?;
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        rustls::SignatureScheme::RSA_PSS_SHA384 => {
+            let vk = VerifyingKey::<Sha384>::new(public_key);
+            let sig = rsa::pss::Signature::try_from(dss.signature())
+                .map_err(|_| rustls::CertificateError::BadSignature)?;
+            vk.verify(message, &sig)
+                .map_err(|_| rustls::CertificateError::BadSignature)?;
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        rustls::SignatureScheme::RSA_PSS_SHA512 => {
+            let vk = VerifyingKey::<Sha512>::new(public_key);
+            let sig = rsa::pss::Signature::try_from(dss.signature())
+                .map_err(|_| rustls::CertificateError::BadSignature)?;
+            vk.verify(message, &sig)
+                .map_err(|_| rustls::CertificateError::BadSignature)?;
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        _ => {
+            #[allow(deprecated)]
+            Err(rustls::CertificateError::UnsupportedSignatureAlgorithm.into())
+        }
+    }
+}
+
