@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -538,9 +539,26 @@ impl PairingServer {
         };
 
         let handler = self.launch_handler.clone();
-        let result = tokio::task::spawn_blocking(move || handler.launch(width, height, fps, rikey, client_key, client_ip))
-            .await
-            .unwrap_or_else(|e| Err(format!("launch task panicked: {e}")));
+        let result = match tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || handler.launch(width, height, fps, rikey, client_key, client_ip)),
+        )
+        .await
+        {
+            Ok(join_result) => join_result.unwrap_or_else(|e| Err(format!("launch task panicked: {e}"))),
+            // The blocking task itself keeps running to completion on
+            // tokio's blocking pool even after we give up waiting on it
+            // here (there's no way to cancel a `spawn_blocking` closure
+            // mid-flight) -- this bounds how long a client's `/launch` HTTP
+            // request can hang, not how long the underlying spawn attempt
+            // itself takes. A stuck attempt eventually finishes (or, if it
+            // never does, leaves `ClientState::Spawning` in place, which a
+            // retry's own `raced_a_spawn_in_flight` 15s condvar wait already
+            // handles). Added after a real CI hang traced to this exact call
+            // having no outer bound at all -- unlike every other blocking
+            // GStreamer/subprocess call in this codebase.
+            Err(_) => Err("launch did not complete within 30s".to_string()),
+        };
 
         match result {
             // The client parses this as a raw socket address, not a hostname
@@ -560,9 +578,12 @@ impl PairingServer {
 
     async fn resume(&self, _params: &HashMap<String, String>, local_ip: std::net::IpAddr, client_key: ClientKey) -> Response<Full<Bytes>> {
         let handler = self.launch_handler.clone();
-        let result = tokio::task::spawn_blocking(move || handler.resume(client_key))
-            .await
-            .unwrap_or_else(|e| Err(format!("resume task panicked: {e}")));
+        // Same outer-bound reasoning as `launch`'s own timeout above -- see
+        // its comment.
+        let result = match tokio::time::timeout(Duration::from_secs(30), tokio::task::spawn_blocking(move || handler.resume(client_key))).await {
+            Ok(join_result) => join_result.unwrap_or_else(|e| Err(format!("resume task panicked: {e}"))),
+            Err(_) => Err("resume did not complete within 30s".to_string()),
+        };
 
         match result {
             Ok(()) => xml_response(format!(
@@ -579,9 +600,12 @@ impl PairingServer {
 
     async fn cancel(&self, _params: &HashMap<String, String>, client_key: ClientKey) -> Response<Full<Bytes>> {
         let handler = self.launch_handler.clone();
-        let result = tokio::task::spawn_blocking(move || handler.cancel(client_key))
-            .await
-            .unwrap_or_else(|e| Err(format!("cancel task panicked: {e}")));
+        // Same outer-bound reasoning as `launch`'s own timeout above -- see
+        // its comment.
+        let result = match tokio::time::timeout(Duration::from_secs(30), tokio::task::spawn_blocking(move || handler.cancel(client_key))).await {
+            Ok(join_result) => join_result.unwrap_or_else(|e| Err(format!("cancel task panicked: {e}"))),
+            Err(_) => Err("cancel did not complete within 30s".to_string()),
+        };
 
         match result {
             Ok(()) => xml_response(paired_xml("<cancel>1</cancel>")),

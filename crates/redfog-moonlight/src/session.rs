@@ -1801,26 +1801,59 @@ impl SessionManager {
                 // can't itself cross into `spawn_blocking`'s `'static` closure
                 // while still being used afterward here.
                 let compositor = session.compositor.take().expect("Login session always has a compositor");
-                let (video_pipeline, cuda_direct_session, compositor) = tokio::task::spawn_blocking(move || {
-                    let (video_pipeline, cuda_direct_session) =
-                        this.build_video_pipeline(&kind, &compositor, generation, fps_cap, bitrate_kbps, codec, handle, this.clone());
-                    (video_pipeline, cuda_direct_session, compositor)
-                })
+                let build_start = std::time::Instant::now();
+                // Bounded, matching every other blocking GStreamer call in
+                // this method (see the video/audio Playing-transitions
+                // right below) -- added after a real CI hang traced to
+                // `/launch`'s own equivalent call (see
+                // `PairingServer::launch`'s timeout in `pairing.rs`) having
+                // no outer bound at all. `compositor` is moved into the
+                // closure, so a timeout here can't recover it -- the
+                // blocking task keeps running in the background (no way to
+                // cancel a `spawn_blocking` closure mid-flight) and its
+                // result, including the compositor, is simply dropped once
+                // it eventually finishes. That leaves `session.compositor`
+                // permanently `None`, which later code (`.expect("...
+                // compositor...")`) will panic on -- a bounded, isolated
+                // failure of this one session/request, not an indefinitely
+                // wedged server.
+                match tokio::time::timeout(
+                    Duration::from_secs(15),
+                    tokio::task::spawn_blocking(move || {
+                        let (video_pipeline, cuda_direct_session) =
+                            this.build_video_pipeline(&kind, &compositor, generation, fps_cap, bitrate_kbps, codec, handle, this.clone());
+                        (video_pipeline, cuda_direct_session, compositor)
+                    }),
+                )
                 .await
-                .expect("build_video_pipeline task panicked");
-                session.compositor = Some(compositor);
-                session.video_pipeline = video_pipeline;
-                session.cuda_direct_session = cuda_direct_session;
-                // `session.codec` was set back in `spawn_session`, before
-                // ANNOUNCE — stale now that the pipeline above was actually
-                // built against the freshly-negotiated `codec`. Nothing
-                // reads this for the Login stage besides the periodic stats
-                // log inside `build_video_pipeline` (Login is never taken
-                // over/resumed, so `reconcile_video_pipeline`'s own
-                // `session.codec` comparison never sees this value), but
-                // leaving it stale would make that log lie about what's
-                // actually being encoded.
-                session.codec = codec;
+                {
+                    Ok(Ok((video_pipeline, cuda_direct_session, compositor))) => {
+                        tracing::info!(
+                            "start_streaming(generation={generation}): Login video pipeline rebuilt for negotiated codec after {:?}",
+                            build_start.elapsed()
+                        );
+                        session.compositor = Some(compositor);
+                        session.video_pipeline = video_pipeline;
+                        session.cuda_direct_session = cuda_direct_session;
+                        // `session.codec` was set back in `spawn_session`,
+                        // before ANNOUNCE — stale now that the pipeline
+                        // above was actually built against the freshly-
+                        // negotiated `codec`. Nothing reads this for the
+                        // Login stage besides the periodic stats log inside
+                        // `build_video_pipeline` (Login is never taken
+                        // over/resumed, so `reconcile_video_pipeline`'s own
+                        // `session.codec` comparison never sees this
+                        // value), but leaving it stale would make that log
+                        // lie about what's actually being encoded.
+                        session.codec = codec;
+                    }
+                    Ok(Err(e)) => tracing::error!("build_video_pipeline task panicked for generation={generation}: {e}"),
+                    Err(_) => tracing::error!(
+                        "build_video_pipeline did not complete within 15s for generation={generation} -- this session's \
+                         compositor is now permanently gone; whatever request touches it next will fail loudly instead \
+                         of the whole server hanging"
+                    ),
+                }
             }
             // Bounded — confirmed via a dedicated integration test (not
             // guesswork) that this can hang even for a session with
