@@ -140,17 +140,27 @@ jobs:
         #
         # TEMPORARY diagnostic wrapper: a run on 2026-09-11 hung for over an
         # hour on this exact step (confirmed not just "slow CI hardware" --
-        # the same suite finishes in well under 10 minutes locally), cause
-        # not yet known. Backgrounds the real `cargo test` invocation and
-        # polls every 10s while it's still running, printing which
-        # process(es) are alive (by elapsed time, to spot one stuck far
-        # longer than everything else) and, for anything that looks like
-        # one of ours, its /proc state/wchan/kernel stack -- best-effort:
-        # `sudo cat .../stack` commonly fails outright on a locked-down
-        # runner kernel, hence the `|| true`s throughout, so a permission
-        # failure here never itself fails the job. Remove this wrapper
-        # (back to a plain `cargo test ...` line) once the hang is
-        # root-caused and fixed.
+        # the same suite finishes in well under 10 minutes locally); a
+        # second run instead died abruptly mid-test with no error message
+        # at all (no panic, no failing test -- just stopped, consistent
+        # with the runner itself being killed, e.g. OOM), so this covers
+        # both failure shapes, not just a hang. Backgrounds the real
+        # `cargo test` invocation and polls every 10s while it's still
+        # running: memory usage, a recent kernel-log tail (best-effort --
+        # catches an OOM kill if CAP_SYSLOG allows reading it), the process
+        # list by elapsed time (to spot one stuck far longer than
+        # everything else), and, for anything that looks like ours
+        # (matches both hyphenated production binaries like
+        # `redfog-broker` *and* underscored cargo test-harness binaries
+        # like `redfog_core-<hash>` -- confirmed live the hyphen-only
+        # version of this pattern missed the second run's own death
+        # entirely, since it died inside a test-harness process, not a
+        # spawned subprocess), its /proc state/wchan/kernel stack --
+        # best-effort throughout (`sudo cat .../stack` commonly fails
+        # outright on a locked-down runner kernel), hence the `|| true`s,
+        # so a permission failure here never itself fails the job. Remove
+        # this wrapper (back to a plain `cargo test ...` line) once
+        # whatever's actually happening is root-caused and fixed.
         run: |
           source <(cargo llvm-cov show-env --sh)
           cargo test --workspace --exclude kwin-capture -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test &
@@ -159,10 +169,14 @@ jobs:
           while kill -0 "$TEST_PID" 2>/dev/null; do
             sleep 10
             echo "::group::diagnostics at $(date -u +%H:%M:%S) (test harness still running)"
+            echo "--- memory ---"
+            free -h 2>&1 || true
+            echo "--- recent kernel log (OOM kills etc, best-effort -- may be empty without CAP_SYSLOG) ---"
+            sudo dmesg --time-format=iso 2>/dev/null | tail -20 || true
             echo "--- processes by elapsed time ---"
             ps -eo pid,ppid,stat,etimes,cmd --sort=-etimes 2>&1 | head -40 || true
             echo "--- /proc detail for redfog/compositor/dbus/pipewire processes ---"
-            for pid in $(pgrep -f 'redfog-|kwin_wayland|dbus-daemon|dbus-run-session|pipewire' 2>/dev/null); do
+            for pid in $(pgrep -f 'redfog|kwin_wayland|dbus-daemon|dbus-run-session|pipewire' 2>/dev/null); do
               comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
               state="$(awk '/^State:/{print $0}' "/proc/$pid/status" 2>/dev/null)"
               wchan="$(cat "/proc/$pid/wchan" 2>/dev/null; echo)"
