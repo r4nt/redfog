@@ -15,7 +15,24 @@ fn env_port(name: &str, default: u16) -> u16 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // TEMPORARY diagnostic: a real, still-unresolved CI hang (two attempted
+    // fixes so far, neither one the actual cause) shows redfog-server
+    // producing *zero* log output for the whole stall -- not even its own
+    // startup banner near the bottom of `run()`, which always appears
+    // within a second or two in a working run. `tracing_subscriber::fmt::
+    // init()` emits DEBUG+ with no filtering (confirmed: unrelated DEBUG
+    // lines from deep in this process show up in every passing run), so if
+    // *any* tracing call anywhere in this function or the ones it calls
+    // ever executed, it would be visible -- meaning execution is frozen
+    // somewhere between process start and the first `tracing::info!` call,
+    // but exactly where hasn't been pinned down despite two targeted fixes.
+    // Plain `eprintln!` (stderr is unbuffered in Rust, no manual flush
+    // needed) bypasses `tracing_subscriber` entirely, in case its own
+    // initialization is somehow implicated. Remove once the real stuck
+    // point is identified from a CI run carrying this instrumentation.
+    eprintln!("STARTUP-CHECKPOINT: main() entered");
     tracing_subscriber::fmt::init();
+    eprintln!("STARTUP-CHECKPOINT: tracing_subscriber initialized");
 
     // rustls::ServerConfig::builder() (pairing.rs's HTTPS server) picks the
     // process-default CryptoProvider automatically, but only if exactly one
@@ -28,10 +45,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("no CryptoProvider installed yet");
+    eprintln!("STARTUP-CHECKPOINT: CryptoProvider installed");
 
     // Must run before anything else touches D-Bus: spawns a private session
     // bus and exports DBUS_SESSION_BUS_ADDRESS for the rest of this process.
+    eprintln!("STARTUP-CHECKPOINT: calling ensure_private_dbus_session()");
     let _dbus_session = redfog_core::ensure_private_dbus_session();
+    eprintln!("STARTUP-CHECKPOINT: ensure_private_dbus_session() returned");
 
     // For Backend::GstWaylandDisplay: waylanddisplaysrc isn't installed
     // system-wide, so it won't be on GStreamer's default plugin search path
@@ -60,7 +80,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("GST_GL_PLATFORM", "egl");
     }
 
+    eprintln!("STARTUP-CHECKPOINT: calling gstreamer::init()");
     gstreamer::init()?;
+    eprintln!("STARTUP-CHECKPOINT: gstreamer::init() returned");
 
     // TEMPORARY debugging aid for the "resume works but video updates are
     // severely throttled" investigation — traces `pipewiresrc`'s own
@@ -84,10 +106,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    eprintln!("STARTUP-CHECKPOINT: calling HeadlessRuntime::start()");
     let _headless_runtime = redfog_core::HeadlessRuntime::start(redfog_core::default_runtime_dir())
         .map_err(|e| e as Box<dyn std::error::Error>)?;
+    eprintln!("STARTUP-CHECKPOINT: HeadlessRuntime::start() returned");
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    eprintln!("STARTUP-CHECKPOINT: tokio runtime built, entering block_on(run())");
     runtime.block_on(run())
 }
 
@@ -188,6 +213,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into();
     std::env::set_var("REDFOG_LOGIN_SOCKET", &login_socket_path);
 
+    eprintln!("STARTUP-CHECKPOINT: run() reached, calling SessionManager::new()");
     let session_manager = SessionManager::new(SessionConfig {
         bind_addr,
         video_port,
@@ -203,6 +229,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         allow_concurrent_sessions_per_user,
     })
     .await?;
+    eprintln!("STARTUP-CHECKPOINT: SessionManager::new() returned");
 
     let pairing_server = Arc::new(PairingServer {
         clients: clients.clone(),
