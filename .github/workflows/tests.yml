@@ -176,8 +176,28 @@ jobs:
             echo "--- processes by elapsed time ---"
             ps -eo pid,ppid,stat,etimes,cmd --sort=-etimes 2>&1 | head -40 || true
             echo "--- /proc detail for redfog/compositor/dbus/pipewire processes ---"
-            for pid in $(pgrep -f 'redfog|kwin_wayland|dbus-daemon|dbus-run-session|pipewire' 2>/dev/null); do
-              comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
+            # Matched by /proc/<pid>/comm (the short process name), NOT by
+            # `pgrep -f` against the full command line: confirmed live the
+            # latter also matched `rustc`/`cargo-llvm-cov` invocations
+            # merely *building* a crate named redfog-core (its --crate-name
+            # argument contains "redfog"), spawning a `sudo` subprocess per
+            # match, every 10s, throughout active compilation -- correlated
+            # live with two consecutive runs dying abruptly (no panic, no
+            # failing test, no OOM per the memory check above) shortly
+            # after a burst of these diagnostics for rustc/cargo pids, one
+            # of them mid-*build* (never even reached the test-running
+            # phase) -- this wrapper perturbing the very thing it's meant
+            # to just observe, not the original hang, most likely explains
+            # both. `comm` is real process identity, not a substring of
+            # arbitrary arguments, so this can't match a build tool that
+            # merely mentions "redfog" in passing.
+            for pid in /proc/[0-9]*; do
+              pid="${pid#/proc/}"
+              comm="$(cat "/proc/$pid/comm" 2>/dev/null)" || continue
+              case "$comm" in
+                redfog*|kwin_wayland|dbus-daemon|dbus-run-sess*|pipewire*) ;;
+                *) continue ;;
+              esac
               state="$(awk '/^State:/{print $0}' "/proc/$pid/status" 2>/dev/null)"
               wchan="$(cat "/proc/$pid/wchan" 2>/dev/null; echo)"
               syscall="$(cat "/proc/$pid/syscall" 2>/dev/null || true)"
