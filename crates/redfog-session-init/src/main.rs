@@ -125,17 +125,17 @@
 //! session (`pam_kwallet5.so`'s session hook can only unlock with a
 //! password its own `auth` hook captured moments earlier on the *same*
 //! PAM transaction). Never passed via argv (readable by any local user via
-//! `/proc/<pid>/cmdline`) or an inherited pipe fd (this process is started
-//! by systemd from a unit file's `ExecStart=`, which has no generic
-//! mechanism to hand an arbitrary broker-owned fd into it either —
-//! confirmed live, `systemd-run --help` offers only `--pipe` for stdio and
-//! nothing like `--fd=`, and a unit file has no equivalent directive).
-//! Instead: the broker writes it to a `0600`-mode, root-owned temp file
-//! inside this session's own `runtime_dir` immediately before spawning,
-//! passed via `REDFOG_SESSION_PASSWORD_FILE`; this process reads it first
-//! thing and unlinks it immediately after, before doing anything else —
-//! the same exposure window a pipe would have given, just without needing
-//! fd-passing machinery that doesn't exist for this spawn path.
+//! `/proc/<pid>/cmdline`) and never written to a file on either end either:
+//! `spawn_via_pam` (`redfog-broker/src/session.rs`) uses systemd's own
+//! `LoadCredential=` unit directive, pointed at an `AF_UNIX` *stream
+//! socket* the broker binds rather than a plain file path — systemd itself
+//! connects to that socket once, at process invocation, and reads the
+//! password straight off the connection. This process just reads the
+//! result back out of systemd's own credential store,
+//! `$CREDENTIALS_DIRECTORY/password` — a location systemd itself backs
+//! with non-swappable memory where possible, exposes read-only, and tears
+//! down automatically when this unit stops (crash or not), so there's
+//! nothing for this process to unlink itself either.
 //!
 //! ## Reporting the logind session id back
 //!
@@ -166,7 +166,7 @@ fn main() {
     let username = &args[0];
     let (command, command_args) = args[2..].split_first().expect("checked len above");
 
-    let mut password = read_and_delete_password_file().unwrap_or_else(|e| {
+    let mut password = read_password_credential().unwrap_or_else(|e| {
         eprintln!("redfog-session-init: {e}");
         std::process::exit(1);
     });
@@ -318,16 +318,17 @@ fn zero_string(s: &mut String) {
     s.clear();
 }
 
-/// Reads the password `redfog-broker` wrote to a short-lived file (see this
-/// module's own doc comment for why a temp file instead of an inherited
-/// pipe fd) and unlinks it immediately — minimizing how long the plaintext
-/// sits on disk at all, and ensuring it's gone even if this process exits
-/// abnormally right after.
-fn read_and_delete_password_file() -> Result<String, String> {
-    let path = std::env::var("REDFOG_SESSION_PASSWORD_FILE").map_err(|_| "REDFOG_SESSION_PASSWORD_FILE not set".to_string())?;
-    let password = std::fs::read_to_string(&path).map_err(|e| format!("failed to read password file {path}: {e}"))?;
-    let _ = std::fs::remove_file(&path);
-    Ok(password)
+/// Reads the password back out of systemd's own credential store — see
+/// this module's own doc comment for why it ends up there
+/// (`LoadCredential=password:<socket-path>` on the unit, systemd itself
+/// having connected to the broker's socket and streamed it in). No unlink
+/// needed: `$CREDENTIALS_DIRECTORY` is systemd-managed and torn down
+/// automatically when this unit stops, crash or not.
+fn read_password_credential() -> Result<String, String> {
+    let dir = std::env::var("CREDENTIALS_DIRECTORY")
+        .map_err(|_| "CREDENTIALS_DIRECTORY not set -- was LoadCredential=password:... dropped from the unit?".to_string())?;
+    let path = format!("{dir}/password");
+    std::fs::read_to_string(&path).map_err(|e| format!("failed to read password credential {path}: {e}"))
 }
 
 /// Login+password answers for the PAM conversation callback below — a

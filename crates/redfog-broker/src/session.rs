@@ -450,19 +450,28 @@ impl SessionManager {
     ///   session's own private, per-spawn sandbox `runtime_dir`, which is
     ///   the one actually wanted here — so it stays explicit below, same as
     ///   before.
-    /// - No inherited pipe fd for the password or the reported-back logind
-    ///   session id, despite the original plan draft assuming one:
-    ///   **confirmed live** that `systemd-run` (and, by the same
-    ///   mechanism, a plain `systemctl start` of a unit file — neither
-    ///   forks the target process directly) has no generic way to hand an
-    ///   arbitrary caller-owned fd into a service's exec step at all
-    ///   (`systemd-run --help` offers only `--pipe` for stdio, fds 0-2,
-    ///   nothing like `--fd=`; a unit file has no equivalent directive
-    ///   either). Both instead go through short-lived, root-owned
-    ///   (`0600`) files inside this session's own `runtime_dir` — see
-    ///   `redfog-session-init`'s own doc comment for the exact handshake
-    ///   and why that's an equivalent (not weaker) exposure window to a
-    ///   pipe would have been.
+    /// - No inherited pipe fd for the password, despite the original plan
+    ///   draft assuming one: **confirmed live** that `systemd-run` (and, by
+    ///   the same mechanism, a plain `systemctl start` of a unit file —
+    ///   neither forks the target process directly) has no generic way to
+    ///   hand an arbitrary caller-owned fd into a service's exec step at
+    ///   all (`systemd-run --help` offers only `--pipe` for stdio, fds
+    ///   0-2, nothing like `--fd=`; a unit file has no equivalent
+    ///   directive either). Used systemd's own `LoadCredential=` mechanism
+    ///   instead, pointed at an `AF_UNIX` *stream socket* rather than a
+    ///   plain file (`man systemd.exec`'s CREDENTIALS section — confirmed
+    ///   on this machine, systemd 261): systemd itself connects to it
+    ///   once, at process invocation, and reads the credential straight
+    ///   off that connection, exposing it to the unit's processes at
+    ///   `$CREDENTIALS_DIRECTORY/password` — read-only, backed by
+    ///   non-swappable memory where possible, and torn down automatically
+    ///   when the unit stops, crash or not. The password is never written
+    ///   to a file at all, on either end — an actual improvement over the
+    ///   original plan's inherited-pipe idea, not just a workaround for
+    ///   its unavailability. The reported-back logind session id still
+    ///   goes through a plain file (`REDFOG_SESSION_ID_REPORT_FILE`) —
+    ///   that direction carries no secret, so there's nothing this
+    ///   mechanism buys it.
     /// - The mount-namespace sandboxing (`TemporaryFileSystem=`/
     ///   `BindPaths=`, see `device_sandbox_systemd_directives`) goes back
     ///   to being plain lines inside the `.service` unit file, exactly as
@@ -583,18 +592,54 @@ impl SessionManager {
         let session_init_path = session_init_path()?;
         let pipewire_session_path = pipewire_session_path()?;
 
-        // Secure secret passing — see `spawn_via_pam`'s own doc comment and
-        // `redfog-session-init`'s for why a short-lived, root-owned 0600
-        // file (not an inherited pipe fd) is used for both directions.
-        // Written *inside* `runtime_dir` (not `/tmp` directly) so both ends
-        // agree on the path via nothing but the already-known
-        // `runtime_dir`, and so cleanup happens automatically whenever the
-        // session's own runtime dir is eventually cleaned up even if
-        // something crashes before either side removes its own file.
-        let password_file_path = format!("{runtime_dir}/pam-password");
-        std::fs::write(&password_file_path, password).map_err(|e| format!("failed to write {password_file_path}: {e}"))?;
-        std::fs::set_permissions(&password_file_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("failed to chmod {password_file_path}: {e}"))?;
+        // Secure secret passing — see `spawn_via_pam`'s own doc comment for
+        // why this goes through systemd's own `LoadCredential=` mechanism
+        // (pointed at an AF_UNIX *stream socket*, not a plain file):
+        // systemd itself connects to this socket once, as part of actually
+        // starting the unit below, and reads the password straight off
+        // that connection — it's never written to a file at all, on either
+        // end. Bound *inside* `runtime_dir` (not `/tmp` directly) so both
+        // ends agree on the path via nothing but the already-known
+        // `runtime_dir`.
+        let password_socket_path = format!("{runtime_dir}/pam-password.sock");
+        let _ = std::fs::remove_file(&password_socket_path); // stale leftover, defensive only -- runtime_dir is freshly created above
+        let password_listener =
+            tokio::net::UnixListener::bind(&password_socket_path).map_err(|e| format!("failed to bind {password_socket_path}: {e}"))?;
+        {
+            // Detached: has to run *concurrently* with the `systemctl
+            // start` call further down, since systemd only connects to
+            // this socket as part of that unit actually starting, not
+            // before it — this can't be awaited inline here first.
+            // Bounded so a unit that never actually starts (or never
+            // reaches the LoadCredential= step) doesn't leave this task
+            // waiting forever.
+            let mut password_to_send = password.to_string();
+            let socket_path_for_task = password_socket_path.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                match tokio::time::timeout(Duration::from_secs(20), password_listener.accept()).await {
+                    Ok(Ok((mut stream, _))) => {
+                        if let Err(e) = stream.write_all(password_to_send.as_bytes()).await {
+                            tracing::warn!("failed to write password credential to {socket_path_for_task}: {e}");
+                        }
+                    }
+                    Ok(Err(e)) => tracing::warn!("accept() on {socket_path_for_task} failed: {e}"),
+                    Err(_) => tracing::warn!(
+                        "nothing connected to {socket_path_for_task} within 20s -- systemd never read the password credential (unit \
+                         failed to start?)"
+                    ),
+                }
+                // Zeroed the same way redfog-session-init zeroes its own
+                // copy -- not left to a plain drop.
+                unsafe {
+                    for b in password_to_send.as_bytes_mut() {
+                        *b = 0;
+                    }
+                }
+                password_to_send.clear();
+                let _ = std::fs::remove_file(&socket_path_for_task);
+            });
+        }
         let session_id_report_path = format!("{runtime_dir}/pam-session-id");
         let _ = std::fs::remove_file(&session_id_report_path); // stale leftover, defensive only -- runtime_dir is freshly created above
 
@@ -649,8 +694,8 @@ impl SessionManager {
              Environment=XDG_DATA_DIRS=/usr/local/share:/usr/share\n\
              Environment=XDG_CONFIG_DIRS=/etc/xdg\n\
              Environment=XDG_MENU_PREFIX=plasma-\n\
-             Environment=REDFOG_SESSION_PASSWORD_FILE={password_file_path}\n\
-             Environment=REDFOG_SESSION_ID_REPORT_FILE={session_id_report_path}\n"
+             Environment=REDFOG_SESSION_ID_REPORT_FILE={session_id_report_path}\n\
+             LoadCredential=password:{password_socket_path}\n"
         );
         // TEMPORARY debugging aid: kwin_wayland's own logging is otherwise
         // silent about most of what it does. `kwin_screencast` is the
@@ -695,7 +740,7 @@ impl SessionManager {
             grant_acl(&server_user, &wayland_socket_path, "rw", "connect to").await;
         }
         if let Err(e) = run_systemctl(&["start", &format!("{unit_name}.service")]).await {
-            let _ = std::fs::remove_file(&password_file_path);
+            let _ = std::fs::remove_file(&password_socket_path);
             return Err(e);
         }
 
