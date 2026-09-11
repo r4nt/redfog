@@ -2336,8 +2336,46 @@ impl SessionManager {
                     .map(str::to_string)
                     .or_else(|| std::env::var("PIPEWIRE_REMOTE").ok())
                     .unwrap_or_else(|| "pipewire-0".to_string());
-                let audio_loopback = AudioLoopback::spawn("redfog-user-0", &pipewire_socket_path)
-                    .map_err(|e| format!("failed to spawn audio loopback for redfog-user-0: {e}"))?;
+                // Bounded, and never fails the whole handoff on its own --
+                // a session should still come up (silently, via
+                // `build_pipelines`'s own `None` -> `make_silent_audio_
+                // pipeline` fallback, same as Login already uses) rather
+                // than hang or abort outright on a machine with no audio
+                // hardware. `AudioLoopback::spawn` itself is already
+                // internally bounded now (both its own blocking `pw-dump`/
+                // `pw-metadata` calls go through `run_command_with_timeout`
+                // — confirmed live those can hang indefinitely against a
+                // PipeWire daemon whose wireplumber died mid-transaction,
+                // e.g. for lack of real audio hardware to enumerate) --
+                // this outer bound is defense in depth against that inner
+                // bookkeeping ever regressing, and `spawn_blocking` keeps
+                // even the *bounded* worst case (~10s) off this task's own
+                // tokio worker thread.
+                let audio_loopback_start = std::time::Instant::now();
+                let audio_loopback = match tokio::time::timeout(
+                    Duration::from_secs(15),
+                    tokio::task::spawn_blocking(move || AudioLoopback::spawn("redfog-user-0", &pipewire_socket_path)),
+                )
+                .await
+                {
+                    Ok(Ok(Ok(loopback))) => Some(loopback),
+                    Ok(Ok(Err(e))) => {
+                        tracing::warn!("AudioLoopback::spawn failed for redfog-user-0, continuing without audio: {e}");
+                        None
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("AudioLoopback::spawn task panicked for redfog-user-0, continuing without audio: {e}");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            "AudioLoopback::spawn did not complete within 15s for redfog-user-0 (should be unreachable -- it's internally \
+                             bounded well under this), continuing without audio"
+                        );
+                        None
+                    }
+                };
+                tracing::info!("handoff_to_user: AudioLoopback::spawn for redfog-user-0 finished after {:?}", audio_loopback_start.elapsed());
                 let generation = self.next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let selected = reported.and_then(|r| r.selected);
                 (
@@ -2351,7 +2389,7 @@ impl SessionManager {
                         generation,
                         origin,
                         selected,
-                        Some(audio_loopback),
+                        audio_loopback,
                     )?,
                     false,
                 )

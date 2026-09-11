@@ -1773,14 +1773,43 @@ pub struct AudioLoopback {
     pipewire_socket_path: String,
 }
 
+/// Runs `cmd` on its own thread and waits up to `timeout` for it to finish,
+/// returning `None` if it didn't -- that thread is then abandoned (leaked)
+/// rather than blocking the caller any further, the same bounded-cost
+/// tradeoff `redfog-moonlight`'s own `run_with_timeout` documents (one
+/// stuck thread, not an unbounded hang). Needed because a bare
+/// `Command::output()` has no timeout of its own: **confirmed live** that
+/// `pw-dump`/`pw-metadata` can hang indefinitely waiting for a round-trip
+/// reply from a PipeWire daemon whose session manager (wireplumber) died
+/// mid-transaction -- the case on any machine with no real audio hardware
+/// for wireplumber's ALSA monitor to enumerate (a bare CI container,
+/// concretely). A plain retry loop that only checks `Instant::now() <
+/// deadline` *between* attempts doesn't actually bound anything if a
+/// single attempt itself never returns control -- both call sites below
+/// used to do exactly that.
+fn run_command_with_timeout(mut cmd: Command, timeout: Duration) -> Option<std::io::Result<std::process::Output>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(cmd.output());
+    });
+    rx.recv_timeout(timeout).ok()
+}
+
 /// Polls `pw-dump` for a node whose `node.name` is `name`, up to `timeout`
 /// — see `AudioLoopback::spawn`'s doc comment for why this exists: without
 /// it, any race between PipeWire node instantiation and clients starting to
-/// play audio could lead to audio routing issues.
+/// play audio could lead to audio routing issues. Each `pw-dump` attempt
+/// itself goes through `run_command_with_timeout`, bounded by whatever's
+/// left of the overall `timeout` — see that function's own doc comment for
+/// why the attempt itself, not just the loop around it, needs its own
+/// bound.
 fn wait_for_pipewire_node(pipewire_socket_path: &str, name: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if let Ok(output) = Command::new("pw-dump").env("PIPEWIRE_REMOTE", pipewire_socket_path).output() {
+        let remaining = timeout.saturating_sub(start.elapsed()).max(Duration::from_millis(50));
+        let mut cmd = Command::new("pw-dump");
+        cmd.env("PIPEWIRE_REMOTE", pipewire_socket_path);
+        if let Some(Ok(output)) = run_command_with_timeout(cmd, remaining) {
             if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(name) {
                 return true;
             }
@@ -1833,21 +1862,34 @@ impl AudioLoopback {
         // wireplumber itself needed. Best-effort: a session should still
         // work (just possibly without audio) rather than fail outright if
         // `pw-metadata` is missing or this particular PipeWire build wires
-        // default-node selection differently.
-        match Command::new("pw-metadata")
-            .env("PIPEWIRE_REMOTE", pipewire_socket_path)
-            .args(["-n", "default", "0", "default.configured.audio.sink", &format!(r#"{{"name":"{sink_name}"}}"#)])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
+        // default-node selection differently — including, now, if it
+        // never returns at all: **confirmed live** that `pw-metadata`
+        // (like `pw-dump` above) can hang indefinitely against a daemon
+        // whose wireplumber died mid-transaction (no audio hardware for it
+        // to enumerate), so this goes through `run_command_with_timeout`
+        // too rather than a bare `Command::output()`.
+        let mut cmd = Command::new("pw-metadata");
+        cmd.env("PIPEWIRE_REMOTE", pipewire_socket_path).args([
+            "-n",
+            "default",
+            "0",
+            "default.configured.audio.sink",
+            &format!(r#"{{"name":"{sink_name}"}}"#),
+        ]);
+        match run_command_with_timeout(cmd, Duration::from_secs(5)) {
+            Some(Ok(output)) if output.status.success() => {
                 eprintln!("redfog-core: set default.configured.audio.sink to {sink_name}");
             }
-            Ok(output) => eprintln!(
+            Some(Ok(output)) => eprintln!(
                 "redfog-core: pw-metadata set default.configured.audio.sink to {sink_name} exited with {}: {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             ),
-            Err(e) => eprintln!("redfog-core: failed to run pw-metadata to set default.configured.audio.sink to {sink_name}: {e}"),
+            Some(Err(e)) => eprintln!("redfog-core: failed to run pw-metadata to set default.configured.audio.sink to {sink_name}: {e}"),
+            None => eprintln!(
+                "redfog-core: pw-metadata to set default.configured.audio.sink to {sink_name} did not complete within 5s \
+                 (PipeWire's session manager may be unavailable, e.g. no audio hardware) — continuing without audio routing"
+            ),
         }
 
         Ok(Self {
@@ -2091,6 +2133,53 @@ mod tests {
     fn audio_pipeline_uses_constant_bitrate_opus() {
         let desc = audio_pipeline_description("some-capture-node", "some-client");
         assert!(desc.contains("bitrate-type=cbr"), "pipeline description: {desc}");
+    }
+
+    /// Guards the actual fix for a real, confirmed hang: **`pw-dump`/
+    /// `pw-metadata` can block indefinitely** against a PipeWire daemon
+    /// whose wireplumber died mid-transaction (e.g. a machine/CI container
+    /// with no real audio hardware for it to enumerate) — confirmed live
+    /// this wedged `redfog-server` permanently (every login spawns a fresh
+    /// `AudioLoopback`, each one stranding one more tokio worker thread,
+    /// until the whole process starved). `sleep 5` here stands in for that
+    /// hang: a command that will never return control to its caller on its
+    /// own. If `run_command_with_timeout` didn't actually bound it, this
+    /// test itself would hang for 5s+ instead of finishing in well under
+    /// 1s.
+    #[test]
+    fn run_command_with_timeout_bounds_a_command_that_never_returns() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("5");
+        let start = Instant::now();
+        let result = run_command_with_timeout(cmd, Duration::from_millis(200));
+        assert!(result.is_none(), "expected the hung command to time out, got {result:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "run_command_with_timeout took {:?} to bound a command with a 200ms timeout -- not actually bounded",
+            start.elapsed()
+        );
+    }
+
+    /// Same guard, at the level actually used by `AudioLoopback::spawn`:
+    /// `wait_for_pipewire_node`'s own retry loop must give up within
+    /// (approximately) its `timeout` budget. This test can't spin up a
+    /// real PipeWire daemon with a wireplumber that dies mid-transaction
+    /// (that repro was done manually, live — see this function's own doc
+    /// comment), so it only exercises the retry-loop budget accounting
+    /// itself, against a `pw-dump` that doesn't exist at all (a socket
+    /// path pointing nowhere) — the coverage that matters here is that the
+    /// loop's own deadline math is correct, since `run_command_with_timeout`
+    /// bounding each individual attempt is already covered above.
+    #[test]
+    fn wait_for_pipewire_node_gives_up_within_its_timeout_when_pw_dump_is_missing() {
+        let start = Instant::now();
+        let found = wait_for_pipewire_node("/nonexistent-socket", "redfog-audio-sink", Duration::from_millis(300));
+        assert!(!found);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "wait_for_pipewire_node took {:?} against a 300ms timeout",
+            start.elapsed()
+        );
     }
 
     /// Guards against the Login stage silently regressing back to a real
