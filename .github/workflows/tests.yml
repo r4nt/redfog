@@ -191,11 +191,40 @@ jobs:
         # to lose by not touching compiler processes in detail, only
         # counting them.
         #
-        # Best-effort throughout (`sudo cat .../stack` commonly fails
-        # outright on a locked-down runner kernel), hence the `|| true`s,
-        # so a permission failure here never itself fails the job. Remove
-        # this wrapper (back to a plain `cargo test ...` line) once
-        # whatever's actually happening is root-caused and fixed.
+        # The actual, confirmed cause of every one of this wrapper's own
+        # earlier abrupt "no error, just stops" deaths (not a hang, not the
+        # runner being killed, and not really the build-tool/false-positive
+        # theories above, though those remain worth keeping): a *shell
+        # scripting bug in this wrapper itself*, unrelated to redfog. This
+        # step runs under `bash -e`. The PID->PPid map-building loop reads
+        # `< "/proc/$p/status"` for every entry `/proc/[0-9]*` glob-expanded
+        # a moment earlier -- but /proc is constantly changing (especially
+        # during active compilation or test execution, exactly when this
+        # loop runs), and a process that exits in the gap between the glob
+        # expansion and the redirection actually opening makes that
+        # redirection fail. `2>/dev/null` only silences the *printed*
+        # error; it does not stop the failed redirection's exit status from
+        # being a top-level command failure, which `-e` treats as fatal --
+        # killing the entire script (and, with it, whatever `cargo test`
+        # was mid-way through). Directly reproduced locally: an unguarded
+        # version of this exact construct, pointed at a pid that doesn't
+        # exist, exits the whole script with the identical error text CI
+        # showed ("No such file or directory") and status 1; adding
+        # `|| continue` after the redirection (skip this one pid, keep
+        # going) fixes it, confirmed by the same repro finishing normally.
+        # A run with this fixed did survive long enough to reach a genuine,
+        # reproducible hang inside `hevc_post_handoff_nvenc_direct_encode_
+        # stays_up` (stuck for 6.5+ minutes straight) -- that's the actual
+        # thing still to root-cause, once this wrapper can reliably survive
+        # long enough to show its /proc detail.
+        #
+        # Best-effort throughout otherwise (`sudo cat .../stack` commonly
+        # fails outright on a locked-down runner kernel -- confirmed live
+        # via `dmesg`, these are ptrace-denied by the runner's own LSM
+        # policy, not a bug, hence the `|| true`s so a permission failure
+        # here never itself fails the job). Remove this wrapper (back to a
+        # plain `cargo test ...` line) once the real hang above is
+        # root-caused and fixed.
         run: |
           source <(cargo llvm-cov show-env --sh)
           cargo test --workspace --exclude kwin-capture -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test &
@@ -223,7 +252,7 @@ jobs:
                     break
                     ;;
                 esac
-              done < "/proc/$p/status" 2>/dev/null
+              done < "/proc/$p/status" 2>/dev/null || continue
               if [ -n "$ppid" ]; then
                 PPID_OF["$p"]="$ppid"
                 CHILDREN["$ppid"]+="$p "
