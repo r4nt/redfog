@@ -140,23 +140,43 @@ jobs:
         #
         # TEMPORARY diagnostic wrapper: a run on 2026-09-11 hung for over an
         # hour on this exact step (confirmed not just "slow CI hardware" --
-        # the same suite finishes in well under 10 minutes locally); a
-        # second run instead died abruptly mid-test with no error message
-        # at all (no panic, no failing test -- just stopped, consistent
-        # with the runner itself being killed, e.g. OOM), so this covers
-        # both failure shapes, not just a hang. Backgrounds the real
-        # `cargo test` invocation and polls every 10s while it's still
-        # running: memory usage, a recent kernel-log tail (best-effort --
-        # catches an OOM kill if CAP_SYSLOG allows reading it), the process
-        # list by elapsed time (to spot one stuck far longer than
-        # everything else), and, for anything that looks like ours
-        # (matches both hyphenated production binaries like
-        # `redfog-broker` *and* underscored cargo test-harness binaries
-        # like `redfog_core-<hash>` -- confirmed live the hyphen-only
-        # version of this pattern missed the second run's own death
-        # entirely, since it died inside a test-harness process, not a
-        # spawned subprocess), its /proc state/wchan/kernel stack --
-        # best-effort throughout (`sudo cat .../stack` commonly fails
+        # the same suite finishes in well under 10 minutes locally).
+        # A **confirmed, persistent** finding from a later run (30-minute
+        # job timeout, cancelled): three zombie processes (dbus-daemon,
+        # pipewire, pipewire-pulse) were already zombies at the very first
+        # 10s check and stayed zombies for the full 22+ minutes until
+        # cancellation -- something spawned by this suite is never reaping
+        # its own dead children, and the job's own cleanup log separately
+        # confirms the real *stuck* process was the test harness binary
+        # itself (`Terminate orphan process: pid (30254)
+        # (connection_integration-<hash>)`), not the redfog-broker/server
+        # processes it spawns (those were just idling normally,
+        # `futex_do_wait`, waiting for the stuck harness to ask them for
+        # anything).
+        #
+        # Backgrounds the real `cargo test` invocation and polls every 10s
+        # while it's still running, dumping /proc state/wchan/kernel
+        # stack/PPid for *every real descendant* of the test-harness
+        # process (not a name-based allowlist -- an earlier version of this
+        # wrapper used one, and it missed both the stuck
+        # connection_integration binary itself, *and* separately, via an
+        # overly broad `pgrep -f` against full command lines, matched
+        # rustc/cargo-llvm-cov invocations merely *building* a crate named
+        # redfog-core -- confirmed live that spawned a `sudo` subprocess
+        # per match every 10s during active compilation, and correlates
+        # with two consecutive runs dying abruptly with no error at all,
+        # one of them mid-*build*, i.e. this wrapper perturbing the very
+        # thing it's meant to observe, not the original hang).
+        #
+        # The descendant walk builds the whole PID->PPid map with pure bash
+        # builtins first (reading /proc/*/status directly), not by shelling
+        # out to `awk`/`ps` once per process -- confirmed live the naive
+        # version of this took 11.6s for just 560 processes (dominated by
+        # per-process subprocess-spawn overhead alone), far too slow for a
+        # 10s poll interval; the builtin-only version does the same map
+        # build in under 50ms.
+        #
+        # Best-effort throughout (`sudo cat .../stack` commonly fails
         # outright on a locked-down runner kernel), hence the `|| true`s,
         # so a permission failure here never itself fails the job. Remove
         # this wrapper (back to a plain `cargo test ...` line) once
@@ -175,35 +195,39 @@ jobs:
             sudo dmesg --time-format=iso 2>/dev/null | tail -20 || true
             echo "--- processes by elapsed time ---"
             ps -eo pid,ppid,stat,etimes,cmd --sort=-etimes 2>&1 | head -40 || true
-            echo "--- /proc detail for redfog/compositor/dbus/pipewire processes ---"
-            # Matched by /proc/<pid>/comm (the short process name), NOT by
-            # `pgrep -f` against the full command line: confirmed live the
-            # latter also matched `rustc`/`cargo-llvm-cov` invocations
-            # merely *building* a crate named redfog-core (its --crate-name
-            # argument contains "redfog"), spawning a `sudo` subprocess per
-            # match, every 10s, throughout active compilation -- correlated
-            # live with two consecutive runs dying abruptly (no panic, no
-            # failing test, no OOM per the memory check above) shortly
-            # after a burst of these diagnostics for rustc/cargo pids, one
-            # of them mid-*build* (never even reached the test-running
-            # phase) -- this wrapper perturbing the very thing it's meant
-            # to just observe, not the original hang, most likely explains
-            # both. `comm` is real process identity, not a substring of
-            # arbitrary arguments, so this can't match a build tool that
-            # merely mentions "redfog" in passing.
-            for pid in /proc/[0-9]*; do
-              pid="${pid#/proc/}"
-              comm="$(cat "/proc/$pid/comm" 2>/dev/null)" || continue
-              case "$comm" in
-                redfog*|kwin_wayland|dbus-daemon|dbus-run-sess*|pipewire*) ;;
-                *) continue ;;
-              esac
-              state="$(awk '/^State:/{print $0}' "/proc/$pid/status" 2>/dev/null)"
-              wchan="$(cat "/proc/$pid/wchan" 2>/dev/null; echo)"
-              syscall="$(cat "/proc/$pid/syscall" 2>/dev/null || true)"
-              echo "pid=$pid comm=$comm $state wchan=$wchan"
-              [ -n "$syscall" ] && echo "  syscall: $syscall"
-              sudo cat "/proc/$pid/stack" 2>/dev/null | sed 's/^/  stack: /' || true
+            echo "--- full descendant tree of the test harness (pid $TEST_PID) ---"
+            declare -A CHILDREN=() PPID_OF=()
+            for p in /proc/[0-9]*; do
+              p="${p#/proc/}"
+              ppid=""
+              while IFS= read -r line; do
+                case "$line" in
+                  PPid:*)
+                    ppid="${line#PPid:}"
+                    ppid="${ppid//[[:space:]]/}"
+                    break
+                    ;;
+                esac
+              done < "/proc/$p/status" 2>/dev/null
+              if [ -n "$ppid" ]; then
+                PPID_OF["$p"]="$ppid"
+                CHILDREN["$ppid"]+="$p "
+              fi
+            done
+            queue=("$TEST_PID")
+            while [ "${#queue[@]}" -gt 0 ]; do
+              cur="${queue[0]}"
+              queue=("${queue[@]:1}")
+              for pid in ${CHILDREN[$cur]:-}; do
+                comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
+                state="$(awk '/^State:/{print $0}' "/proc/$pid/status" 2>/dev/null)"
+                wchan="$(cat "/proc/$pid/wchan" 2>/dev/null; echo)"
+                syscall="$(cat "/proc/$pid/syscall" 2>/dev/null || true)"
+                echo "pid=$pid ppid=${PPID_OF[$pid]} comm=$comm $state wchan=$wchan"
+                [ -n "$syscall" ] && echo "  syscall: $syscall"
+                sudo cat "/proc/$pid/stack" 2>/dev/null | sed 's/^/  stack: /' || true
+                queue+=("$pid")
+              done
             done
             echo "::endgroup::"
           done
