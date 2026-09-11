@@ -176,6 +176,21 @@ jobs:
         # 10s poll interval; the builtin-only version does the same map
         # build in under 50ms.
         #
+        # Known build-tool processes (rustc/cargo/cc/ld/...) are excluded
+        # from the expensive per-process detail (state/wchan/`sudo cat
+        # .../stack`) and never walked into for their own children either --
+        # confirmed live, even with the *correct* descendant-tree filter
+        # above (no false-positive matches this time), the runner still
+        # died within ~2s of a diagnostics block that `sudo cat`'d several
+        # actively-running rustc/cargo-llvm-cov processes mid-*build*,
+        # matching the same "dies right after this wrapper touches active
+        # compiler processes" pattern from two earlier runs. The original
+        # hang was never observed during the build phase in any run --
+        # every real finding (the persistent zombies, the stuck harness
+        # binary) came from the test-*running* phase -- so there's nothing
+        # to lose by not touching compiler processes in detail, only
+        # counting them.
+        #
         # Best-effort throughout (`sudo cat .../stack` commonly fails
         # outright on a locked-down runner kernel), hence the `|| true`s,
         # so a permission failure here never itself fails the job. Remove
@@ -214,12 +229,35 @@ jobs:
                 CHILDREN["$ppid"]+="$p "
               fi
             done
+            build_tool_count=0
             queue=("$TEST_PID")
             while [ "${#queue[@]}" -gt 0 ]; do
               cur="${queue[0]}"
               queue=("${queue[@]:1}")
               for pid in ${CHILDREN[$cur]:-}; do
                 comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
+                case "$comm" in
+                  rustc|cargo|cargo-llvm-cov|cc1|cc1plus|cc|gcc|clang*|ld|ld.lld|ld.bfd|ld.gold|as)
+                    # Known build-tool processes: never the site of the
+                    # original hang (every finding so far points at the
+                    # *test-running* phase, not the build) -- confirmed
+                    # live that hammering these with `sudo cat .../stack`
+                    # every 10s during active parallel compilation
+                    # correlates with the runner itself dying within
+                    # seconds, three separate times (the second and third
+                    # via this exact wrapper, once even with the fixed
+                    # comm-based/descendant-tree filters correctly finding
+                    # only *real* rustc/cargo-llvm-cov descendants, so it
+                    # isn't only about false-positive matches). Just count
+                    # them (still a useful signal: "compilation still in
+                    # progress") and don't recurse into their own children
+                    # either -- a build script like pam-sys's own
+                    # bindgen/clang invocation can fan out further, same
+                    # risk.
+                    build_tool_count=$((build_tool_count + 1))
+                    continue
+                    ;;
+                esac
                 state="$(awk '/^State:/{print $0}' "/proc/$pid/status" 2>/dev/null)"
                 wchan="$(cat "/proc/$pid/wchan" 2>/dev/null; echo)"
                 syscall="$(cat "/proc/$pid/syscall" 2>/dev/null || true)"
@@ -229,6 +267,7 @@ jobs:
                 queue+=("$pid")
               done
             done
+            echo "(also $build_tool_count build-tool process(es) -- rustc/cargo/cc/ld/etc -- skipped in detail, not walked further)"
             echo "::endgroup::"
           done
           wait "$TEST_PID"
