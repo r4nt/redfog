@@ -11,6 +11,10 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Confirmed live: without this, a genuine hang (not just a slow run --
+    # see the "Run tests with coverage" step's own comment) burns the
+    # default 360-minute job timeout in full before anything notices.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -133,9 +137,43 @@ jobs:
         # execute (the step above only proves it builds). Run everything
         # else workspace-wide, including crates that never got exercised in
         # CI before this (e.g. redfog-broker's own unit tests).
+        #
+        # TEMPORARY diagnostic wrapper: a run on 2026-09-11 hung for over an
+        # hour on this exact step (confirmed not just "slow CI hardware" --
+        # the same suite finishes in well under 10 minutes locally), cause
+        # not yet known. Backgrounds the real `cargo test` invocation and
+        # polls every 10s while it's still running, printing which
+        # process(es) are alive (by elapsed time, to spot one stuck far
+        # longer than everything else) and, for anything that looks like
+        # one of ours, its /proc state/wchan/kernel stack -- best-effort:
+        # `sudo cat .../stack` commonly fails outright on a locked-down
+        # runner kernel, hence the `|| true`s throughout, so a permission
+        # failure here never itself fails the job. Remove this wrapper
+        # (back to a plain `cargo test ...` line) once the hang is
+        # root-caused and fixed.
         run: |
           source <(cargo llvm-cov show-env --sh)
-          cargo test --workspace --exclude kwin-capture -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test
+          cargo test --workspace --exclude kwin-capture -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test &
+          TEST_PID=$!
+          echo "test harness pid: $TEST_PID"
+          while kill -0 "$TEST_PID" 2>/dev/null; do
+            sleep 10
+            echo "::group::diagnostics at $(date -u +%H:%M:%S) (test harness still running)"
+            echo "--- processes by elapsed time ---"
+            ps -eo pid,ppid,stat,etimes,cmd --sort=-etimes 2>&1 | head -40 || true
+            echo "--- /proc detail for redfog/compositor/dbus/pipewire processes ---"
+            for pid in $(pgrep -f 'redfog-|kwin_wayland|dbus-daemon|dbus-run-session|pipewire' 2>/dev/null); do
+              comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
+              state="$(awk '/^State:/{print $0}' "/proc/$pid/status" 2>/dev/null)"
+              wchan="$(cat "/proc/$pid/wchan" 2>/dev/null; echo)"
+              syscall="$(cat "/proc/$pid/syscall" 2>/dev/null || true)"
+              echo "pid=$pid comm=$comm $state wchan=$wchan"
+              [ -n "$syscall" ] && echo "  syscall: $syscall"
+              sudo cat "/proc/$pid/stack" 2>/dev/null | sed 's/^/  stack: /' || true
+            done
+            echo "::endgroup::"
+          done
+          wait "$TEST_PID"
 
       - name: Coverage summary
         # `cargo llvm-cov report` needs the same show-env vars as the build/
