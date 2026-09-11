@@ -75,8 +75,30 @@ pub fn ensure_private_dbus_session() -> Option<DbusSession> {
     let mut daemon = cmd.spawn().expect("failed to spawn dbus-daemon");
 
     let mut stdout = std::io::BufReader::new(daemon.stdout.take().expect("piped stdout"));
-    let mut address = String::new();
-    stdout.read_line(&mut address).expect("failed to read dbus-daemon's printed address");
+    // Bounded via a helper thread + channel (this runs before any tokio
+    // runtime exists, so `tokio::time::timeout` isn't available yet) rather
+    // than a bare blocking `read_line` -- added after a real CI hang traced
+    // to this exact call. This is the *first* blocking call in
+    // `redfog-server`'s `main()`, before `gstreamer::init()`, before any
+    // log output at all -- an unbounded hang here is completely silent
+    // (nothing printed, ever) and indistinguishable from every other kind
+    // of startup failure. dbus-daemon normally prints its address within
+    // milliseconds, so this bound exists purely to fail loudly and fast
+    // instead of freezing the whole process forever.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut address = String::new();
+        let result = stdout.read_line(&mut address).map(|_| (address, stdout));
+        let _ = tx.send(result);
+    });
+    let (address, stdout) = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok((address, stdout))) => (address, stdout),
+        Ok(Err(e)) => panic!("failed to read dbus-daemon's printed address: {e}"),
+        Err(_) => {
+            let _ = daemon.kill();
+            panic!("dbus-daemon did not print its address within 10s");
+        }
+    };
     let address = address.trim();
     assert!(!address.is_empty(), "dbus-daemon printed an empty address");
     env::set_var("DBUS_SESSION_BUS_ADDRESS", address);
