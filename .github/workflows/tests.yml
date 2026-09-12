@@ -225,9 +225,24 @@ jobs:
         # here never itself fails the job). Remove this wrapper (back to a
         # plain `cargo test ...` line) once the real hang above is
         # root-caused and fixed.
+        #
+        # `--nocapture`: three separate CI runs of the `hevc_client_
+        # negotiates_hevc_and_login_stage_honors_it` hang each showed
+        # *zero* captured output from either redfog-server or redfog-broker
+        # -- not even redfog-broker's own unconditional startup warning,
+        # which always prints within milliseconds. That looked like both
+        # processes were frozen before doing anything at all, and burned
+        # three CI round-trips chasing fixes for startup code that turned
+        # out to be a red herring: without `--nocapture`, `cargo test`
+        # buffers a test's stdout/stderr and only ever prints it once that
+        # test finishes (pass-with-flag, or fail) -- for a test that hangs
+        # forever, whatever it and its child processes already printed
+        # stays buffered and invisible forever, indistinguishable from
+        # "never printed anything". `--nocapture` streams it live instead,
+        # regardless of whether the test ever completes.
         run: |
           source <(cargo llvm-cov show-env --sh)
-          cargo test --workspace --exclude kwin-capture -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test &
+          cargo test --workspace --exclude kwin-capture -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test --nocapture &
           TEST_PID=$!
           echo "test harness pid: $TEST_PID"
           while kill -0 "$TEST_PID" 2>/dev/null; do
