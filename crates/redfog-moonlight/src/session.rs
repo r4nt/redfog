@@ -2411,21 +2411,52 @@ impl SessionManager {
                 tracing::info!("handoff_to_user: AudioLoopback::spawn for redfog-user-0 finished after {:?}", audio_loopback_start.elapsed());
                 let generation = self.next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let selected = reported.and_then(|r| r.selected);
-                (
-                    self.spawn_session(
-                        SessionType::User(resolved_username),
-                        width,
-                        height,
-                        fps,
-                        compositor,
-                        broker_session_id,
-                        generation,
-                        origin,
-                        selected,
-                        audio_loopback,
-                    )?,
-                    false,
+                // Bounded, and off this task's own tokio worker thread --
+                // `spawn_session` -> `build_pipelines` synchronously builds
+                // the real production video/audio pipelines, including (for
+                // `VideoEncoder::NvencDirect`) a real `CudaDirectEncoderSession`
+                // that talks directly to the CUDA/NVENC driver. Strongly
+                // suspected (not yet proven via a live stack trace) to be
+                // the site of a real CI hang in an environment with the
+                // NVIDIA userspace libraries installed for linking only (no
+                // real GPU present at all) -- either way, this call used to
+                // run inline, completely unbounded, unlike every other
+                // blocking GStreamer/CUDA call in this method (the
+                // `AudioLoopback::spawn` call just above, and
+                // `reconcile_video_pipeline` just above that), which is
+                // worth closing regardless. `compositor`/`audio_loopback` are moved
+                // into the closure, so a timeout here can't recover them --
+                // same caveat as `start_streaming`'s own equivalent rebuild
+                // call (see its doc comment): the blocking task keeps
+                // running in the background with no way to cancel it, and
+                // whatever it produces is simply dropped once it eventually
+                // finishes. A bounded, isolated failure of this one handoff
+                // is still far better than wedging the whole server.
+                let spawn_session_start = std::time::Instant::now();
+                let this = self.arc_self();
+                let kind = SessionType::User(resolved_username);
+                let session = match tokio::time::timeout(
+                    Duration::from_secs(30),
+                    tokio::task::spawn_blocking(move || {
+                        this.spawn_session(kind, width, height, fps, compositor, broker_session_id, generation, origin, selected, audio_loopback)
+                    }),
                 )
+                .await
+                {
+                    Ok(Ok(Ok(session))) => session,
+                    Ok(Ok(Err(e))) => return Err(e),
+                    Ok(Err(e)) => return Err(format!("spawn_session task panicked: {e}")),
+                    Err(_) => {
+                        return Err(
+                            "spawn_session did not complete within 30s -- most likely a real GPU/NVENC call \
+                             blocking because no real GPU is present, or a genuinely wedged PipeWire/KWin \
+                             negotiation; giving up rather than hanging this handoff forever"
+                                .to_string(),
+                        );
+                    }
+                };
+                tracing::info!("handoff_to_user: spawn_session finished after {:?}", spawn_session_start.elapsed());
+                (session, false)
             }
         };
         tracing::info!("handoff_to_user: calling start_streaming (is_resume={is_resume}) after {:?} total so far", handoff_start.elapsed());
