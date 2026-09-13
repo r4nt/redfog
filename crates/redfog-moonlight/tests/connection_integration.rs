@@ -3127,6 +3127,20 @@ async fn hevc_client_negotiates_hevc_and_login_stage_honors_it() {
 /// doc comment for the real cost (`request_keyframe` has no effect for HEVC).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hevc_post_handoff_nvenc_direct_encode_stays_up() {
+    // Real runtime hardware probe (opens an actual CUDA context on device
+    // 0), not just "is the nvh264enc GStreamer plugin registered" --
+    // matches the same skip pattern kwin-capture's own CUDA/NVENC tests
+    // already use (see e.g. cuda_direct_nvenc.rs), rather than a blanket
+    // `#[ignore]`: this runs automatically and skips itself with a clear
+    // message on a machine without a real GPU (this CI environment has
+    // none -- see .github/workflows/tests.yml's NVENC-userspace-libraries
+    // step, link-time only), but still actually executes wherever a GPU is
+    // present, CI included, if one is ever added.
+    if !redfog_core::cuda_gpu_available() {
+        eprintln!("no CUDA-capable GPU available — skipping hevc_post_handoff_nvenc_direct_encode_stays_up");
+        return;
+    }
+
     let _ = rustls::crypto::ring::default_provider().install_default();
     let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
 

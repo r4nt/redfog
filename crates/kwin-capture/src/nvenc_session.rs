@@ -103,6 +103,21 @@ impl VideoCodec {
     }
 }
 
+/// Whether a real CUDA-capable GPU is present at all — for tests that
+/// exercise [`CudaDirectEncoderSession`] end to end (unlike
+/// `redfog_core::detect_video_encoder`'s plain GStreamer factory-
+/// registration lookup, which only proves the `nvh264enc` plugin is
+/// *installed*, not that a working GPU backs it — see that function's own
+/// doc comment). A real probe: actually opens a CUDA context on device 0,
+/// same as [`av1_encode_supported`] and `run_encoder` do, just without
+/// going as far as initializing an encoder or listing codec GUIDs. Cached
+/// for the life of the process for the same reason `av1_encode_supported`
+/// is.
+pub fn cuda_gpu_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| cudarc016::driver::CudaContext::new(0).is_ok())
+}
+
 /// Whether this GPU/driver's NVENC can encode AV1 at all (Ada Lovelace+
 /// only) — drives whether the server advertises AV1 to clients at all (see
 /// `redfog-moonlight`'s `pairing`/`rtsp` modules). Cheap after the first

@@ -1723,6 +1723,12 @@ pub use kwin_capture::nvenc_session::VideoCodec;
 /// `redfog-moonlight` gate AV1 advertisement/negotiation on real hardware
 /// support without a direct `kwin-capture` dependency.
 pub use kwin_capture::nvenc_session::av1_encode_supported;
+/// Same re-export reasoning as `CudaDirectEncoderSession` above — lets
+/// tests that need a real GPU (not just the `nvh264enc` plugin being
+/// installed, see `detect_video_encoder`'s own doc comment) skip
+/// themselves gracefully without a direct `kwin-capture`/`cudarc`
+/// dependency.
+pub use kwin_capture::nvenc_session::cuda_gpu_available;
 
 /// [`VideoEncoder::NvencDirect`] counterpart to [`make_encoder_pipeline`] —
 /// same `source`/`bitrate_kbps`/`on_access_unit` shape, but returns a
