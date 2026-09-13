@@ -1,0 +1,15 @@
+# CI hang backstop: several real, one-off hangs in redfog-moonlight's
+# integration tests (a stuck subprocess call, a leaked background tokio
+# task after a panic, and — still unreproduced locally — redfog-broker/
+# redfog-server never receiving SIGTERM during test cleanup) each burned an
+# entire 30-minute CI job before being individually root-caused, one at a
+# time, across several rounds of `--nocapture`-enabled CI runs. Rather than
+# keep chasing each new hang mechanism as it turns up, this makes any
+# future one bounded regardless of cause: a test still running after
+# `period` is marked slow, and killed after `terminate-after` more periods
+# elapse — turning "the whole job hangs for 30 minutes" into "this one test
+# fails after ~90s" once and for all. See .github/workflows/tests.yml's
+# "Run tests with coverage" step for how this replaced a much more
+# complicated (and, in the end, still insufficient) diagnostic wrapper.
+[profile.default]
+slow-timeout = { period = "90s", terminate-after = 1 }

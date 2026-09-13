@@ -101,6 +101,9 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
       - name: Fetch patched vendor dependencies
         run: bash scripts/fetch-patched-deps.sh
 
@@ -138,183 +141,33 @@ jobs:
         # else workspace-wide, including crates that never got exercised in
         # CI before this (e.g. redfog-broker's own unit tests).
         #
-        # TEMPORARY diagnostic wrapper: a run on 2026-09-11 hung for over an
-        # hour on this exact step (confirmed not just "slow CI hardware" --
-        # the same suite finishes in well under 10 minutes locally).
-        # A **confirmed, persistent** finding from a later run (30-minute
-        # job timeout, cancelled): three zombie processes (dbus-daemon,
-        # pipewire, pipewire-pulse) were already zombies at the very first
-        # 10s check and stayed zombies for the full 22+ minutes until
-        # cancellation -- something spawned by this suite is never reaping
-        # its own dead children, and the job's own cleanup log separately
-        # confirms the real *stuck* process was the test harness binary
-        # itself (`Terminate orphan process: pid (30254)
-        # (connection_integration-<hash>)`), not the redfog-broker/server
-        # processes it spawns (those were just idling normally,
-        # `futex_do_wait`, waiting for the stuck harness to ask them for
-        # anything).
-        #
-        # Backgrounds the real `cargo test` invocation and polls every 10s
-        # while it's still running, dumping /proc state/wchan/kernel
-        # stack/PPid for *every real descendant* of the test-harness
-        # process (not a name-based allowlist -- an earlier version of this
-        # wrapper used one, and it missed both the stuck
-        # connection_integration binary itself, *and* separately, via an
-        # overly broad `pgrep -f` against full command lines, matched
-        # rustc/cargo-llvm-cov invocations merely *building* a crate named
-        # redfog-core -- confirmed live that spawned a `sudo` subprocess
-        # per match every 10s during active compilation, and correlates
-        # with two consecutive runs dying abruptly with no error at all,
-        # one of them mid-*build*, i.e. this wrapper perturbing the very
-        # thing it's meant to observe, not the original hang).
-        #
-        # The descendant walk builds the whole PID->PPid map with pure bash
-        # builtins first (reading /proc/*/status directly), not by shelling
-        # out to `awk`/`ps` once per process -- confirmed live the naive
-        # version of this took 11.6s for just 560 processes (dominated by
-        # per-process subprocess-spawn overhead alone), far too slow for a
-        # 10s poll interval; the builtin-only version does the same map
-        # build in under 50ms.
-        #
-        # Known build-tool processes (rustc/cargo/cc/ld/...) are excluded
-        # from the expensive per-process detail (state/wchan/`sudo cat
-        # .../stack`) and never walked into for their own children either --
-        # confirmed live, even with the *correct* descendant-tree filter
-        # above (no false-positive matches this time), the runner still
-        # died within ~2s of a diagnostics block that `sudo cat`'d several
-        # actively-running rustc/cargo-llvm-cov processes mid-*build*,
-        # matching the same "dies right after this wrapper touches active
-        # compiler processes" pattern from two earlier runs. The original
-        # hang was never observed during the build phase in any run --
-        # every real finding (the persistent zombies, the stuck harness
-        # binary) came from the test-*running* phase -- so there's nothing
-        # to lose by not touching compiler processes in detail, only
-        # counting them.
-        #
-        # The actual, confirmed cause of every one of this wrapper's own
-        # earlier abrupt "no error, just stops" deaths (not a hang, not the
-        # runner being killed, and not really the build-tool/false-positive
-        # theories above, though those remain worth keeping): a *shell
-        # scripting bug in this wrapper itself*, unrelated to redfog. This
-        # step runs under `bash -e`. The PID->PPid map-building loop reads
-        # `< "/proc/$p/status"` for every entry `/proc/[0-9]*` glob-expanded
-        # a moment earlier -- but /proc is constantly changing (especially
-        # during active compilation or test execution, exactly when this
-        # loop runs), and a process that exits in the gap between the glob
-        # expansion and the redirection actually opening makes that
-        # redirection fail. `2>/dev/null` only silences the *printed*
-        # error; it does not stop the failed redirection's exit status from
-        # being a top-level command failure, which `-e` treats as fatal --
-        # killing the entire script (and, with it, whatever `cargo test`
-        # was mid-way through). Directly reproduced locally: an unguarded
-        # version of this exact construct, pointed at a pid that doesn't
-        # exist, exits the whole script with the identical error text CI
-        # showed ("No such file or directory") and status 1; adding
-        # `|| continue` after the redirection (skip this one pid, keep
-        # going) fixes it, confirmed by the same repro finishing normally.
-        # A run with this fixed did survive long enough to reach a genuine,
-        # reproducible hang inside `hevc_post_handoff_nvenc_direct_encode_
-        # stays_up` (stuck for 6.5+ minutes straight) -- that's the actual
-        # thing still to root-cause, once this wrapper can reliably survive
-        # long enough to show its /proc detail.
-        #
-        # Best-effort throughout otherwise (`sudo cat .../stack` commonly
-        # fails outright on a locked-down runner kernel -- confirmed live
-        # via `dmesg`, these are ptrace-denied by the runner's own LSM
-        # policy, not a bug, hence the `|| true`s so a permission failure
-        # here never itself fails the job). Remove this wrapper (back to a
-        # plain `cargo test ...` line) once the real hang above is
-        # root-caused and fixed.
-        #
-        # `--nocapture`: three separate CI runs of the `hevc_client_
-        # negotiates_hevc_and_login_stage_honors_it` hang each showed
-        # *zero* captured output from either redfog-server or redfog-broker
-        # -- not even redfog-broker's own unconditional startup warning,
-        # which always prints within milliseconds. That looked like both
-        # processes were frozen before doing anything at all, and burned
-        # three CI round-trips chasing fixes for startup code that turned
-        # out to be a red herring: without `--nocapture`, `cargo test`
-        # buffers a test's stdout/stderr and only ever prints it once that
-        # test finishes (pass-with-flag, or fail) -- for a test that hangs
-        # forever, whatever it and its child processes already printed
-        # stays buffered and invisible forever, indistinguishable from
-        # "never printed anything". `--nocapture` streams it live instead,
-        # regardless of whether the test ever completes.
+        # Runs under cargo-nextest (see .config/nextest.toml), not plain
+        # `cargo test`, specifically for its per-test slow-timeout. Several
+        # real, one-off hangs here -- a stuck subprocess call
+        # (AudioLoopback::spawn's pw-dump/pw-metadata against a dead
+        # wireplumber), a leaked background tokio task after a panic
+        # (moonlight-common's video/audio/control stream drivers never
+        # noticing MoonlightStream::stop(), see patches/moonlight-common-
+        # rust-stream-driver-abort-on-stop.patch), and -- still unreproduced
+        # locally -- redfog-broker/redfog-server never receiving SIGTERM
+        # during test cleanup -- each burned this job's entire 30-minute
+        # timeout before being individually root-caused, one at a time,
+        # across several rounds of a much more complicated diagnostic
+        # wrapper that used to live here (backgrounding `cargo test`,
+        # polling /proc every 10s, dumping process trees/kernel stacks --
+        # see this file's git history around 2026-09-11/12 if that detail
+        # is ever needed again). nextest's own slow-timeout makes any
+        # *future* hang bounded regardless of cause: a test still running
+        # after 90s is marked slow and killed, turning "the whole job hangs
+        # for 30 minutes" into "this one test fails after ~90s" -- so the
+        # wrapper's whole job (surviving long enough to even show useful
+        # diagnostics) is no longer needed to make progress; a genuinely
+        # new hang now shows up as a clear, fast nextest TIMEOUT result
+        # instead, with normal `--nocapture`-free output (nextest always
+        # streams a timed-out test's captured output on its own).
         run: |
           source <(cargo llvm-cov show-env --sh)
-          cargo test --workspace --exclude kwin-capture -- --test-threads=1 --skip gst_wayland_display_backend_smoke_test --nocapture &
-          TEST_PID=$!
-          echo "test harness pid: $TEST_PID"
-          while kill -0 "$TEST_PID" 2>/dev/null; do
-            sleep 10
-            echo "::group::diagnostics at $(date -u +%H:%M:%S) (test harness still running)"
-            echo "--- memory ---"
-            free -h 2>&1 || true
-            echo "--- recent kernel log (OOM kills etc, best-effort -- may be empty without CAP_SYSLOG) ---"
-            sudo dmesg --time-format=iso 2>/dev/null | tail -20 || true
-            echo "--- processes by elapsed time ---"
-            ps -eo pid,ppid,stat,etimes,cmd --sort=-etimes 2>&1 | head -40 || true
-            echo "--- full descendant tree of the test harness (pid $TEST_PID) ---"
-            declare -A CHILDREN=() PPID_OF=()
-            for p in /proc/[0-9]*; do
-              p="${p#/proc/}"
-              ppid=""
-              while IFS= read -r line; do
-                case "$line" in
-                  PPid:*)
-                    ppid="${line#PPid:}"
-                    ppid="${ppid//[[:space:]]/}"
-                    break
-                    ;;
-                esac
-              done < "/proc/$p/status" 2>/dev/null || continue
-              if [ -n "$ppid" ]; then
-                PPID_OF["$p"]="$ppid"
-                CHILDREN["$ppid"]+="$p "
-              fi
-            done
-            build_tool_count=0
-            queue=("$TEST_PID")
-            while [ "${#queue[@]}" -gt 0 ]; do
-              cur="${queue[0]}"
-              queue=("${queue[@]:1}")
-              for pid in ${CHILDREN[$cur]:-}; do
-                comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
-                case "$comm" in
-                  rustc|cargo|cargo-llvm-cov|cc1|cc1plus|cc|gcc|clang*|ld|ld.lld|ld.bfd|ld.gold|as)
-                    # Known build-tool processes: never the site of the
-                    # original hang (every finding so far points at the
-                    # *test-running* phase, not the build) -- confirmed
-                    # live that hammering these with `sudo cat .../stack`
-                    # every 10s during active parallel compilation
-                    # correlates with the runner itself dying within
-                    # seconds, three separate times (the second and third
-                    # via this exact wrapper, once even with the fixed
-                    # comm-based/descendant-tree filters correctly finding
-                    # only *real* rustc/cargo-llvm-cov descendants, so it
-                    # isn't only about false-positive matches). Just count
-                    # them (still a useful signal: "compilation still in
-                    # progress") and don't recurse into their own children
-                    # either -- a build script like pam-sys's own
-                    # bindgen/clang invocation can fan out further, same
-                    # risk.
-                    build_tool_count=$((build_tool_count + 1))
-                    continue
-                    ;;
-                esac
-                state="$(awk '/^State:/{print $0}' "/proc/$pid/status" 2>/dev/null)"
-                wchan="$(cat "/proc/$pid/wchan" 2>/dev/null; echo)"
-                syscall="$(cat "/proc/$pid/syscall" 2>/dev/null || true)"
-                echo "pid=$pid ppid=${PPID_OF[$pid]} comm=$comm $state wchan=$wchan"
-                [ -n "$syscall" ] && echo "  syscall: $syscall"
-                sudo cat "/proc/$pid/stack" 2>/dev/null | sed 's/^/  stack: /' || true
-                queue+=("$pid")
-              done
-            done
-            echo "(also $build_tool_count build-tool process(es) -- rustc/cargo/cc/ld/etc -- skipped in detail, not walked further)"
-            echo "::endgroup::"
-          done
-          wait "$TEST_PID"
+          cargo llvm-cov nextest --workspace --exclude kwin-capture --test-threads 1 -- --skip gst_wayland_display_backend_smoke_test
 
       - name: Coverage summary
         # `cargo llvm-cov report` needs the same show-env vars as the build/

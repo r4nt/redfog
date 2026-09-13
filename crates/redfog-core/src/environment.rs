@@ -151,10 +151,6 @@ impl HeadlessRuntime {
     /// socket to appear, and export `PIPEWIRE_REMOTE` for the current
     /// process so `CompositorSession::spawn` picks it up automatically.
     pub fn start(runtime_dir: impl Into<PathBuf>) -> Result<Self, BoxError> {
-        // TEMPORARY diagnostic -- see the matching STARTUP-CHECKPOINT block
-        // in redfog-server's main.rs for why these exist. Remove alongside
-        // those once the real stuck point is found.
-        eprintln!("STARTUP-CHECKPOINT: HeadlessRuntime::start() entered");
         let runtime_dir = runtime_dir.into();
         std::fs::create_dir_all(&runtime_dir)
             .map_err(|e| format!("failed to create runtime dir {runtime_dir:?}: {e}"))?;
@@ -248,12 +244,10 @@ impl HeadlessRuntime {
             pipewire_cmd.stdout(Stdio::null()).stderr(Stdio::null());
         }
         let pipewire = pipewire_cmd.spawn().map_err(|e| format!("failed to spawn pipewire: {e}"))?;
-        eprintln!("STARTUP-CHECKPOINT: pipewire spawned, waiting for socket");
 
         if !wait_for_path(&pipewire_socket, Duration::from_secs(10)) {
             return Err("PipeWire socket did not appear within 10s".into());
         }
-        eprintln!("STARTUP-CHECKPOINT: pipewire socket appeared");
 
         let mut wireplumber_cmd = Command::new("wireplumber");
         wireplumber_cmd.env("XDG_RUNTIME_DIR", &runtime_dir)
@@ -280,18 +274,15 @@ impl HeadlessRuntime {
             pipewire_pulse_cmd.stdout(Stdio::null()).stderr(Stdio::null());
         }
         let pipewire_pulse = pipewire_pulse_cmd.spawn().map_err(|e| format!("failed to spawn pipewire-pulse: {e}"))?;
-        eprintln!("STARTUP-CHECKPOINT: wireplumber + pipewire-pulse spawned, waiting for pulse socket");
 
         let pulse_socket = runtime_dir.join("pulse/native");
         if !wait_for_path(&pulse_socket, Duration::from_secs(10)) {
             return Err("PipeWire-Pulse socket did not appear within 10s".into());
         }
-        eprintln!("STARTUP-CHECKPOINT: pulse socket appeared, sleeping 1s for graph to leave 'suspended'");
 
         // wireplumber needs a moment to bring the PipeWire graph out of
         // 'suspended' before nodes will transition to running.
         std::thread::sleep(Duration::from_secs(1));
-        eprintln!("STARTUP-CHECKPOINT: HeadlessRuntime::start() about to return Ok");
 
         env::set_var("PIPEWIRE_REMOTE", &pipewire_socket);
 
