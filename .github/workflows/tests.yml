@@ -166,18 +166,23 @@ jobs:
         # instead, with normal `--nocapture`-free output (nextest always
         # streams a timed-out test's captured output on its own).
         #
-        # No `source <(cargo llvm-cov show-env --sh)` here, unlike the
-        # plain-`cargo build`/`cargo test` steps elsewhere in this job:
-        # `cargo llvm-cov nextest` sets up its own instrumentation
-        # internally (that's the whole point of it being a dedicated
-        # subcommand rather than a plain `cargo nextest run`) -- sourcing
-        # show-env first as well double-wraps rustc (this step's own
-        # RUSTC_WRAPPER=cargo-llvm-cov, invoked *again* by the subcommand's
-        # own setup) and breaks every single compilation outright.
-        # Confirmed live: doing so made every rustc invocation in the
-        # workspace fail immediately, even trivial `--print=sysroot`-style
-        # probe calls, well before any real test ran.
-        run: cargo llvm-cov nextest --workspace --exclude kwin-capture --test-threads 1 -- --skip gst_wayland_display_backend_smoke_test
+        # Plain `cargo nextest run`, sourcing show-env first -- same reason
+        # "Build workspace binaries under coverage instrumentation" above
+        # uses plain `cargo build` rather than `cargo llvm-cov --workspace`:
+        # the `cargo llvm-cov <subcommand>` form (tried first here, as
+        # `cargo llvm-cov nextest`) manages its own instrumentation and
+        # profile-data directory internally, *separate* from the plain
+        # `target/` dir show-env points plain cargo commands at -- confirmed
+        # live, it left `target/` with no `*.profraw` files at all, so the
+        # later "Coverage summary" step's `cargo llvm-cov report` (which
+        # only ever looks under the show-env-configured plain `target/`)
+        # failed outright with "not found *.profraw files", even though the
+        # tests themselves had all just passed. Sourcing show-env here too
+        # keeps this step's instrumentation consistent with every other
+        # step in this job, all four sharing the one plain `target/` dir.
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo nextest run --workspace --exclude kwin-capture --test-threads 1 -- --skip gst_wayland_display_backend_smoke_test
 
       - name: Coverage summary
         # `cargo llvm-cov report` needs the same show-env vars as the build/
