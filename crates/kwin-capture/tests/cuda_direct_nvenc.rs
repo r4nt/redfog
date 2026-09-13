@@ -73,7 +73,8 @@ async fn run_cuda_direct_nvenc_test(codec: VideoCodec) {
 
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
     eprintln!("Starting CudaDirectEncoderSession (DMA-BUF -> CUDA -> NVENC, no GStreamer, codec={codec:?})...");
-    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), WIDTH, HEIGHT, FPS, BITRATE_KBPS, codec, move |data, is_keyframe, _capture_instant| {
+    let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), WIDTH, HEIGHT, FPS, BITRATE_KBPS, codec, connected, move |data, is_keyframe, _capture_instant| {
         let _ = tx.send((data, is_keyframe));
     });
 

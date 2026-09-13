@@ -54,7 +54,8 @@ async fn reconfigure_keeps_video_flowing() {
     let _compositor_guard = KillCompositorOnDrop(compositor);
 
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
-    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), 1280, 720, 60, 5_000, VideoCodec::H264, move |data, is_keyframe, _capture_instant| {
+    let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), 1280, 720, 60, 5_000, VideoCodec::H264, connected, move |data, is_keyframe, _capture_instant| {
         let _ = tx.send((data, is_keyframe));
     });
 
@@ -129,7 +130,8 @@ async fn reconfigure_reuses_capture_connection() {
     let _compositor_guard = KillCompositorOnDrop(compositor);
 
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
-    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), 1280, 720, 60, 5_000, VideoCodec::H264, move |data, is_keyframe, _capture_instant| {
+    let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), 1280, 720, 60, 5_000, VideoCodec::H264, connected, move |data, is_keyframe, _capture_instant| {
         let _ = tx.send((data, is_keyframe));
     });
 
@@ -200,7 +202,8 @@ async fn hevc_survives_many_frames_and_request_keyframe_produces_a_real_idr() {
     let _compositor_guard = KillCompositorOnDrop(compositor);
 
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
-    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), 1280, 720, 60, 5_000, VideoCodec::Hevc, move |data, is_keyframe, _capture_instant| {
+    let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), 1280, 720, 60, 5_000, VideoCodec::Hevc, connected, move |data, is_keyframe, _capture_instant| {
         let _ = tx.send((data, is_keyframe));
     });
 
@@ -271,7 +274,8 @@ async fn av1_survives_many_frames_and_request_keyframe_produces_a_real_idr() {
     let _compositor_guard = KillCompositorOnDrop(compositor);
 
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
-    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), 1280, 720, 60, 5_000, VideoCodec::Av1, move |data, is_keyframe, _capture_instant| {
+    let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let session = CudaDirectEncoderSession::spawn(node_id, socket_path, _headless_runtime.pipewire_socket.to_str().unwrap().to_string(), 1280, 720, 60, 5_000, VideoCodec::Av1, connected, move |data, is_keyframe, _capture_instant| {
         let _ = tx.send((data, is_keyframe));
     });
 

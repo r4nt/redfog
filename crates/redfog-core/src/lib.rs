@@ -1745,12 +1745,15 @@ pub fn make_cuda_direct_encoder_session(
     pipewire_socket_path: &str,
     bitrate_kbps: u32,
     codec: VideoCodec,
+    // See `CudaDirectEncoderSession::spawn`'s doc comment on its own
+    // `connected` parameter — passed straight through.
+    connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     on_access_unit: impl Fn(Vec<u8>, bool, std::time::Instant) + Send + Sync + 'static,
 ) -> CudaDirectEncoderSession {
     let VideoSource::KwinNativeDmaBuf { node_id, wayland_socket_path, width, height, fps } = source else {
         panic!("make_cuda_direct_encoder_session only supports VideoSource::KwinNativeDmaBuf");
     };
-    CudaDirectEncoderSession::spawn(node_id, wayland_socket_path, pipewire_socket_path.to_string(), width, height, fps, bitrate_kbps, codec, on_access_unit)
+    CudaDirectEncoderSession::spawn(node_id, wayland_socket_path, pipewire_socket_path.to_string(), width, height, fps, bitrate_kbps, codec, connected, on_access_unit)
 }
 
 /// A per-session virtual audio sink: apps in the compositor session play

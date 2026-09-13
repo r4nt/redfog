@@ -172,6 +172,24 @@ struct SessionOrigin {
     /// is actually built for right now" — see `reconcile_video_pipeline`'s
     /// doc comment for why a takeover needs both.
     codec: redfog_core::VideoCodec,
+    /// Whether this session's ENet control-channel peer is currently
+    /// connected — set by `ControlEventHandler::on_peer_connected`/
+    /// `on_peer_disconnected` (see `SessionManager`'s impl), checked by the
+    /// video/audio encoder callbacks (`build_video_pipeline`/
+    /// `build_pipelines`) to skip packetizing and sending once a client has
+    /// gone away, without needing to stop pulling/encoding samples (that
+    /// still has to happen regardless, or the pipeline itself would stall).
+    /// Confirmed live: a client that just closes its app (no clean
+    /// `/cancel` or logout) leaves its session in `ClientState::Streaming`
+    /// indefinitely -- nothing else currently notices or backgrounds it --
+    /// so without this, encoding and `sendmmsg` both keep running forever
+    /// against a destination that's gone, filling the log with repeated
+    /// "Network is unreachable" warnings (far more often for audio, at
+    /// ~200 packets/sec, than video). Starts optimistic (`true`): video/
+    /// audio can start flowing moments before this session's own ENet
+    /// control-channel peer has even finished connecting/matching, and
+    /// there's no reason to suppress that legitimate startup window.
+    connected: Arc<AtomicBool>,
 }
 
 impl SessionOrigin {
@@ -191,6 +209,7 @@ impl SessionOrigin {
             target_bitrate_kbps: default_bitrate_kbps,
             current_bitrate_kbps: default_bitrate_kbps,
             codec: redfog_core::VideoCodec::default(),
+            connected: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -1040,6 +1059,13 @@ impl SessionManager {
         codec: redfog_core::VideoCodec,
         handle: tokio::runtime::Handle,
         this: Arc<Self>,
+        // Same `Arc` as this session's own `SessionOrigin::connected` --
+        // only consulted by the `NvencDirect` branch below (see
+        // `CudaDirectEncoderSession::spawn`'s doc comment on its own
+        // `connected` parameter): the GStreamer paths still rely purely on
+        // the post-encode check inside `on_video_access_unit`/`on_audio_
+        // packet` below, not this.
+        connected: Arc<std::sync::atomic::AtomicBool>,
     ) -> (gstreamer::Pipeline, Option<Arc<redfog_core::CudaDirectEncoderSession>>) {
         let video_encoder = if matches!(kind, SessionType::Login) {
             redfog_core::VideoEncoder::Software
@@ -1099,6 +1125,14 @@ impl SessionManager {
                     let Some(session) = session_by_generation(&shared, generation) else { return };
                     (session.origin.clone(), session.codec, session.origin.target_bitrate_kbps)
                 };
+                // See `SessionOrigin::connected`'s doc comment: still pulled
+                // and encoded (this closure runs off appsink's own
+                // `new_sample`, further up than this check -- draining it
+                // promptly is what keeps the pipeline itself from stalling),
+                // just not packetized/sent once nothing's listening.
+                if !origin.connected.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 let sender = this.video_sender.clone();
                 // RTP timestamps use a 90kHz clock (standard for video) —
                 // derived from wall-clock time since streaming started
@@ -1180,8 +1214,14 @@ impl SessionManager {
         let video_pipeline = if video_encoder == redfog_core::VideoEncoder::NvencDirect
             && matches!(source, redfog_core::VideoSource::KwinNativeDmaBuf { .. })
         {
-            let session =
-                redfog_core::make_cuda_direct_encoder_session(source, &pipewire_socket_path, initial_bitrate_kbps, codec, on_video_access_unit);
+            let session = redfog_core::make_cuda_direct_encoder_session(
+                source,
+                &pipewire_socket_path,
+                initial_bitrate_kbps,
+                codec,
+                connected,
+                on_video_access_unit,
+            );
             cuda_direct_session = Some(Arc::new(session));
             // `NvencDirect` has no GStreamer pipeline at all — this empty
             // placeholder exists only so the rest of this type's machinery
@@ -1250,6 +1290,7 @@ impl SessionManager {
         fps_cap: Option<u32>,
         initial_bitrate_kbps: u32,
         codec: redfog_core::VideoCodec,
+        connected: Arc<std::sync::atomic::AtomicBool>,
     ) -> (gstreamer::Pipeline, gstreamer::Pipeline, Option<Arc<redfog_core::CudaDirectEncoderSession>>) {
         // GStreamer's appsink callbacks run on GStreamer's own streaming
         // threads, not tokio worker threads — `tokio::spawn` would panic
@@ -1287,7 +1328,7 @@ impl SessionManager {
         let (video_pipeline, cuda_direct_session) = if matches!(kind, SessionType::Login) {
             (gstreamer::Pipeline::new(), None)
         } else {
-            self.build_video_pipeline(kind, compositor, generation, fps_cap, initial_bitrate_kbps, codec, handle.clone(), this.clone())
+            self.build_video_pipeline(kind, compositor, generation, fps_cap, initial_bitrate_kbps, codec, handle.clone(), this.clone(), connected)
         };
 
         let on_audio_packet = move |packet: Vec<u8>| {
@@ -1309,6 +1350,11 @@ impl SessionManager {
                 };
                 session.origin.clone()
             };
+            // See `SessionOrigin::connected`'s doc comment / the video
+            // callback's identical check above.
+            if !origin.connected.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
             let sender = this.audio_sender.clone();
             let (key, key_id) = (origin.rikey, origin.rikey_key_id);
             // NOT a 48kHz sample-rate clock, despite that being the
@@ -1513,6 +1559,7 @@ impl SessionManager {
             wanted_codec,
             handle,
             this,
+            session.origin.connected.clone(),
         );
         session.video_pipeline = video_pipeline;
         session.cuda_direct_session = cuda_direct_session;
@@ -1592,7 +1639,7 @@ impl SessionManager {
             self.config.bitrate_kbps,
         );
         let (video_pipeline, audio_pipeline, cuda_direct_session) =
-            self.build_pipelines(&kind, &compositor, audio_loopback.as_ref(), generation, fps_cap, origin.target_bitrate_kbps, codec);
+            self.build_pipelines(&kind, &compositor, audio_loopback.as_ref(), generation, fps_cap, origin.target_bitrate_kbps, codec, origin.connected.clone());
         // Must come *after* `build_pipelines`, not before (this used to be
         // the other way around): `SpawnedCompositor::GstWaylandDisplay`'s
         // `input_sink` now looks up its `waylanddisplaysrc` element inside
@@ -1792,6 +1839,7 @@ impl SessionManager {
                 let kind = session.kind.clone();
                 let bitrate_kbps = session.origin.target_bitrate_kbps;
                 let codec = session.origin.codec;
+                let connected = session.origin.connected.clone();
                 tracing::info!(
                     "start_streaming(generation={generation}): building Login's real video pipeline now that ANNOUNCE has negotiated codec={codec:?}"
                 );
@@ -1821,7 +1869,7 @@ impl SessionManager {
                     Duration::from_secs(15),
                     tokio::task::spawn_blocking(move || {
                         let (video_pipeline, cuda_direct_session) =
-                            this.build_video_pipeline(&kind, &compositor, generation, fps_cap, bitrate_kbps, codec, handle, this.clone());
+                            this.build_video_pipeline(&kind, &compositor, generation, fps_cap, bitrate_kbps, codec, handle, this.clone(), connected);
                         (video_pipeline, cuda_direct_session, compositor)
                     }),
                 )
@@ -3330,6 +3378,20 @@ impl ControlEventHandler for SessionManager {
             if let Some(cuda_direct_session) = &cuda_direct_session {
                 cuda_direct_session.set_bitrate(new_kbps);
             }
+        }
+    }
+    fn on_peer_connected(&self, rikey: [u8; 16]) {
+        let shared = self.shared.lock().unwrap();
+        let Some(client_key) = resolve_client_key_by_rikey(&shared, rikey) else { return };
+        if let Some(ClientState::Streaming { session }) = shared.clients.get(&client_key).map(|slot| &slot.state) {
+            session.origin.connected.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn on_peer_disconnected(&self, rikey: [u8; 16]) {
+        let shared = self.shared.lock().unwrap();
+        let Some(client_key) = resolve_client_key_by_rikey(&shared, rikey) else { return };
+        if let Some(ClientState::Streaming { session }) = shared.clients.get(&client_key).map(|slot| &slot.state) {
+            session.origin.connected.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

@@ -212,6 +212,13 @@ impl CudaDirectEncoderSession {
         fps: u32,
         bitrate_kbps: u32,
         codec: VideoCodec,
+        // Same underlying flag as `redfog_moonlight::session::SessionOrigin::
+        // connected` (a clone of the caller's own `Arc`, not a fresh one) --
+        // read directly by `run_encoder`'s loop, not stored on `Self`: unlike
+        // `shutdown`/`force_keyframe` below, nothing on this side ever needs
+        // to *set* it, only the caller (`SessionManager::on_peer_connected`/
+        // `on_peer_disconnected`) does that, on the very same `Arc`.
+        connected: Arc<AtomicBool>,
         // Third argument: when `capture.next_frame()` returned the frame
         // this access unit was encoded from -- lets the caller measure real
         // end-to-end latency (capture -> encode -> packetize -> actually
@@ -237,6 +244,7 @@ impl CudaDirectEncoderSession {
                 &thread_shutdown,
                 &thread_force_keyframe,
                 &thread_reconfig,
+                &connected,
                 &on_access_unit,
             ) {
                 eprintln!("kwin-capture: CudaDirectEncoderSession thread exiting with error: {e}");
@@ -323,6 +331,7 @@ fn run(
     shutdown: &AtomicBool,
     force_keyframe: &AtomicBool,
     reconfig: &Mutex<Option<PendingReconfig>>,
+    connected: &AtomicBool,
     on_access_unit: &(impl Fn(Vec<u8>, bool, std::time::Instant) + Send + Sync + 'static),
 ) -> Result<(), String> {
     let capture = PipewireCapture::start(node_id, wayland_socket_path, pipewire_socket_path, false)
@@ -335,7 +344,7 @@ fn run(
         if shutdown.load(Ordering::SeqCst) {
             return Ok(());
         }
-        match run_encoder(&capture, width, height, fps, bitrate_kbps, codec, shutdown, force_keyframe, reconfig, on_access_unit)? {
+        match run_encoder(&capture, width, height, fps, bitrate_kbps, codec, shutdown, force_keyframe, reconfig, connected, on_access_unit)? {
             EncoderOutcome::Shutdown => return Ok(()),
             EncoderOutcome::Reconfigure(new) => {
                 eprintln!("kwin-capture: reconfiguring encoder in place (fps={} bitrate={}kbps codec={:?}) — capture connection untouched", new.fps, new.bitrate_kbps, new.codec);
@@ -371,6 +380,7 @@ fn run_encoder(
     shutdown: &AtomicBool,
     force_keyframe: &AtomicBool,
     reconfig: &Mutex<Option<PendingReconfig>>,
+    connected: &AtomicBool,
     on_access_unit: &(impl Fn(Vec<u8>, bool, std::time::Instant) + Send + Sync + 'static),
 ) -> Result<EncoderOutcome, String> {
     let importer = CudaImporter::new().map_err(|e| format!("CudaImporter::new: {e:?}"))?;
@@ -491,6 +501,22 @@ fn run_encoder(
         // "capture" end of the end-to-end (capture -> encode -> packetize
         // -> actually sent) latency the caller measures.
         let capture_instant = std::time::Instant::now();
+        if !connected.load(Ordering::Relaxed) {
+            // No client attached right now -- release the compositor's
+            // buffer immediately without touching CUDA/NVENC at all. Unlike
+            // `redfog_moonlight::session::SessionOrigin::connected`'s other
+            // check (downstream in `on_video_access_unit`, gating
+            // packetize+send only, *after* paying for encode), this is the
+            // one place that can actually skip the expensive part: no CUDA
+            // import, no NVENC resource registration/`encode_picture` --
+            // just the same fd close this loop already does for a
+            // wrong-resolution frame below. Still draining `next_frame()`
+            // every iteration is what keeps PipeWire's buffer pool cycling
+            // and avoids the KWin damage-source stall the caller's own doc
+            // comment describes.
+            unsafe { libc::close(frame.fd) };
+            continue;
+        }
         if !frame.is_dma_buf {
             unsafe { libc::close(frame.fd) };
             continue;

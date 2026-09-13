@@ -3204,3 +3204,112 @@ async fn hevc_post_handoff_nvenc_direct_encode_stays_up() {
         server.stdout_lines.lock().unwrap().join("\n")
     );
 }
+
+/// Regression test for a real, live-confirmed bug report: a client that
+/// just closes its app (no clean `/cancel`/logout) left its session
+/// encoding and sending audio/video forever, since nothing noticed the
+/// disconnect -- confirmed live via journalctl showing hundreds of
+/// `audio send failed: ... Network is unreachable` warnings per hour.
+/// Deliberately never reconnects (that path -- an explicit new `/launch`
+/// backgrounding the old session -- already went through a *different*
+/// code path, the control channel's proactive "stale peer" sweep, and was
+/// already covered by `real_client_connects_reconnects_and_sends_input`;
+/// this test exercises the other one, the actual `Event::Disconnect` ENet
+/// fires on its own once a truly silent peer's ping/timeout elapses, see
+/// `crate::control::ControlServer::serve`'s doc comment) -- the exact
+/// "closed browser tab, never comes back" scenario from the bug report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disconnecting_without_reconnecting_stops_encoding_and_sending() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
+
+    let server = TestServer::spawn();
+
+    let client_identity = ServerIdentity::generate().expect("generate client identity");
+    let client_identifier = ClientIdentifier::from_pem(pem::parse(&client_identity.cert_pem).unwrap());
+    let client_secret = ClientSecret::from_pem(pem::parse(&client_identity.private_key_pem).unwrap());
+
+    let host = MoonlightHost::<TokioHyperClient>::new("127.0.0.1".to_string(), server.http_port, Some("it-client-disconnect".to_string()))
+        .expect("construct MoonlightHost");
+
+    let pin = PairPin::new_random(&RustCryptoBackend).expect("generate pin");
+    let pin_str = pin.to_string();
+    let http_port = server.http_port;
+    let submit_task = tokio::task::spawn_blocking(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        ureq::post(&format!("http://127.0.0.1:{http_port}/submit-pin"))
+            .send_form(&[("uniqueid", "it-client-disconnect"), ("pin", &pin_str)])
+            .expect("submit-pin request");
+    });
+    host.pair(&client_identifier, &client_secret, "disconnect-test".to_string(), pin, RustCryptoBackend)
+        .await
+        .expect("pairing must succeed");
+    submit_task.await.unwrap();
+
+    let mut settings = default_stream_settings();
+    let server_version = host.version().await.expect("server version");
+    let gfe_version = host.gfe_version().await.expect("gfe version");
+    let codec_support = host.server_codec_mode_support().await.expect("codec support");
+    settings.adjust_for_server(server_version, &gfe_version, codec_support).expect("settings compatible");
+
+    let stream_config = host
+        .start_stream(1, &settings, AesKey::new_random(&RustCryptoBackend).expect("aes key"), AesIv(1), "")
+        .await
+        .expect("launch must succeed");
+    let crypto_backend = Arc::new(RustCryptoBackend);
+    let stream = MoonlightStream::connect(stream_config, settings, crypto_backend, video_capabilities())
+        .await
+        .expect("stream must connect");
+
+    server.wait_for_stdout("TESTUX[login]: started", Duration::from_secs(45)).await;
+
+    // Confirm audio is genuinely flowing before disconnecting at all --
+    // `EncodedFrameStats::REPORT_INTERVAL` is a strict 5s, so this line
+    // only ever appears from a real, successful packetize+send.
+    server.wait_for_stdout("audio: ", Duration::from_secs(10)).await;
+    // `wait_for_new_stdout`, not `wait_for_stdout` -- this exact needle can
+    // legitimately have already appeared once before this point (e.g. an
+    // incidental early connect/disconnect during the control channel's own
+    // handshake retries), and a plain "has this ever appeared" check would
+    // trivially, wrongly pass on that stale match instead of the real
+    // disconnect this test triggers below -- see `wait_for_new_stdout`'s
+    // own doc comment.
+    let disconnected_before = server.count_stdout("control channel: peer PeerId(0) disconnected");
+
+    // ---- Simulate closing the window: drop the stream with no clean
+    // RTSP TEARDOWN / control-channel disconnect, and (unlike the
+    // reconnect test) never come back -- the server's only way to notice
+    // is the ENet control channel's own peer timeout. ----
+    drop(stream);
+
+    // ENet's own TIMEOUT_MINIMUM is 5s (tokio-enet's peer.rs) -- generous
+    // margin on top for scheduling jitter, the control loop's own 100ms
+    // poll granularity, and ENet's actual timeout math being a good deal
+    // more involved than that one constant alone (exponential backoff
+    // against timeout_maximum -- confirmed live this routinely takes
+    // 30+ seconds in practice, not just over the 5s minimum). Audio/video
+    // keep flowing completely normally this whole time -- there's no way
+    // for the server to know any sooner -- so the "before" counts below
+    // are deliberately captured *after* this wait, not before it.
+    server.wait_for_new_stdout("control channel: peer PeerId(0) disconnected", disconnected_before, Duration::from_secs(90)).await;
+    let audio_lines_before = server.count_stdout("audio: ");
+    let video_lines_before = server.count_stdout("video: ");
+
+    // One more full report interval (plus margin) with nothing reconnecting
+    // -- if packetizing/sending were still happening, at least one more
+    // "audio: "/"video: " line would have appeared in this window.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    let audio_lines_after = server.count_stdout("audio: ");
+    let video_lines_after = server.count_stdout("video: ");
+    assert_eq!(
+        audio_lines_before, audio_lines_after,
+        "audio kept getting packetized/sent after a disconnect the server itself already logged noticing — full log:\n{}",
+        server.stdout_lines.lock().unwrap().join("\n")
+    );
+    assert_eq!(
+        video_lines_before, video_lines_after,
+        "video kept getting packetized/sent after a disconnect the server itself already logged noticing — full log:\n{}",
+        server.stdout_lines.lock().unwrap().join("\n")
+    );
+}

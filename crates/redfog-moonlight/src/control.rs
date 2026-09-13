@@ -62,6 +62,18 @@ pub trait ControlEventHandler: Send + Sync {
     /// specifically (unlike resolution/fps) needs no client cooperation
     /// beyond this existing report.
     fn on_loss_stats(&self, rikey: [u8; 16], last_good_frame: u64);
+    /// Fired once this rikey's ENet control-channel peer is actually
+    /// matched (see `ControlServer::serve`'s doc comment) -- not on the raw
+    /// ENet-level connect, which happens before we know which session (if
+    /// any) it belongs to. Also fires again on a peer re-matching after a
+    /// transient control-channel drop-and-reconnect for the *same* session
+    /// (same rikey), not just on a session's very first connect.
+    fn on_peer_connected(&self, rikey: [u8; 16]);
+    /// Fired when a matched peer disconnects -- lets `SessionManager` stop
+    /// wasting work encoding/sending to a client that's gone, without
+    /// needing to fully background/tear down the session (see
+    /// `SessionOrigin::connected`'s doc comment).
+    fn on_peer_disconnected(&self, rikey: [u8; 16]);
 }
 
 pub struct NoopControlEventHandler;
@@ -69,6 +81,8 @@ impl ControlEventHandler for NoopControlEventHandler {
     fn on_input(&self, _rikey: [u8; 16], _event: InputEvent) {}
     fn on_request_idr_frame(&self, _rikey: [u8; 16]) {}
     fn on_loss_stats(&self, _rikey: [u8; 16], _last_good_frame: u64) {}
+    fn on_peer_connected(&self, _rikey: [u8; 16]) {}
+    fn on_peer_disconnected(&self, _rikey: [u8; 16]) {}
 }
 
 /// `epoch` is bumped on every `register()` call for a `rikey` (whether it's
@@ -202,10 +216,20 @@ impl ControlServer {
             // Disconnect any peer whose matched rikey has since been
             // superseded (a retake re-registered it, bumping its epoch) or
             // removed entirely (the session ended).
-            let stale: Vec<PeerId> = peer_rikey.iter().filter(|(_, &(rikey, epoch))| regs.get(&rikey) != Some(&epoch)).map(|(&id, _)| id).collect();
-            for peer_id in &stale {
+            let stale: Vec<(PeerId, [u8; 16])> = peer_rikey.iter().filter(|(_, &(rikey, epoch))| regs.get(&rikey) != Some(&epoch)).map(|(&id, &(rikey, _))| (id, rikey)).collect();
+            for (peer_id, rikey) in &stale {
                 host.disconnect_now(*peer_id, 0);
                 peer_rikey.remove(peer_id);
+                // This is its own, separate disconnect path from the
+                // `Event::Disconnect` arm below -- ENet's `disconnect_now`
+                // tears the peer down immediately rather than through its
+                // own event loop, so nothing else here would ever notice
+                // this peer is gone otherwise. Confirmed live this is the
+                // path an actual reconnect-after-silent-close takes (not
+                // `Event::Disconnect`): the new `/launch` backgrounds the
+                // old session, which forgets its rikey from the registry,
+                // which is what makes it "stale" here in the first place.
+                self.handler.on_peer_disconnected(*rikey);
             }
             if !stale.is_empty() {
                 tracing::info!("control channel: disconnected {} stale peer(s) for session takeover", stale.len());
@@ -231,7 +255,9 @@ impl ControlServer {
                 }
                 Ok(Some(Event::Disconnect { peer_id, .. })) => {
                     tracing::info!("control channel: peer {peer_id:?} disconnected");
-                    peer_rikey.remove(&peer_id);
+                    if let Some((rikey, _)) = peer_rikey.remove(&peer_id) {
+                        self.handler.on_peer_disconnected(rikey);
+                    }
                     pending.remove(&peer_id);
                 }
                 Ok(Some(Event::Receive { peer_id, packet, .. })) => {
@@ -243,6 +269,7 @@ impl ControlServer {
                                 tracing::info!("control channel: peer {peer_id:?} matched");
                                 peer_rikey.insert(peer_id, (rikey, epoch));
                                 pending.remove(&peer_id);
+                                self.handler.on_peer_connected(rikey);
                                 self.handle_message(rikey, packet.data());
                             }
                             None => tracing::debug!("control channel: peer {peer_id:?} sent an encrypted message that didn't authenticate against any registered session"),

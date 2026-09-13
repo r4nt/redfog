@@ -151,6 +151,28 @@ against a real client).
       namespace. Worth converging real config into a file (following the
       `session_presets` TOML precedent) before anyone but the maintainer
       runs this. Not urgent for solo dev iteration.
+- [ ] Pre-encode gating for the GStreamer video/audio paths (software
+      x264/x265/av1, GStreamer NVENC, Vulkan, and opus audio) once a
+      client's disconnected. `SessionOrigin::connected` already skips
+      packetize+send for these (see "recently fixed" below) and, for the
+      separate direct-NVENC path, skips the encode itself — but the
+      GStreamer paths still fully encode every frame with nobody
+      listening, since capture and encoder are fused into one element
+      chain in `video_pipeline_description`/`audio_pipeline_description`
+      (`redfog-core/src/lib.rs`), with `appsink` only ever positioned
+      *after* the encoder in production pipelines. Feasible without
+      rebuilding `pipewiresrc`/the screencast connection (the thing that's
+      previously leaked/stalled when touched): extend the existing
+      `identity name=fps_cap_gate` + pad-probe-returns-`Drop` pattern
+      (currently only wired into the damage-driven `GstWaylandDisplay`/
+      `Login` sources, not the production `PipeWireNode`/
+      `KwinNativeDmaBuf` arms) to sit right before the encoder element,
+      driven by `connected` instead of/alongside fps capping. Audio has no
+      such gate at all today and would need one added. Deferred: real
+      engineering, and capture itself is already ~free when the desktop is
+      genuinely idle (KWin's screencast is damage-driven) — the waste this
+      would eliminate is specifically encoding real on-screen activity
+      that nobody's watching.
 
 ## Recently fixed (2026-08-31, for context — not TODO items)
 
