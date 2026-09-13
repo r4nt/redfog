@@ -510,10 +510,24 @@ impl PairingServer {
         let (Some(width), Some(height), Some(fps)) = (parts.next(), parts.next(), parts.next()) else {
             return DEFAULT;
         };
-        let (Ok(width), Ok(height), Ok(fps)) = (width.parse(), height.parse(), fps.parse()) else {
+        let (Ok(width), Ok(height), Ok(fps)) = (width.parse::<u32>(), height.parse::<u32>(), fps.parse()) else {
             return DEFAULT;
         };
-        (width, height, fps)
+        // Real, confirmed regression: moonlight-web-stream reports its
+        // browser viewport size verbatim (e.g. "1680x999x60" -- an odd
+        // height, presumably from devicePixelRatio/layout rounding on its
+        // end), unlike moonlight-qt/moonlight-android, which only ever
+        // offer a fixed list of standard (always-even) resolutions. x265enc
+        // (used for the Login stage, and any HEVC software-encoder
+        // fallback) requires both dimensions to be even for 4:2:0 chroma
+        // subsampling and fails outright otherwise ("Can not initialize
+        // x265 encoder", confirmed live via journalctl) -- H.264/AV1
+        // encoders happened not to complain, masking this for everything
+        // except HEVC. Round down (never up) so this never requests more
+        // than the client's own viewport -- losing at most one row/column
+        // of pixels is imperceptible, unlike the alternative of padding
+        // with fabricated content.
+        (width & !1, height & !1, fps)
     }
 
     fn unpair(&self, _params: &HashMap<String, String>) -> Response<Full<Bytes>> {
@@ -715,6 +729,26 @@ mod tests {
     fn parses_real_client_mode_param() {
         let mut params = HashMap::new();
         params.insert("mode".to_string(), "1280x720x30".to_string());
+        assert_eq!(PairingServer::parse_mode(&params), (1280, 720, 30));
+    }
+
+    /// Regression test for a real, confirmed HEVC-only failure: unlike
+    /// moonlight-qt/moonlight-android (which only ever offer a fixed list
+    /// of standard, always-even resolutions), moonlight-web-stream reports
+    /// its actual browser viewport size verbatim -- observed live as
+    /// "mode=1680x999x60", an odd height. x265enc requires even dimensions
+    /// for 4:2:0 chroma subsampling and fails outright ("Can not initialize
+    /// x265 encoder") on an odd one; H.264/AV1 didn't complain, which is
+    /// why this only ever broke HEVC. Rounds down, never up, so this never
+    /// requests more than the client's own viewport.
+    #[test]
+    fn rounds_odd_dimensions_down_to_even_for_hevc_compat() {
+        let mut params = HashMap::new();
+        params.insert("mode".to_string(), "1680x999x60".to_string());
+        assert_eq!(PairingServer::parse_mode(&params), (1680, 998, 60));
+
+        let mut params = HashMap::new();
+        params.insert("mode".to_string(), "1281x721x30".to_string());
         assert_eq!(PairingServer::parse_mode(&params), (1280, 720, 30));
     }
 
