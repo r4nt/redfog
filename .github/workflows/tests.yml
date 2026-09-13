@@ -84,11 +84,13 @@ jobs:
             libpipewire-0.3-dev pipewire pipewire-pulse wireplumber \
             libpam0g-dev libdbus-1-dev dbus-user-session \
             libssl-dev libvulkan-dev libsdl2-dev
-          # Best-effort: the isolated KWin resume tests
-          # (redfog-core/tests/pause_resume.rs) skip themselves with a
-          # clear message rather than failing if kwin_wayland isn't
-          # installed or doesn't work in this environment, so this is
-          # allowed to fail without breaking the job.
+          # Best-effort: most of redfog-moonlight's integration tests spawn a
+          # real kwin_wayland session and need this installed to pass, but
+          # letting a failed install here take down the whole job would only
+          # replace a specific, actionable "kwin_wayland: command not found"
+          # test failure with a less informative apt error at this earlier
+          # step -- better to let it fail downstream, in whichever test
+          # actually needed it.
           sudo apt-get install -y --no-install-recommends kwin-wayland || true
 
       - name: Install Rust
