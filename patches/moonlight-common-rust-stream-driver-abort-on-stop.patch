@@ -1,0 +1,91 @@
+--- a/src/stream/tokio/driver.rs
++++ b/src/stream/tokio/driver.rs
+@@ -11,6 +11,7 @@
+     io::ReadBuf,
+     net::UdpSocket,
+     spawn,
++    task::JoinHandle,
+     time::{Sleep, sleep_until},
+ };
+ use tracing::{Instrument, Span, debug, error};
+@@ -38,10 +39,11 @@
+             recv_buffer: vec![0; 4096],
+         }),
+         notify: Stream::Notifier::default(),
++        join_handle: Mutex::new(None),
+     }));
+ 
+     let mut driver = StreamDriver(stream_ref.clone());
+-    spawn(
++    let join_handle = spawn(
+         async move {
+             if let Err(err) = (&mut driver).await {
+                 error!(error = %err, "stream driver errored");
+@@ -53,6 +55,10 @@
+         }
+         .instrument(span),
+     );
++    // See `StreamRef::abort_driver`'s doc comment for why this is kept and
++    // used, rather than just discarded the way `spawn(...)`'s return value
++    // usually is here.
++    *stream_ref.0.join_handle.lock().expect("bind_udp_stream: set join_handle") = Some(join_handle);
+ 
+     Ok(stream_ref)
+ }
+@@ -120,6 +126,27 @@
+     pub fn notify(&self) -> &Stream::Notifier {
+         &self.0.notify
+     }
++
++    /// Aborts this stream's background driver task directly rather than
++    /// relying on it to notice a stop signal on its own. `StreamDriver::
++    /// poll` (this file, above) never voluntarily returns `Poll::Ready(Ok(
++    /// ()))` -- it only stops on a genuine protocol/IO error -- so nothing
++    /// about a normal `stop()`/`Drop` ever makes it exit; the `notify()`
++    /// calls `MoonlightStream::stop()` makes only wake *callers* blocked on
++    /// `poll_frame()`/`poll_packet()` (which explicitly check `is_stopped()`
++    /// after waking), not this task. Left unaborted, the task runs forever,
++    /// which is fatal specifically inside a `#[tokio::test]`: a panicking
++    /// test's `Runtime` gets dropped during unwind, and dropping a runtime
++    /// waits for every still-running spawned task -- confirmed live, a real
++    /// CI job burned its entire 30-minute budget this way after an
++    /// otherwise cleanly-bounded test assertion failure, because this
++    /// stream's video driver task kept running (and logging once a second)
++    /// long after the test itself had already failed and unwound.
++    pub fn abort_driver(&self) {
++        if let Some(handle) = self.0.join_handle.lock().expect("abort_driver").take() {
++            handle.abort();
++        }
++    }
+ }
+ 
+ struct StreamInner<Stream>
+@@ -128,6 +155,7 @@
+ {
+     state: Mutex<State<Stream>>,
+     notify: Stream::Notifier,
++    join_handle: Mutex<Option<JoinHandle<()>>>,
+ }
+ 
+ struct State<Stream> {
+--- a/src/stream/tokio/mod.rs
++++ b/src/stream/tokio/mod.rs
+@@ -388,6 +388,18 @@
+ 
+         // Use the control stream notify to stop the stopping task spawned in the constructor
+         self.0.control_stream.notify().on_stop.notify_one();
++
++        // The notify calls above only wake *callers* of poll_frame()/
++        // poll_packet() -- they do nothing for each stream's own background
++        // driver task (see `StreamRef::abort_driver`'s doc comment for why
++        // those never stop on their own). Abort them directly so dropping
++        // this `MoonlightStream` doesn't leave them running forever.
++        self.0.audio_stream.abort_driver();
++        self.0.video_stream.abort_driver();
++        self.0.control_stream.abort_driver();
++        if let Some(foundation_mic_stream) = &self.0.foundation_mic_stream {
++            foundation_mic_stream.abort_driver();
++        }
+     }
+ }
+ 
