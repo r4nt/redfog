@@ -165,9 +165,19 @@ jobs:
         # new hang now shows up as a clear, fast nextest TIMEOUT result
         # instead, with normal `--nocapture`-free output (nextest always
         # streams a timed-out test's captured output on its own).
-        run: |
-          source <(cargo llvm-cov show-env --sh)
-          cargo llvm-cov nextest --workspace --exclude kwin-capture --test-threads 1 -- --skip gst_wayland_display_backend_smoke_test
+        #
+        # No `source <(cargo llvm-cov show-env --sh)` here, unlike the
+        # plain-`cargo build`/`cargo test` steps elsewhere in this job:
+        # `cargo llvm-cov nextest` sets up its own instrumentation
+        # internally (that's the whole point of it being a dedicated
+        # subcommand rather than a plain `cargo nextest run`) -- sourcing
+        # show-env first as well double-wraps rustc (this step's own
+        # RUSTC_WRAPPER=cargo-llvm-cov, invoked *again* by the subcommand's
+        # own setup) and breaks every single compilation outright.
+        # Confirmed live: doing so made every rustc invocation in the
+        # workspace fail immediately, even trivial `--print=sysroot`-style
+        # probe calls, well before any real test ran.
+        run: cargo llvm-cov nextest --workspace --exclude kwin-capture --test-threads 1 -- --skip gst_wayland_display_backend_smoke_test
 
       - name: Coverage summary
         # `cargo llvm-cov report` needs the same show-env vars as the build/
