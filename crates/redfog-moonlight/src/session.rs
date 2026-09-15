@@ -1338,6 +1338,24 @@ impl SessionManager {
             let origin = {
                 let shared = this.shared.lock().unwrap();
                 let Some(session) = session_by_generation(&shared, generation) else {
+                    // A backgrounded session is *expected* to keep hitting
+                    // this branch, at the opus frame rate, for as long as
+                    // it stays backgrounded (its audio pipeline is
+                    // deliberately still `Playing` — see
+                    // `background_or_discard`'s doc comment — while
+                    // `session_by_generation` only ever looks at
+                    // `shared.clients`, which a backgrounded session has
+                    // been moved out of). Confirmed live: this alone
+                    // produced ~11,000 warnings in under a minute for one
+                    // backgrounded session. Silently drop for that case —
+                    // still checked with `shared`'s lock already dropped
+                    // below via a second, separate lock acquisition on
+                    // `background_sessions`, not nested under `shared`'s,
+                    // to avoid a lock-ordering dependency between the two.
+                    drop(shared);
+                    if generation_is_backgrounded(&this.background_sessions, generation) {
+                        return;
+                    }
                     // Was silent before — see `audio_stats`'s own doc
                     // comment for why that was a real diagnostic gap, not a
                     // hypothetical one. Logged every time this fires
@@ -1496,6 +1514,25 @@ impl SessionManager {
         wanted_fps: u32,
         wanted_bitrate_kbps: u32,
         wanted_codec: redfog_core::VideoCodec,
+        // The caller's *incoming* origin's `connected` flag -- NOT
+        // `session.origin.connected`. `handoff_to_user` calls this before
+        // overwriting `session.origin` with a fresh/incoming origin (see its
+        // own comment on why that overwrite has to happen after this call),
+        // so at this point `session.origin` is still the *old* origin that's
+        // about to be discarded. The direct-NVENC path below captures this
+        // `Arc` once and holds it for the encoder thread's whole lifetime
+        // (see `CudaDirectEncoderSession::spawn`'s doc comment) -- passing
+        // `session.origin.connected` here would hand that thread an `Arc`
+        // that's about to become orphaned from the session's real state the
+        // moment the caller finishes overwriting `session.origin`, silently
+        // wedging video at whatever `connected` happened to read at that
+        // instant forever after (confirmed live: a client that disconnected
+        // once, then reconnected through a resume/takeover, kept flowing
+        // audio fine -- its callback re-reads `session.origin` fresh every
+        // packet -- while video stayed dark permanently, because its
+        // `CudaDirectEncoderSession` was still watching the old, by-then-
+        // unreachable origin's `connected` flag stuck at `false`).
+        connected: Arc<std::sync::atomic::AtomicBool>,
     ) -> RunningSession {
         if session.cuda_direct_session.is_none() {
             return session;
@@ -1559,7 +1596,7 @@ impl SessionManager {
             wanted_codec,
             handle,
             this,
-            session.origin.connected.clone(),
+            connected,
         );
         session.video_pipeline = video_pipeline;
         session.cuda_direct_session = cuda_direct_session;
@@ -2364,9 +2401,17 @@ impl SessionManager {
                 // this session's encoder was first built.
                 let this = self.arc_self();
                 let (wanted_bitrate_kbps, wanted_codec) = (origin.target_bitrate_kbps, origin.codec);
-                let mut background = tokio::task::spawn_blocking(move || this.reconcile_video_pipeline(background, width, height, fps, wanted_bitrate_kbps, wanted_codec))
-                    .await
-                    .map_err(|e| format!("reconcile_video_pipeline task panicked: {e}"))?;
+                // The *incoming* origin's `connected` (not `background.origin`'s,
+                // which is about to be discarded below) -- see
+                // `reconcile_video_pipeline`'s doc comment on its own
+                // `connected` parameter for why passing the wrong one here
+                // silently wedges video forever on the direct-NVENC path.
+                let incoming_connected = origin.connected.clone();
+                let mut background = tokio::task::spawn_blocking(move || {
+                    this.reconcile_video_pipeline(background, width, height, fps, wanted_bitrate_kbps, wanted_codec, incoming_connected)
+                })
+                .await
+                .map_err(|e| format!("reconcile_video_pipeline task panicked: {e}"))?;
                 // This resume is still a brand-new wire-level RTSP session
                 // from the client's perspective (a fresh `/launch`, fresh
                 // RTP epoch) even though the compositor underneath is old —
@@ -2757,6 +2802,19 @@ fn resolve_client_key_by_rikey(shared: &Shared, rikey: [u8; 16]) -> Option<Clien
 /// later resume/takeover on the same `RunningSession` untouched.
 fn session_by_generation(shared: &Shared, generation: u64) -> Option<&RunningSession> {
     shared.clients.values().find_map(|slot| slot.state.session().filter(|s| s.generation == generation))
+}
+
+/// Whether `generation` belongs to a session currently sitting in
+/// `background_sessions` — used by the audio callback to tell "this
+/// session is backgrounded, and its pipeline is *deliberately* still
+/// `Playing` (see `background_or_discard`'s doc comment)" apart from "this
+/// session doesn't exist anywhere at all", which `session_by_generation`
+/// alone can't distinguish (it only ever looks at `shared.clients` — see
+/// its own doc comment for why). Only the former is expected/routine; the
+/// latter is the real diagnostic gap the audio callback's warning exists
+/// to catch.
+fn generation_is_backgrounded(background_sessions: &Mutex<HashMap<String, RunningSession>>, generation: u64) -> bool {
+    background_sessions.lock().unwrap().values().any(|session| session.generation == generation)
 }
 
 /// Steals whatever's currently *actively attached* (`Launched` or
