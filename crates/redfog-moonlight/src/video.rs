@@ -497,4 +497,60 @@ mod tests {
         reed_solomon.reconstruct_data(&mut rs_shards).expect("reconstruct dropped data shard from parity shards");
         assert_eq!(rs_shards[1].as_deref(), Some(dropped.as_slice()));
     }
+
+    /// Real cross-check against the client-side implementation, not just
+    /// this module's own hand-rolled reassembly (which only proves the
+    /// packetizer agrees with itself) -- feeds every shard `packetize()`
+    /// produces (data *and* FEC) straight into moonlight-common-rust's own
+    /// `VideoDepayloader`, the same code moonlight-web-stream's `streamer`
+    /// process links against, and asserts the reconstructed frame is
+    /// byte-identical to the original access unit.
+    ///
+    /// AV1 specifically: `VideoDepayloader::parse_frame_header` only trims
+    /// the last shard's zero-padding (via `last_payload_len`) for codecs
+    /// *outside* `VideoFormats::MASK_H264 | MASK_H265` -- i.e. exactly the
+    /// AV1 path, and only that path, since H.264/HEVC decoders tolerate
+    /// trailing zero padding on their last NAL unit but AV1's OBU framing
+    /// doesn't. That's the one codec-conditional branch on the whole
+    /// receive side, and until this test, nothing in this codebase
+    /// exercised it at all -- every existing round-trip check here reused
+    /// the packetizer's own math to verify itself, which would agree with
+    /// a self-consistent bug just as readily as with correct code.
+    #[test]
+    fn round_trips_through_the_real_client_depayloader_for_av1() {
+        use moonlight_common::ServerVersion;
+        use moonlight_common::stream::proto::video::depayloader::{VideoDepayloader, VideoDepayloaderConfig};
+        use moonlight_common::stream::video::{FrameIndex, VideoFormat};
+
+        let payload_capacity = REQUESTED_PACKET_SIZE - NV_VIDEO_PACKET_SIZE;
+        // Sizes chosen to exercise different shapes: a small multi-shard
+        // frame not landing on a shard boundary (the general case), and one
+        // close to a real AV1 keyframe's actual size (~27KB, confirmed live
+        // via journalctl -- "video encoder produced a keyframe (27535
+        // bytes)") -- more shards means more parity shards too (20% default
+        // FEC), a different code path shape than the 4-shard case alone
+        // covers.
+        for size in [payload_capacity * 3 + 137, 27_535] {
+            let mut packetizer = VideoPacketizer::new();
+            let encoded: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+            let shards = packetizer.packetize(&encoded, true, 12345);
+
+            let mut depayloader = VideoDepayloader::new(VideoDepayloaderConfig {
+                packet_size: REQUESTED_PACKET_SIZE,
+                format: VideoFormat::Av1Main8,
+                server_version: ServerVersion::new(7, 1, 431, -1),
+            });
+            for shard in &shards {
+                depayloader.handle_packet(shard).expect("client depayloader must accept every shard packetize() produces");
+            }
+
+            assert!(depayloader.is_frame_available(FrameIndex(1)), "client never saw a complete, reconstructable {size}-byte frame");
+            let frame = depayloader.frame(FrameIndex(1)).expect("frame reported available but frame() returned None");
+            let mut reconstructed = Vec::new();
+            for buffer in frame.buffers {
+                reconstructed.extend_from_slice(buffer.data);
+            }
+            assert_eq!(reconstructed, encoded, "client-reconstructed {size}-byte AV1 frame doesn't match what was encoded — real decode would fail");
+        }
+    }
 }
