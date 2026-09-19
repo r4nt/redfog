@@ -13,3 +13,18 @@
 # complicated (and, in the end, still insufficient) diagnostic wrapper.
 [profile.default]
 slow-timeout = { period = "90s", terminate-after = 1 }
+
+# `redfog-core`'s two `av1_*_keyframe_*` tests (crates/redfog-core/src/
+# lib.rs) do real GStreamer software AV1 encoding and, unlike everything
+# else here, need a real number of access units to actually arrive (not
+# just "eventually", see their own doc comments on why counting frames
+# instead of wall-clock time matters) -- confirmed live across several CI
+# runs that GitHub Actions' shared runners vary enough, run to run, that
+# the shared 90s default sometimes isn't enough even for a deliberately
+# small frame budget. A dedicated, more generous ceiling for just these
+# two keeps the default 90s meaningful everywhere else (still the right
+# backstop for a genuine hang) without this pair's own encoding-speed
+# variance forcing that default upward for every other test.
+[[profile.default.overrides]]
+filter = 'package(redfog-core) and test(keyframe)'
+slow-timeout = { period = "60s", terminate-after = 4 }

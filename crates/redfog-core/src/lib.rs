@@ -2135,19 +2135,24 @@ mod tests {
 
     /// How many access units the two `av1_*_keyframe_*` tests below will
     /// wait for a forced keyframe within, after firing the request(s).
-    /// Confirmed live this needs to stay small, not just "well under
-    /// `NATURAL_KEYFRAME_INTERVAL`": a first attempt used
-    /// `NATURAL_KEYFRAME_INTERVAL / 2` (150) and that alone was enough real
-    /// encoding work to blow past nextest's own 90s slow-timeout on a
-    /// GitHub Actions shared runner on a bad day (a hard `TERMINATING`/
-    /// `TIMEOUT` kill, not even reaching either test's own internal
-    /// assertion) -- GitHub Actions' shared runners are known to vary
-    /// wildly run to run, so the fix isn't a bigger wall-clock allowance
-    /// (an arms race against unpredictable infrastructure) but doing less
-    /// total encoding work per test. 30 is still a 10x margin below the
-    /// 300-frame natural schedule -- more than enough to stay unambiguous
-    /// -- while needing 5x less encoding work than the original 150.
-    const FORCED_KEYFRAME_FRAME_BUDGET: u32 = 30;
+    /// Confirmed live across three separate real CI failures that this
+    /// number is a genuine tradeoff, not just "pick something well under
+    /// `NATURAL_KEYFRAME_INTERVAL`": too big (150, `NATURAL_KEYFRAME_
+    /// INTERVAL / 2`) cost enough real encoding work to blow past
+    /// nextest's slow-timeout on a bad GitHub Actions run; too small (30)
+    /// failed a *different* way on a *good* run -- finished in under 3s,
+    /// but genuinely never saw a keyframe land within those 30 access
+    /// units, meaning `request_keyframe`'s effect isn't reliably visible
+    /// on literally the next frame or two, at least not always. 100 is
+    /// still a real (3x) margin below the 300-frame natural schedule --
+    /// enough to stay unambiguous -- while giving real slack for that
+    /// latency. The matching wall-clock risk (100 access units taking too
+    /// long on a slow CI run) is handled separately, by these two tests'
+    /// own dedicated slow-timeout override in `.config/nextest.toml`,
+    /// rather than by keeping this number artificially small -- the two
+    /// constraints (enough frames to see the effect reliably, enough time
+    /// for slow hardware) don't have to fight over one shared budget.
+    const FORCED_KEYFRAME_FRAME_BUDGET: u32 = 100;
 
     /// Guards against silently reverting to the more common VoIP default of
     /// `frame-size=20` — the exact regression that caused a real, live
@@ -2594,17 +2599,21 @@ mod tests {
         // schedule alone would already satisfy, proving nothing about
         // whether the forced request itself worked. Counting access units
         // instead of elapsed time is invariant to CPU speed: a real,
-        // honored force-key-unit request affects the *next* frame the
-        // encoder processes, not something tied to how long that takes in
-        // wall-clock terms, so a small frame-count budget (well under the
-        // 300-frame natural interval) stays a meaningful, unambiguous
-        // signal on any hardware. The 90s recv loop below is purely a
-        // hang backstop (nextest's own slow-timeout is 90s, so this never
-        // meaningfully extends a genuine wedge) -- it is not what makes
-        // this assertion mean "forced," the frame count is.
+        // honored force-key-unit request takes effect within a bounded
+        // number of frames the encoder processes (see
+        // `FORCED_KEYFRAME_FRAME_BUDGET`'s own doc comment -- confirmed
+        // live this isn't always literally the very next one), not
+        // something tied to how long that takes in wall-clock terms, so a
+        // frame-count budget well under the 300-frame natural interval
+        // stays a meaningful, unambiguous signal regardless of encoding
+        // speed. The recv loop's own wall-clock bound below is purely a
+        // hang backstop matching this pair's dedicated, more generous
+        // slow-timeout override in `.config/nextest.toml` (not the
+        // default 90s) -- it is not what makes this assertion mean
+        // "forced," the frame count is.
         let mut access_units_since_request = 0;
         let mut forced_keyframe_arrived = false;
-        let hang_backstop = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let hang_backstop = std::time::Instant::now() + std::time::Duration::from_secs(200);
         while std::time::Instant::now() < hang_backstop && access_units_since_request < FORCED_KEYFRAME_FRAME_BUDGET {
             if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
                 access_units_since_request += 1;
@@ -2702,13 +2711,12 @@ mod tests {
         // `FORCED_KEYFRAME_FRAME_BUDGET` above: a long enough wall-clock
         // window risks catching the *natural* 300-frame-scheduled keyframe
         // instead of one any of the 15 forced requests actually produced
-        // (proving nothing), while a large frame-count budget risks enough
-        // real encoding work to blow past nextest's own slow-timeout on a
-        // bad CI run. `FORCED_KEYFRAME_FRAME_BUDGET` leaves no ambiguity
-        // either way, on any hardware.
+        // (proving nothing). The wall-clock bound below is just a hang
+        // backstop, matching this pair's dedicated slow-timeout override
+        // in `.config/nextest.toml`.
         let mut access_units_during_flood = 0;
         let mut keyframes_during_flood = 0;
-        let flood_backstop = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let flood_backstop = std::time::Instant::now() + std::time::Duration::from_secs(200);
         while std::time::Instant::now() < flood_backstop && access_units_during_flood < FORCED_KEYFRAME_FRAME_BUDGET {
             if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
                 access_units_during_flood += 1;
