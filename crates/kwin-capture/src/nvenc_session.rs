@@ -481,8 +481,20 @@ fn run_encoder(
     // itself has no pacing/throttle beyond the "no frame yet" sleep below,
     // so it encodes every frame PipeWire/KWin's damage-driven output
     // actually delivers, whatever that real rate turns out to be). Logged
-    // once a second so a live session can be checked directly against the
-    // client-requested fps, without needing an external profiler.
+    // periodically so a live session can be checked directly against the
+    // client-requested fps, without needing an external profiler --
+    // defaults to once a minute (was once a second; confirmed live that
+    // was real, unconditional-by-default log spam over any long-running
+    // session, unlike `EncodedFrameStats`' own 5s-interval stats lines
+    // elsewhere, which are already this quiet). Configurable, not just
+    // quieted outright, since a tighter interval is still genuinely
+    // useful when actively chasing a live fps problem.
+    let fps_log_interval = std::env::var("REDFOG_NVENC_FPS_LOG_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(60));
     let mut fps_window_start = std::time::Instant::now();
     let mut fps_window_count: u32 = 0;
 
@@ -674,7 +686,7 @@ fn run_encoder(
 
         fps_window_count += 1;
         let fps_window_elapsed = fps_window_start.elapsed();
-        if fps_window_elapsed >= std::time::Duration::from_secs(1) {
+        if fps_window_elapsed >= fps_log_interval {
             eprintln!(
                 "kwin-capture: actual encoded frame rate: {:.1} fps (client-requested fps={fps})",
                 fps_window_count as f64 / fps_window_elapsed.as_secs_f64()
