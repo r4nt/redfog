@@ -2133,6 +2133,22 @@ mod tests {
     /// regardless."
     const NATURAL_KEYFRAME_INTERVAL: u32 = 300;
 
+    /// How many access units the two `av1_*_keyframe_*` tests below will
+    /// wait for a forced keyframe within, after firing the request(s).
+    /// Confirmed live this needs to stay small, not just "well under
+    /// `NATURAL_KEYFRAME_INTERVAL`": a first attempt used
+    /// `NATURAL_KEYFRAME_INTERVAL / 2` (150) and that alone was enough real
+    /// encoding work to blow past nextest's own 90s slow-timeout on a
+    /// GitHub Actions shared runner on a bad day (a hard `TERMINATING`/
+    /// `TIMEOUT` kill, not even reaching either test's own internal
+    /// assertion) -- GitHub Actions' shared runners are known to vary
+    /// wildly run to run, so the fix isn't a bigger wall-clock allowance
+    /// (an arms race against unpredictable infrastructure) but doing less
+    /// total encoding work per test. 30 is still a 10x margin below the
+    /// 300-frame natural schedule -- more than enough to stay unambiguous
+    /// -- while needing 5x less encoding work than the original 150.
+    const FORCED_KEYFRAME_FRAME_BUDGET: u32 = 30;
+
     /// Guards against silently reverting to the more common VoIP default of
     /// `frame-size=20` — the exact regression that caused a real, live
     /// symptom (a WebRTC-relaying client's playback clock running 4x too
@@ -2502,8 +2518,15 @@ mod tests {
     #[test]
     fn av1_request_keyframe_actually_forces_one() {
         gst::init().expect("gst::init");
-        const WIDTH: u32 = 1280;
-        const HEIGHT: u32 = 720;
+        // Smaller than `login_software_av1_pipeline_runs_and_keeps_up`'s
+        // 1280x720 -- this test needs meaningfully more total encoding
+        // work done (settle + up to `FORCED_KEYFRAME_FRAME_BUDGET` more
+        // access units, vs. that test's flat 30 in a 5s window), so a
+        // smaller frame is a second, independent lever (alongside
+        // `FORCED_KEYFRAME_FRAME_BUDGET` itself) for keeping this well
+        // clear of nextest's 90s slow-timeout under CI's own worst case.
+        const WIDTH: u32 = 640;
+        const HEIGHT: u32 = 360;
         let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let (au_tx, au_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
 
@@ -2582,7 +2605,7 @@ mod tests {
         let mut access_units_since_request = 0;
         let mut forced_keyframe_arrived = false;
         let hang_backstop = std::time::Instant::now() + std::time::Duration::from_secs(90);
-        while std::time::Instant::now() < hang_backstop && access_units_since_request < NATURAL_KEYFRAME_INTERVAL / 2 {
+        while std::time::Instant::now() < hang_backstop && access_units_since_request < FORCED_KEYFRAME_FRAME_BUDGET {
             if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
                 access_units_since_request += 1;
                 if is_keyframe {
@@ -2614,8 +2637,12 @@ mod tests {
     #[test]
     fn av1_survives_rapid_repeated_keyframe_requests() {
         gst::init().expect("gst::init");
-        const WIDTH: u32 = 1280;
-        const HEIGHT: u32 = 720;
+        // See `av1_request_keyframe_actually_forces_one`'s doc comment on
+        // its own `WIDTH`/`HEIGHT` for why this is smaller than the
+        // pre-existing `login_software_av1_pipeline_runs_and_keeps_up`'s
+        // 1280x720 -- same reasoning applies here too.
+        const WIDTH: u32 = 640;
+        const HEIGHT: u32 = 360;
         let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let (au_tx, au_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
 
@@ -2672,16 +2699,17 @@ mod tests {
 
         // Now drain whatever the flood produced -- frame-count-bounded, not
         // wall-clock-bounded, for exactly the reason explained on
-        // `NATURAL_KEYFRAME_INTERVAL` in the single-request test above: a
-        // long enough wall-clock window risks catching the *natural*
-        // 300-frame-scheduled keyframe instead of one any of the 15 forced
-        // requests actually produced, which would prove nothing. Draining
-        // up to 150 access units (half the natural interval) leaves no
-        // ambiguity either way, on any hardware.
+        // `FORCED_KEYFRAME_FRAME_BUDGET` above: a long enough wall-clock
+        // window risks catching the *natural* 300-frame-scheduled keyframe
+        // instead of one any of the 15 forced requests actually produced
+        // (proving nothing), while a large frame-count budget risks enough
+        // real encoding work to blow past nextest's own slow-timeout on a
+        // bad CI run. `FORCED_KEYFRAME_FRAME_BUDGET` leaves no ambiguity
+        // either way, on any hardware.
         let mut access_units_during_flood = 0;
         let mut keyframes_during_flood = 0;
         let flood_backstop = std::time::Instant::now() + std::time::Duration::from_secs(90);
-        while std::time::Instant::now() < flood_backstop && access_units_during_flood < NATURAL_KEYFRAME_INTERVAL / 2 {
+        while std::time::Instant::now() < flood_backstop && access_units_during_flood < FORCED_KEYFRAME_FRAME_BUDGET {
             if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
                 access_units_during_flood += 1;
                 if is_keyframe {
