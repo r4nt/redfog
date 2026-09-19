@@ -37,6 +37,15 @@ use crate::pairing::{ClientKey, LaunchHandler, RemoteInputKey};
 use crate::rtsp::{AnnouncedParams, RtspHandler};
 use crate::video::{VideoPacketizer, VideoSender};
 
+/// Ceiling applied to the Login stage's own encoder target -- see the doc
+/// comment where this is used, in `start_streaming`'s Login-video-pipeline
+/// rebuild -- regardless of what the client actually negotiated for its
+/// real session. Not user-configurable: this is a fixed characteristic of
+/// the Login screen's own content (static UI, never real video/game
+/// content), not a general quality/bandwidth tuning knob like
+/// `SessionConfig::bitrate_kbps`.
+const LOGIN_BITRATE_CAP_KBPS: u32 = 1000;
+
 pub struct SessionConfig {
     pub bind_addr: IpAddr,
     pub video_port: u16,
@@ -1874,7 +1883,32 @@ impl SessionManager {
                 let handle = tokio::runtime::Handle::current();
                 let this = self.arc_self();
                 let kind = session.kind.clone();
-                let bitrate_kbps = session.origin.target_bitrate_kbps;
+                // Capped well below whatever the client actually
+                // negotiated -- `session.origin.target_bitrate_kbps`
+                // itself is deliberately left untouched here (it's
+                // carried forward as-is into the real User-stage session
+                // on handoff -- see `spawn_session`'s doc comment on why
+                // `origin` has to survive that transition unmodified).
+                // The Login screen is close to static UI (a login form,
+                // no video/game content), so it doesn't need anywhere
+                // near the client's requested bitrate for good visual
+                // quality -- and a lower target directly shrinks every
+                // keyframe (including forced ones from RequestIdrFrame),
+                // which matters because a forced keyframe's *encode
+                // cost* is dominated by resolution/quantization, not
+                // scene motion, so "nothing moves" doesn't make it cheap
+                // on its own. A smaller keyframe both encodes somewhat
+                // faster (less residual detail to pack at a coarser
+                // quantizer) and, more directly, has fewer shards to
+                // fully arrive before moonlight-common-rust's own
+                // `FULL_FRAME_RECEIVE_TIMEOUT`/`STALL_TIMEOUT` (100ms/2s
+                // -- see
+                // `vendor/moonlight-common-rust/src/stream/proto/video/
+                // mod.rs`) give up on it and request another --
+                // confirmed live this matters specifically for the
+                // Login stage's software AV1 path, the one combination
+                // without hardware encoding to fall back on.
+                let bitrate_kbps = session.origin.target_bitrate_kbps.min(LOGIN_BITRATE_CAP_KBPS);
                 let codec = session.origin.codec;
                 let connected = session.origin.connected.clone();
                 tracing::info!(

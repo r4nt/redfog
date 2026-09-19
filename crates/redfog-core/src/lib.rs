@@ -2123,6 +2123,16 @@ where
 mod tests {
     use super::*;
 
+    /// `keyframe-max-dist=300`, the real, hardcoded production value from
+    /// `software_encoder_element`'s AV1 arm -- shared by the two
+    /// `av1_*_keyframe_*` tests below, both of which count access units
+    /// (not wall-clock time) after a forced keyframe request specifically
+    /// to stay well clear of this natural schedule; see their own doc
+    /// comments for why wall-clock alone can't distinguish "the request
+    /// worked" from "we just waited long enough for the next scheduled one
+    /// regardless."
+    const NATURAL_KEYFRAME_INTERVAL: u32 = 300;
+
     /// Guards against silently reverting to the more common VoIP default of
     /// `frame-size=20` — the exact regression that caused a real, live
     /// symptom (a WebRTC-relaying client's playback clock running 4x too
@@ -2549,20 +2559,32 @@ mod tests {
         // This is the exact call `on_request_idr_frame` makes in production.
         request_keyframe(&pipeline);
 
-        // Confirmed live: a 3s deadline here is reliable on a dev machine
-        // but flaked on a shared GitHub Actions runner (real CI failure,
-        // not a hypothetical) -- software AV1 encoding is real CPU work,
-        // and a busier/weaker shared vCPU can genuinely take longer to get
-        // back around to producing the next access unit after the forced
-        // keyframe request, without that meaning the request was ever
-        // actually dropped or ignored. 20s is still well under nextest's
-        // own 90s slow-timeout (`.config/nextest.toml`), and a real "never
-        // honors the request" bug would hang far longer than this margin
-        // covers, not just miss a few extra seconds of scheduling slack.
-        let forced_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        // Deliberately *not* a wall-clock deadline for the pass/fail
+        // criterion: `keyframe-max-dist=300` means a keyframe arrives on
+        // its own schedule every 300 access units regardless of whether
+        // `request_keyframe` does anything at all, and CPU speed alone
+        // (confirmed live: a slower/busier shared CI runner can take much
+        // longer than a fast dev machine to produce each access unit) can
+        // stretch that same 300-frame wait past almost any wall-clock
+        // window -- a long-enough timer risks silently downgrading this
+        // into "eventually some keyframe showed up," which the *natural*
+        // schedule alone would already satisfy, proving nothing about
+        // whether the forced request itself worked. Counting access units
+        // instead of elapsed time is invariant to CPU speed: a real,
+        // honored force-key-unit request affects the *next* frame the
+        // encoder processes, not something tied to how long that takes in
+        // wall-clock terms, so a small frame-count budget (well under the
+        // 300-frame natural interval) stays a meaningful, unambiguous
+        // signal on any hardware. The 90s recv loop below is purely a
+        // hang backstop (nextest's own slow-timeout is 90s, so this never
+        // meaningfully extends a genuine wedge) -- it is not what makes
+        // this assertion mean "forced," the frame count is.
+        let mut access_units_since_request = 0;
         let mut forced_keyframe_arrived = false;
-        while std::time::Instant::now() < forced_deadline {
+        let hang_backstop = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while std::time::Instant::now() < hang_backstop && access_units_since_request < NATURAL_KEYFRAME_INTERVAL / 2 {
             if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                access_units_since_request += 1;
                 if is_keyframe {
                     forced_keyframe_arrived = true;
                     break;
@@ -2573,7 +2595,8 @@ mod tests {
         let _ = pipeline.set_state(gst::State::Null);
         assert!(
             forced_keyframe_arrived,
-            "request_keyframe() never produced a real keyframe within 20s for AV1 -- \
+            "request_keyframe() never produced a real keyframe within {access_units_since_request} \
+             access units (well under the {NATURAL_KEYFRAME_INTERVAL}-frame natural schedule) for AV1 -- \
              a client stuck needing a fresh IDR (e.g. after packet loss) would never recover"
         );
     }
@@ -2634,22 +2657,42 @@ mod tests {
         }
         assert!(saw_initial_keyframe, "never saw the pipeline's own initial keyframe");
 
-        // Flood it: 15 requests, 150ms apart (matching the real log's
-        // observed cadence), while draining and counting access units
-        // throughout -- not just after the flood -- so a stall *during* the
-        // flood shows up too, not just a stall discovered afterward.
-        let mut access_units_during_flood = 0;
-        let mut keyframes_during_flood = 0;
+        // Fire 15 requests, 150ms apart -- matching the real log's observed
+        // cadence. Deliberately *not* interleaved with draining/asserting
+        // on `au_rx` here (`std::sync::mpsc::channel` is unbounded, so a
+        // producer that outruns this loop just queues up harmlessly): the
+        // request *cadence* is the thing being matched to the real bug
+        // report, not how quickly this loop happens to drain results, and
+        // tying those together is what made the original version of this
+        // test too tight on a slower/busier CI runner.
         for _ in 0..15 {
             request_keyframe(&pipeline);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
-            while std::time::Instant::now() < deadline {
-                if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(150)) {
-                    access_units_during_flood += 1;
-                    if is_keyframe {
-                        keyframes_during_flood += 1;
-                    }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+
+        // Now drain whatever the flood produced -- frame-count-bounded, not
+        // wall-clock-bounded, for exactly the reason explained on
+        // `NATURAL_KEYFRAME_INTERVAL` in the single-request test above: a
+        // long enough wall-clock window risks catching the *natural*
+        // 300-frame-scheduled keyframe instead of one any of the 15 forced
+        // requests actually produced, which would prove nothing. Draining
+        // up to 150 access units (half the natural interval) leaves no
+        // ambiguity either way, on any hardware.
+        let mut access_units_during_flood = 0;
+        let mut keyframes_during_flood = 0;
+        let flood_backstop = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while std::time::Instant::now() < flood_backstop && access_units_during_flood < NATURAL_KEYFRAME_INTERVAL / 2 {
+            if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                access_units_during_flood += 1;
+                if is_keyframe {
+                    keyframes_during_flood += 1;
                 }
+            } else {
+                // No more backlog waiting -- the flood's own output has
+                // been fully drained (as opposed to the encoder still
+                // being mid-catch-up, which recv_timeout returning late
+                // rather than erroring already accounts for).
+                break;
             }
         }
 
