@@ -2475,6 +2475,192 @@ mod tests {
         assert!(access_units >= 30, "only {access_units} access units in 5s — Login/Software AV1 pipeline isn't keeping up");
     }
 
+    /// Real, live reproduction of the client's own recovery path: on packet
+    /// loss (or any decode failure), a real Moonlight client's only recourse
+    /// is `RequestIdrFrame`, which `SessionManager::on_request_idr_frame`
+    /// answers by calling exactly `request_keyframe` below against the live
+    /// pipeline (`crates/redfog-moonlight/src/session.rs`). If `av1enc`
+    /// doesn't actually honor the resulting `UpstreamForceKeyUnitEvent` (or
+    /// honors it late), a client stuck needing a fresh IDR would never
+    /// recover -- repeated `RequestIdrFrame` calls, no keyframe ever
+    /// arriving, exactly the "IDR frame request sent" loop confirmed live in
+    /// moonlight-web-stream's own log. `keyframe-max-dist=300` (the real,
+    /// hardcoded production value -- see `software_encoder_element`'s AV1
+    /// arm) means naturally-scheduled keyframes are ~10s apart at 30fps, so
+    /// a keyframe arriving well before that is unambiguously the forced one,
+    /// not a coincidental scheduled one.
+    #[test]
+    fn av1_request_keyframe_actually_forces_one() {
+        gst::init().expect("gst::init");
+        const WIDTH: u32 = 1280;
+        const HEIGHT: u32 = 720;
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (au_tx, au_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
+
+        let pipeline = make_encoder_pipeline(
+            VideoSource::Login { frame_rx, width: WIDTH, height: HEIGHT },
+            "test-client-idr",
+            VideoEncoder::Software,
+            Some(30),
+            10_000,
+            VideoCodec::Av1,
+            "",
+            move |data, is_keyframe, _capture_instant| {
+                let _ = au_tx.send((data, is_keyframe));
+            },
+        );
+        pipeline.set_state(gst::State::Playing).expect("set Playing");
+
+        let pusher_frame_tx = frame_tx.clone();
+        std::thread::spawn(move || {
+            let frame = vec![0x80u8; (WIDTH * HEIGHT * 4) as usize];
+            for _ in 0..300 {
+                if pusher_frame_tx.send(frame.clone()).is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(33));
+            }
+        });
+
+        // Wait for the real initial keyframe (produced at stream start,
+        // unrelated to what this test is checking) and a handful of
+        // ordinary P-frames after it, so the forced request below can't be
+        // mistaken for that startup keyframe.
+        let mut saw_initial_keyframe = false;
+        let mut frames_since_initial_keyframe = 0;
+        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < settle_deadline && frames_since_initial_keyframe < 5 {
+            if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                if is_keyframe {
+                    saw_initial_keyframe = true;
+                } else if saw_initial_keyframe {
+                    frames_since_initial_keyframe += 1;
+                }
+            }
+        }
+        assert!(saw_initial_keyframe, "never saw the pipeline's own initial keyframe -- can't test forced recovery without it");
+        assert_eq!(frames_since_initial_keyframe, 5, "never settled into ordinary P-frames after the initial keyframe");
+
+        // This is the exact call `on_request_idr_frame` makes in production.
+        request_keyframe(&pipeline);
+
+        let forced_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut forced_keyframe_arrived = false;
+        while std::time::Instant::now() < forced_deadline {
+            if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                if is_keyframe {
+                    forced_keyframe_arrived = true;
+                    break;
+                }
+            }
+        }
+
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(
+            forced_keyframe_arrived,
+            "request_keyframe() never produced a real keyframe within 3s for AV1 -- \
+             a client stuck needing a fresh IDR (e.g. after packet loss) would never recover"
+        );
+    }
+
+    /// Same recovery path as `av1_request_keyframe_actually_forces_one`, but
+    /// matching the *actual* observed failure pattern more closely: the real
+    /// moonlight-web-stream log showed `RequestIdrFrame` firing repeatedly,
+    /// 100-300ms apart, not once in isolation -- a client that keeps failing
+    /// to decode keeps asking again immediately, it doesn't wait for one
+    /// clean answer. If flooding `av1enc` with force-key-unit events in
+    /// quick succession ever wedges it (stops producing *any* further access
+    /// units, keyframe or not -- a real, different failure mode than "just
+    /// never honors the request"), a single-request test like the one above
+    /// would never catch it.
+    #[test]
+    fn av1_survives_rapid_repeated_keyframe_requests() {
+        gst::init().expect("gst::init");
+        const WIDTH: u32 = 1280;
+        const HEIGHT: u32 = 720;
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (au_tx, au_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
+
+        let pipeline = make_encoder_pipeline(
+            VideoSource::Login { frame_rx, width: WIDTH, height: HEIGHT },
+            "test-client-idr-flood",
+            VideoEncoder::Software,
+            Some(30),
+            10_000,
+            VideoCodec::Av1,
+            "",
+            move |data, is_keyframe, _capture_instant| {
+                let _ = au_tx.send((data, is_keyframe));
+            },
+        );
+        pipeline.set_state(gst::State::Playing).expect("set Playing");
+
+        let pusher_frame_tx = frame_tx.clone();
+        std::thread::spawn(move || {
+            let frame = vec![0x80u8; (WIDTH * HEIGHT * 4) as usize];
+            for _ in 0..300 {
+                if pusher_frame_tx.send(frame.clone()).is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(33));
+            }
+        });
+
+        // Wait for the pipeline's own initial keyframe before flooding it --
+        // same reasoning as the single-request test above.
+        let mut saw_initial_keyframe = false;
+        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < settle_deadline && !saw_initial_keyframe {
+            if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                saw_initial_keyframe = is_keyframe;
+            }
+        }
+        assert!(saw_initial_keyframe, "never saw the pipeline's own initial keyframe");
+
+        // Flood it: 15 requests, 150ms apart (matching the real log's
+        // observed cadence), while draining and counting access units
+        // throughout -- not just after the flood -- so a stall *during* the
+        // flood shows up too, not just a stall discovered afterward.
+        let mut access_units_during_flood = 0;
+        let mut keyframes_during_flood = 0;
+        for _ in 0..15 {
+            request_keyframe(&pipeline);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+            while std::time::Instant::now() < deadline {
+                if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(150)) {
+                    access_units_during_flood += 1;
+                    if is_keyframe {
+                        keyframes_during_flood += 1;
+                    }
+                }
+            }
+        }
+
+        // The pipeline must still be alive and producing *something* after
+        // the flood -- proves it didn't wedge.
+        let mut access_units_after_flood = 0;
+        let after_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < after_deadline {
+            if au_rx.recv_timeout(std::time::Duration::from_millis(300)).is_ok() {
+                access_units_after_flood += 1;
+            }
+        }
+
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(
+            access_units_during_flood > 0,
+            "pipeline produced nothing at all during the request flood -- av1enc likely wedged under repeated force-key-unit events"
+        );
+        assert!(
+            keyframes_during_flood > 0,
+            "15 rapid RequestIdrFrame-equivalent calls produced zero real keyframes -- exactly the client-never-recovers symptom"
+        );
+        assert!(
+            access_units_after_flood > 0,
+            "pipeline stopped producing access units entirely after the flood -- av1enc wedged permanently, not just during the burst"
+        );
+    }
+
     /// Real, live pipeline test — the whole reason `videorate` shipped
     /// broken is that it was only ever tested against a well-behaved
     /// continuous source, not a rapid-burst pattern (exactly what real
