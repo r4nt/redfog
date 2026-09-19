@@ -2528,7 +2528,12 @@ mod tests {
         // mistaken for that startup keyframe.
         let mut saw_initial_keyframe = false;
         let mut frames_since_initial_keyframe = 0;
-        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Generous relative to what's actually needed (5 P-frames is well
+        // under 200ms of real playback at 30fps): confirmed live on a
+        // shared GitHub Actions runner that this pipeline runs meaningfully
+        // slower than on a dev machine with a dedicated CPU/GPU -- see
+        // `forced_deadline` below for the concrete failure this caused.
+        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while std::time::Instant::now() < settle_deadline && frames_since_initial_keyframe < 5 {
             if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
                 if is_keyframe {
@@ -2544,7 +2549,17 @@ mod tests {
         // This is the exact call `on_request_idr_frame` makes in production.
         request_keyframe(&pipeline);
 
-        let forced_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // Confirmed live: a 3s deadline here is reliable on a dev machine
+        // but flaked on a shared GitHub Actions runner (real CI failure,
+        // not a hypothetical) -- software AV1 encoding is real CPU work,
+        // and a busier/weaker shared vCPU can genuinely take longer to get
+        // back around to producing the next access unit after the forced
+        // keyframe request, without that meaning the request was ever
+        // actually dropped or ignored. 20s is still well under nextest's
+        // own 90s slow-timeout (`.config/nextest.toml`), and a real "never
+        // honors the request" bug would hang far longer than this margin
+        // covers, not just miss a few extra seconds of scheduling slack.
+        let forced_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut forced_keyframe_arrived = false;
         while std::time::Instant::now() < forced_deadline {
             if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
@@ -2558,7 +2573,7 @@ mod tests {
         let _ = pipeline.set_state(gst::State::Null);
         assert!(
             forced_keyframe_arrived,
-            "request_keyframe() never produced a real keyframe within 3s for AV1 -- \
+            "request_keyframe() never produced a real keyframe within 20s for AV1 -- \
              a client stuck needing a fresh IDR (e.g. after packet loss) would never recover"
         );
     }
@@ -2607,9 +2622,11 @@ mod tests {
         });
 
         // Wait for the pipeline's own initial keyframe before flooding it --
-        // same reasoning as the single-request test above.
+        // same reasoning (and same generous deadline, for the same reason
+        // confirmed live on a shared CI runner) as the single-request test
+        // above.
         let mut saw_initial_keyframe = false;
-        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while std::time::Instant::now() < settle_deadline && !saw_initial_keyframe {
             if let Ok((_, is_keyframe)) = au_rx.recv_timeout(std::time::Duration::from_millis(500)) {
                 saw_initial_keyframe = is_keyframe;
@@ -2637,9 +2654,10 @@ mod tests {
         }
 
         // The pipeline must still be alive and producing *something* after
-        // the flood -- proves it didn't wedge.
+        // the flood -- proves it didn't wedge. Same generous margin as
+        // `forced_deadline` above, for the same CI-confirmed reason.
         let mut access_units_after_flood = 0;
-        let after_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let after_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while std::time::Instant::now() < after_deadline {
             if au_rx.recv_timeout(std::time::Duration::from_millis(300)).is_ok() {
                 access_units_after_flood += 1;
