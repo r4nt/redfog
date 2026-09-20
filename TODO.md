@@ -120,9 +120,124 @@ against a real client).
 
 ## Deliberate deferrals (documented, not bugs — just not built yet)
 
-- [ ] Gamepad/controller input. `control.rs` decodes keyboard + mouse
-      only; every other input event type (including all gamepad packets)
-      hits `_ => None` and is silently dropped.
+- [ ] Replace KWin's `org_kde_kwin_fake_input` (KWin-private Wayland
+      protocol) with **EIS** (`libei`/`libeis`, the modern cross-compositor
+      "Emulated Input" standard) for keyboard/mouse/touch injection.
+      Investigated live (2026-09-21): KWin exposes a private D-Bus method,
+      `org.kde.KWin.EIS.RemoteDesktop.connectToEIS` (registered by
+      `kwin_wayland` itself, `src/plugins/eis/eisbackend.cpp` — see
+      github.com/KDE/kwin/tree/master/src/plugins/eis), that hands back a
+      real EIS connection with **no consent dialog and no portal
+      involvement** — confirmed from source (`connectToEIS` mints its own
+      cookie, no caller-identity check at all) and from real prior art: the
+      kwin-mcp project (github.com/isac322/kwin-mcp) calls this exact
+      method directly against `kwin_wayland --virtual`, the same headless
+      setup redfog uses, explicitly to bypass `xdg-desktop-portal`'s
+      consent-gated `RemoteDesktop` interface (which is a dead end for a
+      headless spawn with no user present — `Start()` always needs one real
+      interactive dialog before any persist/restore token exists). Same
+      trust model as `fake_input`'s own `authenticate()` call, just the
+      standardized protocol instead of a KWin-only Wayland extension. A
+      real Rust implementation exists to build on: the `reis` crate
+      (crates.io, actively maintained, pure Rust, both libei and libeis) —
+      call `connectToEIS` via `zbus` to get the fd, then drive the EIS
+      protocol over it with `reis`. Not started; not a Sway/wlroots
+      solution too (unverified whether it has an equivalent non-portal EIS
+      entry point) — this would only replace `InputForwarder`, not
+      `GstInputSink`.
+- [ ] Revisit keyboard/mouse/touch via inputtino (currently permanently on
+      `fake_input` — see `redfog.conf`'s own comment) now that the actual
+      blocker looks more fixable than first thought. Original root cause
+      (confirmed live, 2026-09-20): KWin's headless `--virtual` backend's
+      libinput integration (`libinput_udev_assign_seat(m_session->seat())`,
+      `src/backends/libinput/context.cpp`) can't discover *any* uinput
+      device, because libinput's own `device_added()`
+      (`src/udev-seat.c`) does `strcmp(device_seat, input->seat_id)` before
+      ever calling `open()` — a real bind-mounted, correctly-permissioned
+      device is filtered out at this line, never even attempted. Confirmed
+      via KWin's own source (invent.kde.org/plasma/kwin) that on this
+      machine (real systemd-logind, not the elogind-less `NoopSession`
+      fallback that just hardcodes `"seat0"`) `LogindSession::seat()` does
+      a live D-Bus query of KWin's own logind session's `Seat` property —
+      which comes back empty for a headless PAM-opened session with no
+      `XDG_SEAT` set, hence the empty `seat_id` libinput's `strcmp` never
+      matches against anything.
+      **The fix already shipped for the gamepad** (2026-09-21,
+      `85-redfog-input.rules`): `ENV{ID_SEAT}=""` on redfog's own generated
+      device nodes. Confirmed from libinput source that its NULL-fallback
+      to `"seat0"` (`if (!device_seat) device_seat = default_seat;`) only
+      fires when the property is *absent* — an explicit empty value skips
+      that fallback and compares equal to KWin's empty `seat_id`. This
+      currently only matters for *other* libinput-based consumers inside a
+      session (redfog's own gamepad handling reads the node directly,
+      bypassing libinput) — but the same trick, applied to
+      `inputtino::Keyboard`/`Mouse`/`Trackpad`'s generated nodes, might be
+      the whole fix needed to let KWin itself discover and use them.
+      Considered and rejected: giving each session a genuinely unique
+      `redfog-<session_id>` seat name (via a udev `IMPORT{program}` helper
+      deriving it from the device's distinctive name, plus setting
+      `XDG_SEAT` before `redfog-session-init`'s `pam_open_session()` call)
+      instead of a shared empty string. No actual benefit found: cross-
+      session isolation is already fully provided by
+      `device_sandbox_systemd_directives`'s `BindPaths`/
+      `TemporaryFileSystem=/dev/input:dev` (each session's compositor only
+      ever *sees* its own device node in the first place), so a shared seat
+      identity across sessions can't collide with anything — there's
+      nothing the per-session name would additionally protect. It would
+      also rest on unverified systemd-logind behavior (whether
+      `CreateSession` actually materializes a session on a seat name that
+      only exists because one virtual device was just tagged for it, vs.
+      rejecting/falling back for an unrecognized seat) — real added
+      complexity for a benefit that isn't there. Not worth revisiting
+      unless the shared-empty-string approach is later found to have a gap
+      this would have closed.
+      **New corroborating evidence (2026-09-21):** the gamepad (which
+      already ships with `ENV{ID_SEAT}=""`) now shows up correctly in KDE
+      System Settings' own game-controller panel — a real *other*
+      libinput-based consumer inside the session successfully discovering
+      a redfog-tagged device, exactly the scenario step 2 below is asking
+      about. Not the same test (System Settings isn't KWin's own libinput
+      seat, and gamepad discovery there doesn't touch `SeatInterface`
+      event delivery at all), but a genuine positive data point for the
+      seat-string mechanism generalizing — worth factoring in when this
+      gets picked up.
+      **Also worth reusing if this gets picked up:** getting the gamepad's
+      own ACL right (2026-09-21) needed more than `ENV{ID_SEAT}=""` —
+      `uaccess` kept re-writing/clobbering any `setfacl` grant on these
+      nodes (confirmed live; `TAG-="uaccess"` and an earlier-file
+      `GOTO="uaccess_end"` were both tried and don't work, see
+      `85-redfog-input.rules`' and `session.rs`'s `chown_path`'s own
+      comments for the full story). The fix — `chown` instead of `setfacl`
+      for the actual per-session grant, since `uaccess` never touches base
+      ownership — would apply identically to `inputtino::Keyboard`/`Mouse`
+      device nodes too, being the same kind of uinput-created,
+      `ID_INPUT_JOYSTICK`-or-equivalent-tagged device.
+      **Next steps to actually verify (not yet done):**
+      1. Add the same `ATTRS{name}=="..." ... GROUP="root", MODE="0600",
+         ENV{ID_SEAT}=""` udev override for `inputtino::Keyboard`/`Mouse`
+         (matched by whatever distinctive name they're constructed with,
+         same pattern as `InputtinoGamepad`), and the same broker-side
+         `chown_path` grant (not `setfacl`/`grant_acl`) for their nodes.
+      2. Re-enable `REDFOG_DEBUG_KWIN_LOGGING_RULES=kwin_libinput.debug=true`
+         and spin up a session with a real (or `inputtino_verify`-style
+         throwaway) virtual keyboard/mouse present *before* KWin starts —
+         confirm the device now actually appears as "added" in KWin's own
+         libinput debug log (this alone would falsify or confirm the
+         seat-string theory conclusively, unlike the earlier test which
+         only confirmed bind-mount *visibility*, not libinput's internal
+         seat-matching outcome).
+      3. If discovery succeeds: confirm it's not just a local libinput-
+         level pickup with nothing downstream — send real key/pointer
+         events through the device and confirm they actually reach a
+         Wayland client via KWin's `SeatInterface`. This is the genuinely
+         unverified part: whether KWin's Wayland-facing seat (already
+         proven working today via `fake_input`) is entangled with
+         `m_session->seat()`/the logind seat at all, or is a fully separate
+         internal object that doesn't care how a device was discovered.
+      4. Only if both of those hold: revert the keyboard/mouse/touch
+         portion of the gamepad-only rescope (re-add `InputtinoInputSink`'s
+         keyboard/mouse/touch methods, wire back into `on_input`), keeping
+         gamepad's current direct-evdev handling untouched either way.
 - [ ] HDR. `<IsHdrSupported>0</IsHdrSupported>` is hardcoded. Video itself
       now does H.264, HEVC, and AV1 (see "recently fixed" below) — none of
       it HDR/Main10, just SDR 8-bit.

@@ -141,6 +141,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(s) => s.parse::<redfog_moonlight::session::Backend>()?,
         Err(_) => redfog_moonlight::session::Backend::default(),
     };
+    // Whether this session gets a virtual gamepad, independent of `backend`
+    // above. Keyboard/mouse/touch always go through `Backend`'s own
+    // fake_input/CustomUpstream mechanism regardless of this setting — see
+    // `InputBackend`'s own doc comment. Defaults to no gamepad at all
+    // (`fake-input`); `inputtino` is opt-in, and only actually takes effect
+    // for `Backend::Kwin`.
+    let input_backend = match std::env::var("REDFOG_INPUT_BACKEND") {
+        Ok(s) => s.parse::<redfog_moonlight::session::InputBackend>()?,
+        Err(_) => redfog_moonlight::session::InputBackend::default(),
+    };
     // Auto-detected (prefers nvenc if the plugin is registered — see
     // `detect_video_encoder`'s doc comment) unless explicitly overridden in
     // either direction, e.g. REDFOG_VIDEO_ENCODER=software to force
@@ -199,6 +209,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         broker_socket_path,
         log_mouse_events,
         backend,
+        input_backend,
         session_presets,
         allow_concurrent_sessions_per_user,
     })

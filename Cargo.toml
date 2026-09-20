@@ -19,6 +19,16 @@ members = [
     "crates/redfog-test-cleanup",
 ]
 resolver = "2"
+# Vendored dependencies (see fetch-patched-deps.sh/vendor/, gitignored) live
+# under this workspace root's own directory tree, so Cargo would otherwise
+# implicitly absorb them as workspace members themselves -- confirmed live:
+# without this, `cargo build/test --workspace` also built and RAN
+# inputtino's own upstream test suite (tests/*.rs plus inline #[cfg(test)]
+# unit tests), which assumes real /dev/uinput access and segfaults outright
+# without it. Excluding the whole directory keeps every vendored crate a
+# plain path dependency (still built as needed) without ever being treated
+# as "this workspace" for `--workspace`-scoped commands.
+exclude = ["vendor"]
 
 # Release without debug info gives flamegraph-rs (`cargo flamegraph`)/samply
 # bare addresses instead of function names/line numbers — worthless for

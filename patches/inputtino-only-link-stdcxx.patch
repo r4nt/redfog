@@ -1,0 +1,19 @@
+diff --git a/bindings/rust/inputtino-sys/build.rs b/bindings/rust/inputtino-sys/build.rs
+index c4d4b38..6db9898 100644
+--- a/bindings/rust/inputtino-sys/build.rs
++++ b/bindings/rust/inputtino-sys/build.rs
+@@ -35,8 +35,13 @@ fn main() {
+ 
+     // Dependencies
+     println!("cargo:rustc-link-lib=evdev");
++    // Only stdc++ (GCC/libstdc++) -- not also c++ (LLVM/libc++): the CMake
++    // build above always compiles with the system default `c++` compiler
++    // (GCC on every platform we build for), so libc++ is never actually
++    // needed and usually isn't installed at all (confirmed live: linking
++    // failed with "unable to find library -lc++" on a system that has
++    // libstdc++ but not libc++).
+     println!("cargo:rustc-link-lib=stdc++");
+-    println!("cargo:rustc-link-lib=c++");
+     println!("cargo:rustc-link-lib=static=libinputtino");
+ 
+     let out = bindings.generate().expect("Unable to generate bindings");

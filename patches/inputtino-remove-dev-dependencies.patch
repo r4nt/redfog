@@ -1,0 +1,23 @@
+diff --git a/bindings/rust/inputtino/Cargo.toml b/bindings/rust/inputtino/Cargo.toml
+index 33a534e..f680e71 100644
+--- a/bindings/rust/inputtino/Cargo.toml
++++ b/bindings/rust/inputtino/Cargo.toml
+@@ -7,12 +7,12 @@ homepage = "https://github.com/games-on-whales/inputtino"
+ authors = ["ABeltramo"]
+ description = "Safe wrapper around Rust bindings for inputtino"
+ 
+-[dev-dependencies]
+-input = "0.9.0"
+-rustix = { version = "0.38.18", features = ["fs"] }
+-approx = "0.5.1"
+-sdl2 = "0.37.0"
+-serial_test = "3.1.1"
++# Never build this crate's own tests/examples as part of redfog's workspace
++# build -- their dev-dependencies (input/sdl2/approx/rustix/serial_test) were
++# removed above for exactly this reason. Confirmed live: without this,
++# `cargo build --workspace --tests` still tried to compile tests/*.rs against
++# those now-removed dependencies and failed.
++autotests = false
+ 
+ [dependencies]
+ inputtino-sys = { version = "0.1.0", path = "../inputtino-sys" }

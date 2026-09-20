@@ -1,0 +1,60 @@
+# Applies 85-redfog-input.rules to /dev/uinput right now, for an
+# *already-running* system being installed/upgraded without a reboot --
+# redfog-uinput.conf (a modules-load.d entry, installed alongside this)
+# already makes every *subsequent* boot correct from the start (it loads
+# `uinput` early, before udev's coldplug pass, so the rule applies
+# naturally); this hook exists only to not require that reboot right away.
+#
+# Confirmed live during development that `udevadm trigger` alone is NOT
+# enough: it only re-processes devices that already have a *live* sysfs
+# entry, and `uinput` isn't loaded by default on most systems until
+# something needs it -- with no module loaded there's no live device to
+# trigger at all, so the call silently matches nothing. `/dev/uinput`'s
+# permission check also happens against the stale, kmod-generated 0600
+# root:root placeholder at `open()` time, before the kernel ever gets a
+# chance to auto-load the module on first access -- so simply trying to use
+# it doesn't self-heal the permissions either; the module has to actually
+# be (re)loaded first.
+#
+# `modprobe -r` (only reached if already loaded) fails harmlessly if the
+# module is actually in use (kernel refcounting protects against pulling a
+# module out from under a live session's virtual devices) -- safe to always
+# attempt.
+#
+# `setfacl -b` first, unconditionally: our rule combines `GROUP="input"
+# MODE="0660"` with `TAG+="uaccess"` on the same line (matching how
+# Moonshine's own 60-moonshine.rules does this exact same thing) so
+# logind's per-session ACL management and the static group grant coexist --
+# confirmed live that `devnode_acl()` (systemd's ACL-sync function) only
+# ever touches named-user ACL entries, never the ACL's own `group::` entry,
+# so once that entry is genuinely correct it stays stable across every
+# future login/logout. But getting it *genuinely correct* the first time
+# needs a clean slate: confirmed live that a device already carrying a
+# *stale* ACL (e.g. from before this package's rule ever existed -- Steam's
+# and KDE Connect's own uaccess-tagging rules for the same shared /dev/
+# uinput device predate ours on a system with either installed) does NOT
+# get its ACL rebuilt correctly by a plain reload+trigger or even a full
+# module unload/reload alone -- the stale ACL's `group::---` entry from
+# whenever it was first created simply persists untouched either way.
+# Only clearing it outright first, then re-triggering, produces a correct
+# `group::rw-` this time.
+#
+# `|| true` throughout: never fail the whole install over this -- worst
+# case, REDFOG_INPUT_BACKEND=inputtino just doesn't work until the next
+# reboot, same as if this hook didn't exist at all; the default
+# REDFOG_INPUT_BACKEND (fake-input) is completely unaffected either way.
+_reload_and_trigger_uinput() {
+    udevadm control --reload-rules || true
+    setfacl -b /dev/uinput 2>/dev/null || true
+    modprobe -r uinput 2>/dev/null || true
+    modprobe uinput || true
+    udevadm trigger --subsystem-match=misc --sysname-match=uinput || true
+}
+
+post_install() {
+    _reload_and_trigger_uinput
+}
+
+post_upgrade() {
+    _reload_and_trigger_uinput
+}

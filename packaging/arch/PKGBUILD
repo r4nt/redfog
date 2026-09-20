@@ -14,7 +14,7 @@
 # Build with: cd packaging/arch && makepkg -si
 
 pkgname=redfog-git
-pkgver=r98.f0dd61c
+pkgver=r148.2d86fda.head1789994455
 pkgrel=1
 pkgdesc="Moonlight/GameStream-compatible game streaming server for KDE Plasma on Wayland"
 arch=('x86_64')
@@ -44,6 +44,13 @@ depends=(
                          # written by redfog-broker itself at startup) --
                          # confirmed via namcap, missing from an earlier
                          # draft of this list
+    'libevdev'           # inputtino's uinput device sources link it directly
+                         # (public/shared dependency, even though libinputtino
+                         # itself is linked statically into redfog-core)
+    'acl'                # redfog-git.install's post_install/post_upgrade needs
+                         # `setfacl` to clear a stale ACL on /dev/uinput -- see
+                         # that file's own comment for why a plain udev
+                         # reload/trigger alone isn't enough
 )
 optdepends=(
     'nvidia-utils: hardware-accelerated NVENC video encoding'
@@ -54,10 +61,22 @@ optdepends=(
                   uses for the transient systemd units it generates per session; harmless,
                   a no-op PAM line, if this package is not installed'
 )
-makedepends=('cargo' 'clang' 'git')
+makedepends=('cargo' 'clang' 'git' 'cmake') # cmake: builds vendored inputtino
+                                             # (C++), see scripts/fetch-patched-deps.sh
 provides=('redfog')
 conflicts=('redfog')
 backup=('etc/redfog/redfog.conf')
+# Forces the `uinput` module to reload (picking up 85-redfog-input.rules)
+# on install/upgrade of an *already-running* system, for the same reason
+# redfog-uinput.conf (below) makes every subsequent boot correct from the
+# start: `uinput` isn't loaded by default on most systems until something
+# needs it, and until it IS loaded there's no live sysfs device for udev to
+# apply our rule to at all -- confirmed live, /dev/uinput sits as a generic
+# kmod-generated 0600 root:root placeholder (from the module's own built-in
+# devname alias metadata, unrelated to any udev rule) until then, and
+# REDFOG_INPUT_BACKEND=inputtino fails with a confusing "Permission denied"
+# in the meantime. See redfog-git.install.
+install=redfog-git.install
 # Confirmed live: with the system default OPTIONS=(... lto ...) active,
 # `ring` (pulled in transitively via rustls, for TLS) fails to *link* --
 # undefined symbols for every one of its C/assembly-implemented crypto
@@ -116,7 +135,22 @@ _cd_redfog_src() {
 
 pkgver() {
     _cd_redfog_src
-    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+    if [ -n "$REDFOG_PKG_FROM_HEAD" ]; then
+        # Real, uncommitted working-tree content is what this mode builds
+        # from (that's its whole point) -- but `git rev-parse HEAD` alone
+        # stays frozen across every rebuild until something is actually
+        # committed, since it only ever reflects the last real commit, not
+        # live file content. Confirmed live: this made repeated `makepkg`
+        # runs against uncommitted changes produce the exact same pkgver
+        # every time, so makepkg silently skipped rebuilding (a package
+        # file matching that name already existed) and `-si` reinstalled a
+        # stale, already-on-disk .pkg.tar.zst instead of the current
+        # working tree. A timestamp guarantees a fresh version -- and
+        # therefore a real rebuild -- on every invocation.
+        printf "r%s.%s.head%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)" "$(date +%s)"
+    else
+        printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+    fi
 }
 
 prepare() {
@@ -179,6 +213,8 @@ package() {
     install -Dm644 packaging/arch/redfog-watchdog.service "$pkgdir/usr/lib/systemd/system/redfog-watchdog.service"
     install -Dm644 packaging/arch/redfog.sysusers        "$pkgdir/usr/lib/sysusers.d/redfog.conf"
     install -Dm644 packaging/arch/redfog.conf            "$pkgdir/etc/redfog/redfog.conf"
+    install -Dm644 packaging/arch/85-redfog-input.rules  "$pkgdir/usr/lib/udev/rules.d/85-redfog-input.rules"
+    install -Dm644 packaging/arch/redfog-uinput.conf     "$pkgdir/usr/lib/modules-load.d/redfog-uinput.conf"
 
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

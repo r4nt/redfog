@@ -15,7 +15,6 @@
 //! differently than what's documented here. Key = the client's `rikey` (sent
 //! as a query param on `/launch`, not in the RTSP SDP — see pairing.rs).
 //! `InputData` (0x0206) payloads are `[u32 LE input_event_type][event bytes]`.
-//! Gamepad input is out of scope for this iteration (deferred, see plan doc).
 //!
 //! Layout derived from reading a known-working implementation's wire code
 //! (not vendored), see the plan doc for context.
@@ -45,6 +44,13 @@ pub enum InputEvent {
     TouchUp { pointer_id: u32 },
     TouchCancel { pointer_id: u32 },
     TouchCancelAll,
+    /// A full controller-state snapshot, not an edge/delta — matches both
+    /// the wire packet's own shape and `redfog_core::InputtinoGamepad::
+    /// set_state`'s. `buttons` is the wire's `button_flags`(low 16 bits) |
+    /// `button_flags_2`(high 16 bits, Sunshine extension) combined into one
+    /// 32-bit mask — see `decode_input_event`'s `0x0000000D`/`0x0000000C`
+    /// arm for why no further translation is needed.
+    GamepadState { controller_number: u8, buttons: u32, left_trigger: u8, right_trigger: u8, left_stick: (i16, i16), right_stick: (i16, i16) },
 }
 
 /// `rikey` identifies which session a message came from — matched by
@@ -497,24 +503,55 @@ fn decode_input_event(payload: &[u8]) -> Option<InputEvent> {
                 _ => None,
             }
         }
-        _ => None, // gamepad and other event types: deferred (see plan doc)
-    }
-}
-
-/// The key packet layout is `[flags:u8][key:u16 LE][modifiers:u8][padding:u16]`;
-/// virtual key codes fit in a byte, so the low byte of the LE `key` field
-/// (index 1) is the actual code.
-fn key_code_from(body: &[u8]) -> Option<u8> {
-    body.get(1).copied()
-}
-
-fn mouse_button_from(body: &[u8]) -> Option<u32> {
-    match body.first()? {
-        0x01 => Some(0x110), // Left
-        0x02 => Some(0x112), // Middle
-        0x03 => Some(0x111), // Right
-        0x04 => Some(0x113), // Side
-        0x05 => Some(0x114), // Extra
+        0x0000000D | 0x0000000C => {
+            // MULTI_CONTROLLER_MAGIC (0x0000000D) / _GEN5 (0x0000000C) --
+            // both carry the exact same 26-byte body layout (confirmed
+            // against moonlight-common-c's `NV_MULTI_CONTROLLER_PACKET`
+            // struct and the vendored moonlight-common-rust's own parser,
+            // which -- confusingly, given the naming -- only actually
+            // implements the GEN5 arm; handling both magic values here with
+            // one parser sidesteps needing to know which one real clients
+            // actually send):
+            //   [0..2]=header_b(i16, magic framing, ignored)
+            //   [2..4]=controller_number(i16 LE)
+            //   [4..6]=active_gamepad_mask(u16 LE, ignored -- redfog only
+            //     ever drives one virtual gamepad per session today)
+            //   [6..8]=mid_b(i16, magic framing, ignored)
+            //   [8..10]=button_flags(i16 LE, low 16 bits of ControllerButtons)
+            //   [10]=left_trigger(u8) [11]=right_trigger(u8)
+            //   [12..14]=left_stick_x(i16 LE) [14..16]=left_stick_y(i16 LE)
+            //   [16..18]=right_stick_x(i16 LE) [18..20]=right_stick_y(i16 LE)
+            //   [20..22]=tail_a(i16, magic framing, ignored)
+            //   [22..24]=button_flags_2(i16 LE, high 16 bits -- Sunshine
+            //     extension: PADDLE1-4/TOUCHPAD/MISC)
+            //   [24..26]=tail_b(i16, magic framing, ignored)
+            if body.len() < 26 {
+                return None;
+            }
+            let controller_number = i16::from_le_bytes(body[2..4].try_into().ok()?) as u8;
+            let button_flags = i16::from_le_bytes(body[8..10].try_into().ok()?);
+            let left_trigger = body[10];
+            let right_trigger = body[11];
+            let left_stick_x = i16::from_le_bytes(body[12..14].try_into().ok()?);
+            let left_stick_y = i16::from_le_bytes(body[14..16].try_into().ok()?);
+            let right_stick_x = i16::from_le_bytes(body[16..18].try_into().ok()?);
+            let right_stick_y = i16::from_le_bytes(body[18..20].try_into().ok()?);
+            let button_flags_2 = i16::from_le_bytes(body[22..24].try_into().ok()?);
+            // Reconstructs the full 32-bit ControllerButtons mask -- bit for
+            // bit identical to inputtino's own INPUTTINO_JOYPAD_BTN layout
+            // (confirmed against its C header, including the Sunshine
+            // extension bits), so no further translation happens on the
+            // InputSink/InputtinoGamepad side, only here at decode time.
+            let buttons = (button_flags as u16 as u32) | ((button_flags_2 as u16 as u32) << 16);
+            Some(InputEvent::GamepadState {
+                controller_number,
+                buttons,
+                left_trigger,
+                right_trigger,
+                left_stick: (left_stick_x, left_stick_y),
+                right_stick: (right_stick_x, right_stick_y),
+            })
+        }
         _ => None,
     }
 }
@@ -629,6 +666,24 @@ fn vk_to_evdev(vk: u8) -> Option<u32> {
         0xE2 => 86,  // NonUsBackslash
         _ => return None,
     })
+}
+
+/// The key packet layout is `[flags:u8][key:u16 LE][modifiers:u8][padding:u16]`;
+/// virtual key codes fit in a byte, so the low byte of the LE `key` field
+/// (index 1) is the actual code.
+fn key_code_from(body: &[u8]) -> Option<u8> {
+    body.get(1).copied()
+}
+
+fn mouse_button_from(body: &[u8]) -> Option<u32> {
+    match body.first()? {
+        0x01 => Some(0x110), // Left
+        0x02 => Some(0x112), // Middle
+        0x03 => Some(0x111), // Right
+        0x04 => Some(0x113), // Side
+        0x05 => Some(0x114), // Extra
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -836,6 +891,61 @@ mod tests {
                 let event = decode_input_event(&payload).unwrap();
                 assert_eq!(event, InputEvent::TouchCancelAll);
             }
+            _ => panic!("expected InputData"),
+        }
+    }
+
+    #[test]
+    fn gamepad_state_decodes_and_reconstructs_the_full_32bit_button_mask() {
+        let key = [0x33u8; 16];
+        let mut body = Vec::new();
+        body.extend(0x001Ai16.to_le_bytes()); // header_b (magic framing, ignored)
+        body.extend(0i16.to_le_bytes()); // controller_number
+        body.extend(1u16.to_le_bytes()); // active_gamepad_mask (ignored)
+        body.extend(0x0014i16.to_le_bytes()); // mid_b (magic framing, ignored)
+        body.extend(0x1000i16.to_le_bytes()); // button_flags: A
+        body.push(128); // left_trigger
+        body.push(255); // right_trigger
+        body.extend((-32768i16).to_le_bytes()); // left_stick_x
+        body.extend(32767i16.to_le_bytes()); // left_stick_y
+        body.extend(100i16.to_le_bytes()); // right_stick_x
+        body.extend((-100i16).to_le_bytes()); // right_stick_y
+        body.extend(0x009Ci16.to_le_bytes()); // tail_a (magic framing, ignored)
+        body.extend(0x0001i16.to_le_bytes()); // button_flags_2: bit 16 (Sunshine ext)
+        body.extend(0x0055i16.to_le_bytes()); // tail_b (magic framing, ignored)
+        assert_eq!(body.len(), 26);
+
+        for magic in [0x0000000Du32, 0x0000000C] {
+            let inner = input_data_message(magic, &body);
+            let encrypted = encrypt_message(&key, 0, &inner);
+            match ControlMessage::parse(&encrypted, &key).unwrap() {
+                ControlMessage::InputData(payload) => {
+                    let event = decode_input_event(&payload).unwrap();
+                    assert_eq!(
+                        event,
+                        InputEvent::GamepadState {
+                            controller_number: 0,
+                            buttons: 0x0001_1000, // button_flags(0x1000) | (button_flags_2(0x0001) << 16)
+                            left_trigger: 128,
+                            right_trigger: 255,
+                            left_stick: (-32768, 32767),
+                            right_stick: (100, -100),
+                        },
+                        "magic {magic:#010x}"
+                    );
+                }
+                _ => panic!("expected InputData (magic {magic:#010x})"),
+            }
+        }
+    }
+
+    #[test]
+    fn gamepad_state_too_short_is_rejected() {
+        let key = [0x33u8; 16];
+        let inner = input_data_message(0x0000000D, &[0u8; 25]); // one byte short
+        let encrypted = encrypt_message(&key, 0, &inner);
+        match ControlMessage::parse(&encrypted, &key).unwrap() {
+            ControlMessage::InputData(payload) => assert_eq!(decode_input_event(&payload), None),
             _ => panic!("expected InputData"),
         }
     }

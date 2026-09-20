@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use redfog_core::{AudioLoopback, InputSink, SessionType};
-pub use session_backend::Backend;
+use redfog_core::{AudioLoopback, InputSink, InputtinoGamepad, SessionType};
+pub use session_backend::{Backend, InputBackend};
 use session_backend::SpawnedCompositor;
 
 use crate::audio::{AudioPacketizer, AudioSender};
@@ -76,6 +76,12 @@ pub struct SessionConfig {
     /// without a broker.
     pub broker_socket_path: Option<std::path::PathBuf>,
     pub backend: Backend,
+    /// Keyboard/mouse/touch injection mechanism for the User stage — see
+    /// `InputBackend`'s own doc comment. Independent of `backend` above
+    /// (which compositor runs); only actually takes effect for the
+    /// broker-spawned `Backend::Kwin` path today (see
+    /// `spawn_user_compositor`'s doc comment).
+    pub input_backend: InputBackend,
     /// Operator-configured, named session options offered on the login
     /// screen (see `redfog_login_protocol::load_presets`) — what a
     /// `LoginRequest::Authenticate.session` name other than
@@ -266,6 +272,14 @@ struct RunningSession {
     /// else, so every read site below just `.as_mut()`/`.as_ref()`s past it.
     compositor: Option<SpawnedCompositor>,
     input_forwarder: Box<dyn InputSink>,
+    /// This session's virtual gamepad, when `config.input_backend ==
+    /// InputBackend::Inputtino` — `None` otherwise (including for
+    /// `SessionType::Login`, which never gets one, and any session using the
+    /// default `InputBackend::FakeInput`, which has no gamepad support at
+    /// all). Deliberately not part of `input_forwarder`/`InputSink` — see
+    /// `redfog_core::InputtinoGamepad`'s own doc comment for why gamepad
+    /// input never goes through the compositor.
+    gamepad: Option<InputtinoGamepad>,
     /// Tracks active touch pointer IDs currently down in this session.
     /// Used to avoid leaking touch slots if a release packet is dropped,
     /// and to ensure all slots are cleanly released on cancel or teardown.
@@ -997,7 +1011,7 @@ impl SessionManager {
         height: u32,
         fps: u32,
         reported: &Option<PendingLoginResult>,
-    ) -> Result<(SpawnedCompositor, String, Option<String>), String> {
+    ) -> Result<(SpawnedCompositor, String, Option<String>, Option<InputtinoGamepad>), String> {
         let username = reported.as_ref().map(|r| r.username.clone()).unwrap_or_else(|| "user".to_string());
         // Real password, needed by the broker's `SpawnSession` call below to
         // open a real PAM session with `pam_kwallet5.so` in it (see that
@@ -1014,7 +1028,10 @@ impl SessionManager {
         let user_app = selected.as_ref().map(|s| s.user_app.clone()).unwrap_or_else(|| self.config.user_app.clone());
 
         let Some(broker_socket_path) = &self.config.broker_socket_path else {
-            return session_backend::spawn_user_compositor_direct(backend, &username, &user_app, width, height, fps).map(|c| (c, username, None));
+            // Direct/no-broker spawn never supports inputtino (no broker to
+            // scope its devices into a per-session sandbox at all) — always
+            // `None`, regardless of `self.config.input_backend`.
+            return session_backend::spawn_user_compositor_direct(backend, &username, &user_app, width, height, fps).map(|c| (c, username, None, None));
         };
 
         // The one `session_id` used for this whole User-stage spawn attempt
@@ -1030,6 +1047,7 @@ impl SessionManager {
         let broker_call_start = std::time::Instant::now();
         let result = session_backend::spawn_user_compositor_via_broker(
             backend,
+            self.config.input_backend,
             broker_socket_path,
             session_id.clone(),
             &username,
@@ -1046,7 +1064,7 @@ impl SessionManager {
             if result.is_ok() { "Ok" } else { "Err" },
             broker_call_start.elapsed()
         );
-        result.map(|c| (c, username, Some(session_id)))
+        result.map(|(compositor, inputtino)| (compositor, username, Some(session_id), inputtino))
     }
 
     /// Builds just the video half of a session's pipeline — split out of
@@ -1644,6 +1662,7 @@ impl SessionManager {
     /// `REDFOG_LOGIN_GENERATION` (see `LoginRequest::Authenticate`'s doc
     /// comment). `origin` carries this launch's continuity state — see
     /// `SessionOrigin`'s doc comment for who constructs it and when.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_session(
         &self,
         kind: SessionType,
@@ -1656,6 +1675,7 @@ impl SessionManager {
         origin: SessionOrigin,
         selected_session: Option<SelectedSession>,
         audio_loopback: Option<AudioLoopback>,
+        gamepad: Option<InputtinoGamepad>,
     ) -> Result<RunningSession, String> {
         // `origin.codec` — `VideoCodec::default()` (H.264) for a genuinely
         // fresh `/launch` (nothing has negotiated anything yet), but for
@@ -1702,6 +1722,7 @@ impl SessionManager {
             codec,
             compositor: Some(compositor),
             input_forwarder,
+            gamepad,
             active_touch_ids: HashSet::new(),
             video_pipeline,
             audio_pipeline,
@@ -2468,7 +2489,7 @@ impl SessionManager {
             None => {
                 tracing::info!("handoff_to_user: no backgrounded session for {username}, spawning a fresh user compositor");
                 let spawn_start = std::time::Instant::now();
-                let (compositor, resolved_username, broker_session_id) = self.spawn_user_compositor(width, height, fps, &reported).await?;
+                let (compositor, resolved_username, broker_session_id, gamepad) = self.spawn_user_compositor(width, height, fps, &reported).await?;
                 tracing::info!("handoff_to_user: spawn_user_compositor for {resolved_username} finished after {:?}", spawn_start.elapsed());
                 // Spawned *after* the compositor now, not before — this
                 // used to be reversed (a deliberate hardening — nothing the
@@ -2565,7 +2586,7 @@ impl SessionManager {
                 let session = match tokio::time::timeout(
                     Duration::from_secs(30),
                     tokio::task::spawn_blocking(move || {
-                        this.spawn_session(kind, width, height, fps, compositor, broker_session_id, generation, origin, selected, audio_loopback)
+                        this.spawn_session(kind, width, height, fps, compositor, broker_session_id, generation, origin, selected, audio_loopback, gamepad)
                     }),
                 )
                 .await
@@ -2677,7 +2698,7 @@ impl LaunchHandler for SessionManager {
             // No `AudioLoopback` at all for Login — see
             // `make_silent_audio_pipeline`'s doc comment for why.
             let compositor = self.spawn_login_compositor(width, height, generation)?;
-            self.spawn_session(SessionType::Login, width, height, fps, compositor, None, generation, origin, None, None)
+            self.spawn_session(SessionType::Login, width, height, fps, compositor, None, generation, origin, None, None, None)
         }));
         let session = match spawn_result {
             Ok(Ok(session)) => session,
@@ -3289,6 +3310,31 @@ fn touch_up(active_touch_ids: &mut HashSet<u32>, fwd: &mut dyn InputSink, pointe
     fwd.touch_frame();
 }
 
+/// Applies one controller-state snapshot to this session's virtual gamepad,
+/// if it has one (`gamepad` is `None` for `InputBackend::FakeInput`, the
+/// default — see `InputtinoGamepad`'s own doc comment). `controller_number`
+/// beyond 0 is silently ignored: redfog only ever drives one virtual
+/// gamepad per session today, same as `decode_input_event`'s own comment on
+/// why `active_gamepad_mask` goes unused. No bookkeeping state needed here
+/// (unlike touch's stuck-slot tracking) — the wire packet and inputtino's
+/// own API are both already full-state snapshots, not edge events.
+fn gamepad_state(
+    gamepad: Option<&mut InputtinoGamepad>,
+    controller_number: u8,
+    buttons: u32,
+    left_trigger: u8,
+    right_trigger: u8,
+    left_stick: (i16, i16),
+    right_stick: (i16, i16),
+) {
+    if controller_number != 0 {
+        return;
+    }
+    if let Some(gamepad) = gamepad {
+        gamepad.set_state(buttons, left_trigger, right_trigger, left_stick, right_stick);
+    }
+}
+
 /// Releases every currently-active touch — shared by `on_input`'s
 /// `TouchCancelAll` handling and every place a session gets torn down or
 /// backgrounded mid-gesture (`background_or_discard`, `discard_running_
@@ -3372,18 +3418,13 @@ impl ControlEventHandler for SessionManager {
                 if self.config.log_mouse_events {
                     tracing::info!("mouse event: ScrollVertical amount={amount}");
                 }
-                // Moonlight/Windows uses positive for scrolling up (away from user)
-                // and negative for scrolling down (toward user). Wayland's wl_pointer
-                // axis (and org_kde_kwin_fake_input axis 0) uses positive for scrolling
-                // down and negative for scrolling up. Invert vertical amount so standard
-                // wheel scrolling down scrolls the page down.
-                fwd.axis(0, -amount as f64)
+                fwd.scroll_vertical(amount)
             }
             InputEvent::ScrollHorizontal { amount } => {
                 if self.config.log_mouse_events {
                     tracing::info!("mouse event: ScrollHorizontal amount={amount}");
                 }
-                fwd.axis(1, amount as f64)
+                fwd.scroll_horizontal(amount)
             }
             InputEvent::TouchDown { pointer_id, x, y, .. } => {
                 let px = scale_touch_coord(x, session.width);
@@ -3408,6 +3449,9 @@ impl ControlEventHandler for SessionManager {
             InputEvent::TouchCancelAll => {
                 tracing::info!("touch event: TouchCancelAll (releasing {} active touches)", session.active_touch_ids.len());
                 release_all_touches(&mut session.active_touch_ids, fwd.as_mut());
+            }
+            InputEvent::GamepadState { controller_number, buttons, left_trigger, right_trigger, left_stick, right_stick } => {
+                gamepad_state(session.gamepad.as_mut(), controller_number, buttons, left_trigger, right_trigger, left_stick, right_stick);
             }
         }
         session.input_forwarder.flush();
@@ -3571,7 +3615,8 @@ mod touch_tests {
         fn pointer_motion(&mut self, _dx: f64, _dy: f64) {}
         fn pointer_motion_absolute(&mut self, _x: f64, _y: f64) {}
         fn button(&mut self, _button: u32, _pressed: bool) {}
-        fn axis(&mut self, _axis: u32, _value: f64) {}
+        fn scroll_vertical(&mut self, _amount: i16) {}
+        fn scroll_horizontal(&mut self, _amount: i16) {}
         fn touch_down(&mut self, id: u32, x: f64, y: f64) {
             self.0.push(format!("down({id}, {x}, {y})"));
         }
@@ -3700,6 +3745,46 @@ mod touch_tests {
         // packet must never produce an out-of-bounds coordinate.
         assert_eq!(scale_touch_coord(-0.5, 1920), 0.0);
         assert_eq!(scale_touch_coord(2.0, 1920), 1919.0);
+    }
+}
+
+#[cfg(test)]
+mod gamepad_tests {
+    use super::gamepad_state;
+
+    /// `None` (the default -- `InputBackend::FakeInput`, no gamepad) must be
+    /// a safe, silent no-op for every controller number -- this is the path
+    /// almost every real session actually takes, so it needs no real
+    /// `/dev/uinput` access to be worth testing thoroughly.
+    #[test]
+    fn none_gamepad_is_a_silent_no_op_for_any_controller_number() {
+        for controller_number in [0, 1, 3, 255] {
+            gamepad_state(None, controller_number, 0x1000, 128, 255, (-32768, 32767), (100, -100));
+        }
+    }
+
+    /// Real runtime capability probe (same reasoning as `redfog_core`'s own
+    /// `uinput_available`-gated tests) -- exercises `gamepad_state`'s actual
+    /// dispatch into a real `InputtinoGamepad`, not just the `None` path.
+    #[test]
+    fn routes_controller_zero_to_a_real_gamepad_and_ignores_other_controller_numbers() {
+        if !redfog_core::uinput_available() {
+            eprintln!("no writable /dev/uinput — skipping routes_controller_zero_to_a_real_gamepad_and_ignores_other_controller_numbers");
+            return;
+        }
+        let mut gamepad = redfog_core::InputtinoGamepad::new("test-gamepad-dispatch").expect("create gamepad");
+
+        // Just confirming this reaches the real device without panicking --
+        // InputtinoGamepad::set_state's own value-correctness is exercised
+        // directly in redfog-core's own gated test, and independently
+        // verified against raw kernel events by
+        // scripts/verify-inputtino-devices.py.
+        gamepad_state(Some(&mut gamepad), 0, 0x1000, 128, 255, (-32768, 32767), (100, -100));
+        // A non-zero controller number must be ignored (redfog only ever
+        // drives one virtual gamepad per session today) -- no way to
+        // directly observe "was set_state NOT called" from here, but this
+        // at least confirms it doesn't panic/misbehave for that input.
+        gamepad_state(Some(&mut gamepad), 1, 0x2000, 0, 0, (0, 0), (0, 0));
     }
 }
 

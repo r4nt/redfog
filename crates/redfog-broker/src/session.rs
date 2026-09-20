@@ -290,6 +290,7 @@ impl SessionManager {
         Self { active: Mutex::new(HashMap::new()) }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         &self,
         session_id: &str,
@@ -299,6 +300,7 @@ impl SessionManager {
         height: u32,
         socket_name: &str,
         payload: &[String],
+        input_device_nodes: &[String],
     ) -> Result<SpawnResult, String> {
         if std::env::var_os("REDFOG_BROKER_FAKE_SPAWN").is_some() {
             return self.spawn_fake(session_id, width, height, socket_name, payload).await;
@@ -317,7 +319,7 @@ impl SessionManager {
             }
             Err(_) => username.to_string(),
         };
-        self.spawn_via_pam(session_id, &username, password, width, height, socket_name, payload).await
+        self.spawn_via_pam(session_id, &username, password, width, height, socket_name, payload, input_device_nodes).await
     }
 
     /// Bypasses systemd entirely: spawns `kwin_wayland` directly as the
@@ -480,6 +482,7 @@ impl SessionManager {
     ///   survives `pam_open_session`'s later cgroup migration regardless of
     ///   which mechanism (unit file vs. `systemd-run --property=`) applied
     ///   it in the first place.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_via_pam(
         &self,
         session_id: &str,
@@ -489,6 +492,7 @@ impl SessionManager {
         height: u32,
         socket_name: &str,
         payload: &[String],
+        input_device_nodes: &[String],
     ) -> Result<SpawnResult, String> {
         let unit_name = format!("redfog-session-{session_id}");
         let runtime_dir = format!("{}/session-{session_id}", default_runtime_dir());
@@ -553,6 +557,34 @@ impl SessionManager {
                 }
                 Err(e) => {
                     tracing::warn!("failed to run setfacl granting {username} {what} access on {path}: {e}");
+                }
+            }
+        }
+        // Deliberately `chown`, not `grant_acl`/`setfacl` — see
+        // 85-redfog-input.rules' own comment for why: these nodes are
+        // `uaccess`-tagged by an unrelated stock rule we can't prevent from
+        // matching, and systemd's own `uaccess` builtin keeps re-writing
+        // any ACL on such a device down to just the active-seat-session's
+        // user, clobbering a `setfacl` grant almost immediately. Plain
+        // ownership isn't something that mechanism ever touches (confirmed
+        // already true of the ACL's own `group::` entry) — with
+        // `MODE="0600"` already set by that same udev rule, `chown` alone
+        // *is* the complete access grant, immune to the clobbering because
+        // there's no ACL involved at all.
+        async fn chown_path(username: &str, path: &str, what: &str) {
+            match tokio::process::Command::new("chown").args([username, path]).output().await {
+                Ok(output) if output.status.success() => {
+                    tracing::info!("chowned {what} {path} to {username}");
+                }
+                Ok(output) => {
+                    tracing::warn!(
+                        "chown {what} {path} to {username} exited with {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("failed to run chown on {what} {path}: {e}");
                 }
             }
         }
@@ -706,7 +738,18 @@ impl SessionManager {
         if let Ok(rules) = std::env::var("REDFOG_DEBUG_KWIN_LOGGING_RULES") {
             service_unit.push_str(&format!("Environment=QT_LOGGING_RULES={rules}\n"));
         }
-        for directive in device_sandbox_systemd_directives(&runtime_dir) {
+        // The real access grant for this session's own virtual gamepad
+        // node(s) -- `chown`, not `grant_acl`/`setfacl`, see `chown_path`'s
+        // own comment above for why. Scoped correctly (exactly this
+        // session's target user, not "input"-group-wide or whoever
+        // happens to be the active seat session), and each of these nodes
+        // belongs to exactly one session's own uinput device, never
+        // shared, so there's nothing to clean up either: the node itself
+        // is destroyed when redfog-server drops the device at session end.
+        for node in input_device_nodes {
+            chown_path(username, node, "gamepad device").await;
+        }
+        for directive in device_sandbox_systemd_directives(&runtime_dir, input_device_nodes) {
             service_unit.push_str(&format!("{directive}\n"));
         }
         service_unit.push_str(&format!("ExecStart={exec_start}\n"));
@@ -1419,11 +1462,24 @@ fn which_kwin_wayland() -> Option<String> {
 ///
 /// Returns an empty list only when there's truly nothing to narrow to (no
 /// `/dev/dri` render nodes at all — a machine with no GPU).
-fn device_sandbox_systemd_directives(runtime_dir: &str) -> Vec<String> {
+fn device_sandbox_systemd_directives(runtime_dir: &str, input_device_nodes: &[String]) -> Vec<String> {
     let mut directives = Vec::new();
 
     // Blank out /dev/snd so no raw ALSA audio devices are visible
     directives.push("TemporaryFileSystem=/dev/snd:dev".to_string());
+
+    if !input_device_nodes.is_empty() {
+        // Same reasoning as /dev/dri below: this session's own inputtino
+        // virtual devices (already created by the caller — see
+        // `BrokerRequest::SpawnSession::input_device_nodes`'s doc comment)
+        // must be visible to this compositor, but no *other* concurrent
+        // session's (or the host's real) input devices should be.
+        directives.push("TemporaryFileSystem=/dev/input:dev".to_string());
+        for node in input_device_nodes {
+            directives.push(format!("BindPaths={node}"));
+        }
+        tracing::info!("sandboxing /dev/input down to {input_device_nodes:?} for KWin");
+    }
 
     let Some(node) = select_gpu_render_node() else {
         return directives;

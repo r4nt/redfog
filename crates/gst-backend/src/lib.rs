@@ -219,11 +219,13 @@ impl InputSink for GstInputSink {
         self.send(gst::Structure::builder("MouseButton").field("button", button).field("pressed", pressed).build());
     }
 
-    fn axis(&mut self, axis: u32, value: f64) {
-        // gst-wayland-display's MouseAxis takes (x, y) scroll deltas rather
-        // than an axis index + value — same convention `OrgKdeKwinFakeInput`
-        // uses (0=vertical, 1=horizontal) mapped onto (y, x) here.
-        let (x, y) = if axis == 0 { (0.0, value) } else { (value, 0.0) };
-        self.send(gst::Structure::builder("MouseAxis").field("x", x).field("y", y).build());
+    fn scroll_vertical(&mut self, amount: i16) {
+        // Same Wayland axis-0 sign convention as `OrgKdeKwinFakeInput` —
+        // invert Moonlight/Windows' convention, see `InputSink::scroll_vertical`.
+        self.send(gst::Structure::builder("MouseAxis").field("x", 0.0).field("y", -(amount as f64)).build());
+    }
+
+    fn scroll_horizontal(&mut self, amount: i16) {
+        self.send(gst::Structure::builder("MouseAxis").field("x", amount as f64).field("y", 0.0).build());
     }
 }

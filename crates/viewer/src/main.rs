@@ -534,18 +534,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // pipeline) rather than half torn down.
                 let spawn_result = match args.mode {
                     Mode::Handoff => session_backend::spawn_user_compositor_direct(args.backend, "user", &payload, args.width as u32, args.height as u32, 60),
-                    Mode::Broker => runtime.block_on(session_backend::spawn_user_compositor_via_broker(
-                        args.backend,
-                        args.broker_socket.as_deref().expect("--mode broker requires --broker-socket, checked in parse_args"),
-                        "viewer-0".to_string(),
-                        &args.username,
-                        &args.password,
-                        false,
-                        &payload,
-                        args.width as u32,
-                        args.height as u32,
-                        60,
-                    )),
+                    Mode::Broker => runtime
+                        .block_on(session_backend::spawn_user_compositor_via_broker(
+                            args.backend,
+                            session_backend::InputBackend::FakeInput, // viewer is dev tooling; no inputtino flag here yet
+                            args.broker_socket.as_deref().expect("--mode broker requires --broker-socket, checked in parse_args"),
+                            "viewer-0".to_string(),
+                            &args.username,
+                            &args.password,
+                            false,
+                            &payload,
+                            args.width as u32,
+                            args.height as u32,
+                            60,
+                        ))
+                        .map(|(c, _inputtino)| c),
                     Mode::Single => unreachable!("Mode::Single has no Login stage to hand off from"),
                 };
                 let mut new_compositor = match spawn_result {

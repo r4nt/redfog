@@ -190,7 +190,13 @@ pub trait InputSink: Send {
     fn pointer_motion(&mut self, dx: f64, dy: f64);
     fn pointer_motion_absolute(&mut self, x: f64, y: f64);
     fn button(&mut self, button: u32, pressed: bool);
-    fn axis(&mut self, axis: u32, value: f64);
+    /// Moonlight/Windows convention: positive = up/away-from-user, negative =
+    /// down/toward-user. Each backend is responsible for converting to its
+    /// own convention internally (Wayland's `wl_pointer` axis 0, which both
+    /// `org_kde_kwin_fake_input` and gst-wayland-display's `MouseAxis`
+    /// ultimately follow, is the *opposite* sign — positive is down).
+    fn scroll_vertical(&mut self, amount: i16);
+    fn scroll_horizontal(&mut self, amount: i16);
     fn touch_down(&mut self, _id: u32, _x: f64, _y: f64) {}
     fn touch_motion(&mut self, _id: u32, _x: f64, _y: f64) {}
     fn touch_up(&mut self, _id: u32) {}
@@ -574,8 +580,14 @@ impl InputSink for InputForwarder {
     fn button(&mut self, button: u32, pressed: bool) {
         self.fake_input.button(button, pressed as u32);
     }
-    fn axis(&mut self, axis: u32, value: f64) {
-        self.fake_input.axis(axis, value);
+    fn scroll_vertical(&mut self, amount: i16) {
+        // Wayland's wl_pointer axis (and org_kde_kwin_fake_input axis 0) uses
+        // positive for scrolling down, opposite of Moonlight/Windows — invert
+        // so standard wheel-down still scrolls the page down.
+        self.fake_input.axis(0, -(amount as f64));
+    }
+    fn scroll_horizontal(&mut self, amount: i16) {
+        self.fake_input.axis(1, amount as f64);
     }
     fn touch_down(&mut self, id: u32, x: f64, y: f64) {
         self.fake_input.touch_down(id, x, y);
@@ -594,6 +606,123 @@ impl InputSink for InputForwarder {
     }
     fn flush(&mut self) {
         let _ = self.conn.flush();
+    }
+}
+
+/// Whether this process can actually open `/dev/uinput` for read+write right
+/// now — the real gate for whether [`InputtinoGamepad::new`] can succeed,
+/// same "real runtime capability probe, not a version/config guess" pattern
+/// `kwin_capture::nvenc_session::cuda_gpu_available` already uses for
+/// GPU-gated tests. Cached for the life of the process.
+pub fn uinput_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| std::fs::OpenOptions::new().read(true).write(true).open("/dev/uinput").is_ok())
+}
+
+/// A virtual Xbox One gamepad, backed by inputtino's real kernel `uinput`
+/// device — see `design.md`'s "Future idea: uinput virtual devices" and the
+/// virtual-input-devices plan. Used when `REDFOG_INPUT_BACKEND=inputtino`
+/// selects it (default: `fake-input`, meaning no gamepad support at all —
+/// KWin's `org_kde_kwin_fake_input` protocol, which keyboard/mouse/touch use
+/// unconditionally regardless of this flag, has no gamepad concept).
+///
+/// Deliberately *not* an [`InputSink`] impl: unlike keyboard/mouse/touch,
+/// gamepad input never goes through the compositor at all — the game itself
+/// reads the virtual controller directly off its kernel device node (evdev/
+/// SDL2-style), the same way it would read a real physical controller. So
+/// this needs no seat/libinput integration from the compositor's side (and
+/// isn't affected by the fact that KWin's headless `--virtual` backend has
+/// no real seat and therefore can't discover *any* uinput device that way —
+/// see the virtual-input-devices plan's notes on why keyboard/mouse/touch
+/// stayed on `fake_input` instead of inputtino for exactly this reason).
+///
+/// Construction must happen *before* the compositor is spawned, not lazily:
+/// the resulting [`Self::node_paths`] need to be known so the broker can
+/// scope them into this session's own sandbox (`BindPaths=`), the same
+/// mechanism already used to scope the GPU render node — otherwise a
+/// session's compositor (and the games running inside it) could see every
+/// other concurrent session's (or the host's real) input devices. The
+/// caller keeps the constructed `InputtinoGamepad` itself alive for the
+/// session's lifetime; dropping it destroys the device.
+pub struct InputtinoGamepad {
+    joypad: inputtino::XboxOneJoypad,
+}
+
+impl InputtinoGamepad {
+    /// `label` should be unique per session (e.g. `"{username}-{session_id}"`)
+    /// — used only for the device's human-readable name/uniq, so concurrent
+    /// sessions' virtual gamepads are distinguishable in `evtest`/`libinput
+    /// list-devices` output. The device is still a genuinely distinct kernel
+    /// device regardless of `label` (uinput never dedupes by name).
+    pub fn new(label: &str) -> Result<Self, String> {
+        let def = inputtino::DeviceDefinition::new(
+            &format!("redfog Gamepad ({label})"),
+            0x045E, // Microsoft
+            0x02DD, // Xbox One controller
+            0x0100,
+            &format!("redfog-{label}-Gamepad"),
+            &format!("redfog-{label}-Gamepad"),
+        );
+        let joypad = inputtino::XboxOneJoypad::new(&def).map_err(|e| format!("failed to create virtual gamepad: {e}"))?;
+        Ok(Self { joypad })
+    }
+
+    /// The `/dev/input/eventN` path(s) of the device this created — for the
+    /// broker to bind into this session's own sandbox. See this struct's own
+    /// doc comment for why that has to happen before the compositor spawns.
+    ///
+    /// Retries briefly rather than trusting the first result: the `uinput`
+    /// ioctl that creates the device returns as soon as the *kernel*
+    /// registers it, but the `/dev/input/jsN` sibling (a separate device,
+    /// via the legacy joystick subsystem reacting to the same registration)
+    /// can lag behind by a handful of milliseconds — confirmed live, an
+    /// immediate `get_nodes()` call right after construction can return an
+    /// empty list. Trusting that empty result as-is is much worse than it
+    /// looks: the caller (`session_backend`) treats it as "no gamepad
+    /// nodes to sandbox," which skips this session's *entire*
+    /// `/dev/input` `BindPaths` narrowing (not just the gamepad's own
+    /// ACL grant) — silently leaving the compositor with unrestricted
+    /// access to the real host's `/dev/input`, a much worse failure mode
+    /// than simply not having a gamepad.
+    pub fn node_paths(&self) -> Result<Vec<PathBuf>, String> {
+        const MAX_ATTEMPTS: u32 = 20;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+        for attempt in 0..MAX_ATTEMPTS {
+            let nodes = self.joypad.get_nodes().map_err(|e| format!("failed to get gamepad device nodes: {e}"))?;
+            if !nodes.is_empty() {
+                return Ok(nodes);
+            }
+            if attempt + 1 < MAX_ATTEMPTS {
+                std::thread::sleep(RETRY_DELAY);
+            }
+        }
+        Err(format!(
+            "gamepad device nodes never appeared after creation ({}ms) -- uinput/udev device registration may be unusually slow on \
+             this system",
+            RETRY_DELAY.as_millis() as u32 * MAX_ATTEMPTS
+        ))
+    }
+
+    /// Applies a full controller-state snapshot — matches both the wire
+    /// protocol's own shape (`ControlPacket::ControllerState`, always a full
+    /// snapshot of every button/axis, not per-button edge events) and
+    /// inputtino's own `set_pressed`/`set_triggers`/`set_stick` API, which is
+    /// exactly the same "state, not edges" shape (`set_pressed`'s own doc
+    /// comment: "any buttons not set are released if they were set before").
+    /// No translation of `buttons` needed — confirmed against inputtino's own
+    /// `INPUTTINO_JOYPAD_BTN` C enum: its bit values are identical to
+    /// Moonlight's own wire `ControllerButtons` bits (including the Sunshine
+    /// extension bits — PADDLE1-4/TOUCHPAD/MISC), so the wire's
+    /// `button_flags | (button_flags_2 << 16)` already *is* inputtino's
+    /// bitmask, bit for bit. Same for `left_stick`/`right_stick` (inputtino's
+    /// stick axis range is exactly `i16::MIN..=i16::MAX`, matching the wire's
+    /// own signed 16-bit stick fields) and the triggers (inputtino's trigger
+    /// axis range is exactly `0..=255`, matching the wire's own `u8` fields).
+    pub fn set_state(&mut self, buttons: u32, left_trigger: u8, right_trigger: u8, left_stick: (i16, i16), right_stick: (i16, i16)) {
+        self.joypad.set_pressed(buttons as i32);
+        self.joypad.set_triggers(left_trigger as i16, right_trigger as i16);
+        self.joypad.set_stick(inputtino::JoypadStickPosition::LS, left_stick.0, left_stick.1);
+        self.joypad.set_stick(inputtino::JoypadStickPosition::RS, right_stick.0, right_stick.1);
     }
 }
 
@@ -2851,5 +2980,41 @@ mod tests {
         assert_eq!(after_wait, 2, "expected a buffer arriving after the cap interval to pass (not stuck), got {after_wait}");
 
         let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    /// Real runtime capability probe, not a config guess (same reasoning as
+    /// `cuda_gpu_available`'s own tests) -- CI has no `/dev/uinput` access
+    /// at all, so this always skips there; exercises the actual device
+    /// creation/state-update calls this dev machine's own inputtino
+    /// integration depends on.
+    #[test]
+    fn inputtino_gamepad_creates_distinct_devices_per_session_and_accepts_state_updates() {
+        if !uinput_available() {
+            eprintln!("no writable /dev/uinput — skipping inputtino_gamepad_creates_distinct_devices_per_session_and_accepts_state_updates");
+            return;
+        }
+
+        let mut a = InputtinoGamepad::new("test-session-a").expect("create session a's gamepad");
+        let b = InputtinoGamepad::new("test-session-b").expect("create session b's gamepad");
+
+        let nodes_a = a.node_paths().expect("session a node paths");
+        let nodes_b = b.node_paths().expect("session b node paths");
+        assert!(!nodes_a.is_empty(), "expected at least one node for the gamepad, got {nodes_a:?}");
+        assert!(!nodes_b.is_empty(), "expected at least one node for the gamepad, got {nodes_b:?}");
+        for node in nodes_a.iter().chain(&nodes_b) {
+            assert!(
+                node.starts_with("/dev/input/event"),
+                "expected a /dev/input/eventN node, got {}",
+                node.display()
+            );
+        }
+        assert!(
+            nodes_a.iter().collect::<std::collections::HashSet<_>>().is_disjoint(&nodes_b.iter().collect()),
+            "two concurrent sessions must never share a device node -- got {nodes_a:?} and {nodes_b:?}"
+        );
+
+        // Just confirming this doesn't panic against a real device.
+        a.set_state(0x1000 /* A */, 128, 255, (-32768, 32767), (0, -100));
+        a.set_state(0, 0, 0, (0, 0), (0, 0));
     }
 }

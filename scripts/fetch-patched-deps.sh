@@ -27,8 +27,13 @@ fetch_and_patch() {
 
     for patch in "$@"; do
         echo "[$name] applying $patch..."
-        git -C "$dest" apply --quiet "$repo_root/$patch" 2>/dev/null \
-            || (cd "$dest" && patch -p1 --quiet < "$repo_root/$patch")
+        # Plain `patch`, not `git apply`: $dest has no .git of its own (removed
+        # above), so `git apply` resolves paths against the *outer* redfog
+        # repo instead — and since `vendor/` is gitignored there, it silently
+        # *skips* any patch hunk that adds a new file (exit 0, no error),
+        # rather than failing loudly. Confirmed live while adding the
+        # inputtino touchscreen-wrapper patch. `patch -p1` has no such quirk.
+        (cd "$dest" && patch -p1 --quiet < "$repo_root/$patch")
     done
 
     echo "[$name] ready."
@@ -70,3 +75,34 @@ fetch_and_patch \
     "https://github.com/1wilkens/pam-sys" \
     "v1.0.0-alpha5" \
     "patches/pam-sys-bindgen-bump.patch"
+
+# MIT — vendored (not on crates.io at all: `bindings/rust/{inputtino-sys,
+# inputtino}` are unpublished, and inputtino-sys's build.rs resolves the C++
+# tree it builds via a relative `../../../` path, so the two must be
+# co-located). Provides a virtual Xbox One gamepad via uinput (see
+# design.md's "Future idea: uinput virtual devices" and the
+# virtual-input-devices plan -- keyboard/mouse/touch stayed on KWin's
+# fake_input instead, since KWin's headless backend has no real seat and its
+# libinput integration can't discover *any* uinput device, virtual or
+# physical; gamepad input bypasses the compositor entirely, since games read
+# the controller device directly, so it's unaffected by that). No upstream
+# release tags exist; pinned to a specific commit on the `stable` branch,
+# same as moonlight-common-rust above. Patches:
+#  - remove-dev-dependencies: the `inputtino` crate's own [dev-dependencies]
+#    (for its own tests/examples, which we never build) pin `sdl2 = "0.37.0"`
+#    -- conflicts at resolution time with redfog-test-ux's own `sdl2 = "^0.38"`
+#    (both `links = "SDL2"", and Cargo's resolver considers a path
+#    dependency's dev-dependencies too, even when nothing will build them)
+#    -- confirmed live as a real `cargo build` failure before this patch.
+#  - only-link-stdcxx: inputtino-sys's build.rs links both stdc++ (GCC/
+#    libstdc++) and c++ (LLVM/libc++) unconditionally, but the CMake build
+#    it drives always compiles with the system default `c++` compiler (GCC
+#    everywhere we build), so libc++ is never actually needed -- and often
+#    isn't installed at all. Confirmed live: linking failed with "unable to
+#    find library -lc++" without this patch.
+fetch_and_patch \
+    "inputtino" \
+    "https://github.com/games-on-whales/inputtino" \
+    "d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8" \
+    "patches/inputtino-remove-dev-dependencies.patch" \
+    "patches/inputtino-only-link-stdcxx.patch"

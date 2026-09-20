@@ -1,0 +1,99 @@
+# /dev/uinput defaults to root:root mode 0660 -- without this rule, only
+# root could create a virtual gamepad via inputtino (keyboard/mouse/touch
+# stay on KWin's own fake_input mechanism regardless -- see design.md/the
+# virtual-input-devices plan for why). Grants the "input" group access
+# instead, matching the reference project Wolf's own 85-wolf.rules line for
+# the same purpose. redfog-server (see redfog-server.service's
+# SupplementaryGroups=input) is the only thing that needs this; harmless
+# no-op if REDFOG_INPUT_BACKEND is never set to "inputtino" (the default,
+# "fake-input", never touches /dev/uinput).
+#
+# TAG+="uaccess" kept deliberately (not stripped), even though other
+# software already tags this same shared device (Steam's/KDE Connect's own
+# udev rules, both `KERNEL=="uinput" ... TAG+="uaccess"` with no GROUP= of
+# their own) -- matching Moonshine's own 60-moonshine.rules, which combines
+# GROUP=/MODE= with TAG+="uaccess" the same way. Confirmed live: systemd's
+# per-session ACL sync (`devnode_acl()`) only ever manages named-*user* ACL
+# entries, never the ACL's own `group::` entry -- so once genuinely
+# correct, this group grant is stable across every future login/logout/VT
+# switch, and coexists peacefully with Steam/KDE Connect's own *interactive*
+# per-session access to the same device (no need to choose one or the
+# other). Getting `group::` genuinely correct the first time on a device
+# that already carries a *stale* ACL from before this rule existed needs an
+# explicit one-time `setfacl -b` (see redfog-git.install) -- a plain
+# reload/trigger, or even a full module unload+reload, does not reset an
+# already-stale ACL's `group::` entry on its own; confirmed live.
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput", TAG+="uaccess"
+
+# The rule above only covers /dev/uinput itself (needed to *create* a
+# device); each created gamepad's own /dev/input/eventN + /dev/input/jsN
+# nodes are a *different* udev device (SUBSYSTEM=="input") that the
+# distro's own stock uaccess rules already fall back to GROUP="input"
+# MODE="0660" for. That fallback is a blanket grant -- any local user who
+# happens to be a member of "input" (regardless of whether they're
+# streaming a redfog session at all, let alone *this* one) could open
+# another session's virtual gamepad directly from the real host /dev,
+# something redfog-broker's own per-session BindPaths sandboxing
+# (device_sandbox_systemd_directives) can't do anything about, since that
+# grant lives entirely outside any session's mount namespace. Also
+# deliberately *not* relying on the "uaccess" mechanism at all here
+# (unlike /dev/uinput above), and not just because it grants to whichever
+# user is the *active* session on this device's arbitrary, unrelated seat
+# rather than this device's own session's target user. Confirmed live
+# (2026-09-21) it's actively hostile to anything else touching this
+# device's ACL, not just a loose fit: 70-uaccess.rules unconditionally
+# tags every SUBSYSTEM=="input" device with ENV{ID_INPUT_JOYSTICK}=="?*"
+# (unavoidably true for us) as "uaccess", and 73-seat-late.rules's
+# `RUN{builtin}+="uaccess"` (gated on that tag) then keeps *re-writing*
+# the device's ACL down to just the active-seat-session's user on every
+# subsequent uevent -- observed clobbering redfog-broker's own grant
+# within the same second. Tried and abandoned: opting out via
+# `TAG-="uaccess"` from this (later-loaded) file -- doesn't work, udev's
+# tag *match* conditions (like 73-seat-late.rules') check the sticky/
+# historical tag set, which a later `-=` never clears, by design. Also
+# tried and abandoned: a separate, earlier-loaded file doing
+# `GOTO="uaccess_end"` to skip 70-uaccess.rules' body entirely for these
+# devices -- `udevadm test` confirmed this is a structural dead end, not
+# a syntax mistake: GOTO targets resolve in file-*loading* order, so an
+# earlier file can never jump forward into a label a later file defines
+# ("no matching label, ignoring" / "dropping"). The actual, robust fix:
+# stop using an ACL at all. `devnode_acl()`/the "uaccess" builtin only
+# ever manage *named ACL entries* -- never base ownership, confirmed
+# already true of the `group::` entry above and equally true of plain
+# `chown`. redfog-broker's own explicit per-session `chown <username>`
+# (session.rs's `grant_acl` — actually a chown for these nodes, not a
+# setfacl; matched by the distinctive name `InputtinoGamepad::new` gives
+# every device: "redfog Gamepad (<username>-<session_id>)") is the sole
+# real access grant from here on, immune to uaccess entirely since
+# there's no ACL for it to resync.
+#
+# ENV{ID_SEAT}="" (rather than leaving it unset, the default for basically
+# every device on a single-seat machine): libinput's own device_added()
+# (src/udev-seat.c) only falls back to its "seat0" default when this
+# property is *absent* -- `if (!device_seat) device_seat = default_seat;`
+# -- an *explicit* empty value skips that fallback and is compared as-is.
+# KWin's headless `--virtual` backend has no real logind seat, so it calls
+# `libinput_udev_assign_seat()` with an empty string too (confirmed via
+# its own source, see the plan/TODO's libei note) -- meaning libinput's
+# `strcmp(device_seat, input->seat_id)` device-matching can otherwise
+# never succeed for *any* uinput device under it, gamepad included. This
+# doesn't matter for redfog's own gamepad handling today (it reads the
+# node directly, bypassing libinput entirely -- see
+# `InputtinoGamepad`'s doc comment) but costs nothing and may help any
+# *other* libinput-based app/toolkit running inside the same headless
+# session that expects normal seat-based device discovery to work.
+#
+# Not TAG+="uaccess" (unlike /dev/uinput above): confirmed live
+# (2026-09-21) that these devices must never carry that tag at all, or
+# systemd-logind's own `uaccess` udev builtin (invoked by the stock
+# 73-seat-late.rules, gated on the tag) keeps re-writing this device's
+# ACL down to whichever session it considers "active" on the (real,
+# physical, entirely unrelated) seat -- observed clobbering redfog-
+# broker's own just-applied `user:<username>:rw` grant within the same
+# second. Trying to *remove* the tag after the fact from here (a later
+# file, via `TAG-="uaccess"`) does not work, even though that's real,
+# documented udev syntax -- see 05-redfog-input-preempt-uaccess.rules
+# (loaded first, before the stock rule that assigns it) for why, and for
+# the actual fix. redfog-broker's own explicit per-session `setfacl`
+# (session.rs's grant_acl) is the sole thing that ever touches this ACL.
+SUBSYSTEM=="input", ATTRS{name}=="redfog Gamepad *", GROUP="root", MODE="0600", ENV{ID_SEAT}=""

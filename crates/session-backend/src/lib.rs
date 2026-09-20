@@ -60,6 +60,50 @@ impl std::str::FromStr for Backend {
     }
 }
 
+/// Whether this session gets a virtual gamepad — orthogonal to [`Backend`]
+/// (which compositor runs): gamepad input never goes through the compositor
+/// at all (the game reads the virtual controller directly off its kernel
+/// device node, same as a real physical one), so this isn't a per-backend
+/// choice the way keyboard/mouse/touch injection is. Keyboard/mouse/touch
+/// always go through KWin's `org_kde_kwin_fake_input` (or gst-wayland-
+/// display's `CustomUpstream` events) regardless of this setting — inputtino
+/// was tried for those too, but KWin's headless `--virtual` backend has no
+/// real seat, and its libinput integration can't discover *any* uinput
+/// device (virtual or physical) without one; see the virtual-input-devices
+/// plan for the full story. Only wired up for the broker-spawned
+/// `Backend::Kwin` path today (see `spawn_user_compositor_via_broker`'s
+/// `Inputtino` arm) — the direct/standalone dev-spawn path
+/// (`spawn_user_compositor_direct`) doesn't support gamepad at all yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputBackend {
+    /// No virtual gamepad for this session.
+    #[default]
+    FakeInput,
+    /// A virtual Xbox One gamepad via `redfog_core::InputtinoGamepad` (real
+    /// kernel `uinput` device).
+    Inputtino,
+}
+
+impl InputBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InputBackend::FakeInput => "fake-input",
+            InputBackend::Inputtino => "inputtino",
+        }
+    }
+}
+
+impl std::str::FromStr for InputBackend {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "fake-input" => Ok(InputBackend::FakeInput),
+            "inputtino" => Ok(InputBackend::Inputtino),
+            other => Err(format!("unknown input backend {other:?} (expected \"fake-input\" or \"inputtino\")")),
+        }
+    }
+}
+
 /// Which compositor backend produced a session's video/input surface —
 /// [`Backend`] selects between the first two for the *User* stage; the
 /// third, [`Self::HeadlessLogin`], is what the *Login* stage always uses
@@ -181,6 +225,11 @@ impl SpawnedCompositor {
     /// Wayland socket, nothing to do with the video pipeline at all);
     /// `HeadlessLogin`'s input goes over its own plain Unix socket, also
     /// nothing to do with GStreamer — both ignore `video_pipeline`.
+    ///
+    /// Gamepad (see [`InputBackend`]) is deliberately *not* threaded through
+    /// here — unlike keyboard/mouse/touch, it never goes through the
+    /// compositor at all, so it doesn't participate in this per-`Backend`
+    /// dispatch; see `redfog_core::InputtinoGamepad`'s own doc comment.
     pub fn input_sink(&self, video_pipeline: Option<&gstreamer::Pipeline>) -> Result<Box<dyn InputSink>, String> {
         match self {
             Self::Kwin(session) => Ok(Box::new(
@@ -329,8 +378,17 @@ impl InputSink for HeadlessLoginInputSink {
     fn button(&mut self, button: u32, pressed: bool) {
         let _ = self.tx.send(redfog_login_protocol::render::LoginInputEvent::MouseButton { button, pressed });
     }
-    fn axis(&mut self, axis: u32, value: f64) {
-        let _ = self.tx.send(redfog_login_protocol::render::LoginInputEvent::MouseAxis { axis, value });
+    fn scroll_vertical(&mut self, amount: i16) {
+        // Reconstruct the wire protocol's pre-existing axis-0/inverted shape
+        // (redfog-login itself is unchanged) — see `InputSink::scroll_vertical`.
+        let _ = self
+            .tx
+            .send(redfog_login_protocol::render::LoginInputEvent::MouseAxis { axis: 0, value: -(amount as f64) });
+    }
+    fn scroll_horizontal(&mut self, amount: i16) {
+        let _ = self
+            .tx
+            .send(redfog_login_protocol::render::LoginInputEvent::MouseAxis { axis: 1, value: amount as f64 });
     }
     fn touch_down(&mut self, id: u32, x: f64, y: f64) {
         if id == 0 {
@@ -556,6 +614,7 @@ pub fn spawn_user_compositor_direct(backend: Backend, username: &str, user_app: 
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_user_compositor_via_broker(
     backend: Backend,
+    input_backend: InputBackend,
     broker_socket_path: &Path,
     session_id: String,
     username: &str,
@@ -565,7 +624,7 @@ pub async fn spawn_user_compositor_via_broker(
     width: u32,
     height: u32,
     fps: u32,
-) -> Result<SpawnedCompositor, String> {
+) -> Result<(SpawnedCompositor, Option<redfog_core::InputtinoGamepad>), String> {
     use redfog_broker_protocol::{read_response, write_request, BrokerRequest, BrokerResponse};
     use tokio::io::BufReader;
     use tokio::net::UnixStream;
@@ -588,6 +647,44 @@ pub async fn spawn_user_compositor_via_broker(
 
     match backend {
         Backend::Kwin => {
+            // Must be created *before* SpawnSession, not after connecting to
+            // the compositor the way `input_sink()` normally would — the
+            // broker needs this device node's path right now, to scope it
+            // into this session's own sandbox (`BindPaths=`) at spawn time,
+            // the same mechanism it already uses for the GPU render node.
+            // See `InputtinoGamepad`'s own doc comment.
+            //
+            // Both device creation (a uinput ioctl call) and node discovery
+            // (which can retry with real thread sleeps for up to ~500ms —
+            // see `InputtinoGamepad::node_paths`'s own doc comment) are
+            // blocking work; this whole async fn runs on a tokio worker
+            // thread, so both go on tokio's dedicated blocking pool
+            // instead, rather than risk stalling unrelated concurrent
+            // sessions' own async work sharing that same worker thread.
+            let (gamepad, input_device_nodes) = match input_backend {
+                InputBackend::FakeInput => (None, Vec::new()),
+                InputBackend::Inputtino => {
+                    // `{username}-{session_id}`, not just `session_id` alone
+                    // (still the actual uniqueness guarantee — a strictly
+                    // increasing per-process counter, see
+                    // `next_broker_session_id`): makes concurrent sessions'
+                    // gamepads distinguishable at a glance in `evtest`/
+                    // `libinput list-devices` output on a multi-session host,
+                    // not just distinct.
+                    let label = format!("{username}-{session_id}");
+                    let session_id_for_error = session_id.clone();
+                    let (gamepad, nodes) = tokio::task::spawn_blocking(move || {
+                        let gamepad = redfog_core::InputtinoGamepad::new(&label)
+                            .map_err(|e| format!("failed to create inputtino gamepad for session {session_id_for_error}: {e}"))?;
+                        let nodes = gamepad.node_paths().map_err(|e| format!("failed to get gamepad device nodes: {e}"))?;
+                        Ok::<_, String>((gamepad, nodes))
+                    })
+                    .await
+                    .map_err(|e| format!("gamepad creation task panicked: {e}"))??;
+                    (Some(gamepad), nodes)
+                }
+            };
+
             write_request(
                 &mut reader,
                 &BrokerRequest::SpawnSession {
@@ -598,6 +695,7 @@ pub async fn spawn_user_compositor_via_broker(
                     height,
                     socket_name: "redfog-user-0".to_string(),
                     payload: user_app.to_vec(),
+                    input_device_nodes: input_device_nodes.into_iter().map(|p| p.to_string_lossy().to_string()).collect(),
                 },
             )
             .await
@@ -619,14 +717,15 @@ pub async fn spawn_user_compositor_via_broker(
                 fps,
                 &pipewire_socket_path,
             )
-            .map(SpawnedCompositor::Kwin)
+            .map(|session| (SpawnedCompositor::Kwin(session), gamepad))
             .map_err(|e| format!("failed to attach to broker-spawned session: {e}"))
         }
         // The broker interaction for this backend (SpawnPayload) happens
         // later, in spawn_gst_payload, once the socket built here actually
         // exists — see SpawnedCompositor's doc comment. Authenticate above
-        // still applies.
-        Backend::GstWaylandDisplay => spawn_gst_compositor(width, height, fps, "redfog-user-0"),
+        // still applies. `input_backend` is ignored here — GstWaylandDisplay
+        // always uses `FakeInput` for now (see `InputBackend`'s doc comment).
+        Backend::GstWaylandDisplay => spawn_gst_compositor(width, height, fps, "redfog-user-0").map(|c| (c, None)),
     }
 }
 

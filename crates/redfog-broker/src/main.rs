@@ -159,10 +159,10 @@ async fn handle_connection(
                 tracing::info!("authenticating user {username}");
                 BrokerResponse::Authenticate(auth::authenticate(username, password).await)
             }
-            BrokerRequest::SpawnSession { session_id, username, password, width, height, socket_name, payload } => {
+            BrokerRequest::SpawnSession { session_id, username, password, width, height, socket_name, payload, input_device_nodes } => {
                 tracing::info!("spawning session {session_id} for user {username} ({width}x{height})");
                 let result = sessions
-                    .spawn(&session_id, &username, &password, width, height, &socket_name, &payload)
+                    .spawn(&session_id, &username, &password, width, height, &socket_name, &payload, &input_device_nodes)
                     .await
                     .map(|spawned| redfog_broker_protocol::SpawnedSession {
                         wayland_socket_path: spawned.wayland_socket_path,

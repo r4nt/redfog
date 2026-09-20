@@ -29,7 +29,27 @@ pub enum BrokerRequest {
     /// already carries a password over; never forwarded to
     /// `redfog-session-init` as an argv (see its own doc comment for why —
     /// argv is readable by any local user via `/proc/<pid>/cmdline`).
-    SpawnSession { session_id: String, username: String, password: String, width: u32, height: u32, socket_name: String, payload: Vec<String> },
+    SpawnSession {
+        session_id: String,
+        username: String,
+        password: String,
+        width: u32,
+        height: u32,
+        socket_name: String,
+        payload: Vec<String>,
+        /// `/dev/input/eventN` path(s) of the virtual gamepad the caller
+        /// already created (via `redfog_core::InputtinoGamepad`, when
+        /// `REDFOG_INPUT_BACKEND=inputtino`) before sending this request —
+        /// empty when using the default `fake-input` mechanism, which needs
+        /// no device-level sandboxing at all (see `InputBackend`'s doc
+        /// comment in `session_backend`). The broker bind-mounts exactly
+        /// these paths into the spawned compositor's own sandbox (see
+        /// `device_sandbox_systemd_directives`), the same way it already
+        /// scopes the GPU render node — so a session's compositor can never
+        /// see another concurrent session's (or the host's real) input
+        /// devices.
+        input_device_nodes: Vec<String>,
+    },
     /// For backends where the *caller* (not the broker) already created and
     /// owns the compositor/Wayland socket — e.g. redfog-moonlight embedding
     /// a `gst-wayland-display` pipeline directly in its own process, unlike

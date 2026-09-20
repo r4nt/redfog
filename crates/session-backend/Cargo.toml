@@ -10,7 +10,7 @@ redfog-broker-protocol = { path = "../redfog-broker-protocol" }
 redfog-login-protocol = { path = "../redfog-login-protocol" }
 gstreamer = "0.21"
 gstreamer-app = "0.21"
-tokio = { version = "1", features = ["net", "io-util"] }
+tokio = { version = "1", features = ["net", "io-util", "rt"] }
 tracing = "0.1"
 
 [dev-dependencies]

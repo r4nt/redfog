@@ -254,6 +254,7 @@ if [ -z "${REDFOG_LIVE_SCOPED:-}" ]; then
         --setenv="GST_TRACERS=${GST_TRACERS:-}" \
         --setenv="GST_DEBUG=${GST_DEBUG:-}" \
         --setenv="REDFOG_VIDEO_ENCODER=${REDFOG_VIDEO_ENCODER:-}" \
+        --setenv="REDFOG_INPUT_BACKEND=${REDFOG_INPUT_BACKEND:-}" \
         --setenv="REDFOG_DEBUG_GST_DEBUG=${REDFOG_DEBUG_GST_DEBUG:-}" \
         --setenv="REDFOG_DEBUG_KWIN_LOGGING_RULES=${REDFOG_DEBUG_KWIN_LOGGING_RULES:-}" \
         --setenv="REDFOG_LIVE_BROKER_RUST_LOG=${REDFOG_LIVE_BROKER_RUST_LOG:-}" \
@@ -337,6 +338,14 @@ if [ -z "${REDFOG_LIVE_STANDALONE:-}" ] \
     [ -n "${REDFOG_DEBUG_KWIN_LOGGING_RULES:-}" ] && broker_env+=("REDFOG_DEBUG_KWIN_LOGGING_RULES=${REDFOG_DEBUG_KWIN_LOGGING_RULES}")
     [ -n "${REDFOG_LIVE_SWAY:-}" ] && server_env+=("REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR=${PLUGIN_DIR}")
     [ -n "${REDFOG_VIDEO_ENCODER:-}" ] && server_env+=("REDFOG_VIDEO_ENCODER=${REDFOG_VIDEO_ENCODER}")
+    # "fake-input" (default) or "inputtino" -- see InputBackend's own doc
+    # comment. Package-parity mode is the one that actually exercises the
+    # real privilege model this needs (redfog-server.service's
+    # SupplementaryGroups=input + the installed udev rule) -- re-run
+    # `makepkg -si` first if you've changed either since the package was
+    # last installed, this script only hot-swaps the binaries, never the
+    # unit files/udev rules themselves (see header comment).
+    [ -n "${REDFOG_INPUT_BACKEND:-}" ] && server_env+=("REDFOG_INPUT_BACKEND=${REDFOG_INPUT_BACKEND}")
     # Diagnostic toggle for audio.rs's AudioPacketizer -- see its
     # `fec_enabled` field doc comment. Set to isolate whether a client's
     # audio trouble comes from the FEC packets' sequence-number reuse.
@@ -592,6 +601,7 @@ else
     REDFOG_GST_WAYLAND_DISPLAY_PLUGIN_DIR="${REDFOG_LIVE_SWAY:+$PLUGIN_DIR}" \
     REDFOG_DEBUG_GST_DEBUG="${REDFOG_DEBUG_GST_DEBUG-}" \
     REDFOG_VIDEO_ENCODER="${REDFOG_VIDEO_ENCODER:-}" \
+    REDFOG_INPUT_BACKEND="${REDFOG_INPUT_BACKEND:-}" \
     RUST_LOG="${REDFOG_LIVE_SERVER_RUST_LOG:-redfog_moonlight=info,redfog_server=info,gst_backend=info}" \
     GST_TRACERS="${GST_TRACERS:-}" \
     GST_DEBUG="${GST_DEBUG:-}" \

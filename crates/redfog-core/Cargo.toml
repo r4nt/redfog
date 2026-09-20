@@ -13,6 +13,9 @@ gstreamer-app = "0.21"
 gstreamer-video = { version = "0.21", features = ["v1_24"] }
 gstreamer-allocators = "0.21"
 libc = "0.2"
+# Not on crates.io at all -- run `./scripts/fetch-patched-deps.sh` once to
+# fetch it into `vendor/` (gitignored). See that script's own comment for why.
+inputtino = { path = "../../vendor/inputtino/bindings/rust/inputtino" }
 
 [dev-dependencies]
 nix = { version = "0.26", features = ["signal"] }

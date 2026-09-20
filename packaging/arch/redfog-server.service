@@ -8,6 +8,17 @@ Wants=redfog-broker.service
 Type=simple
 User=redfog
 Group=redfog
+# Lets this process create/drive a virtual gamepad via inputtino when
+# REDFOG_INPUT_BACKEND=inputtino (opt-in; see redfog.conf) -- keyboard/
+# mouse/touch always go through KWin's own fake_input mechanism regardless,
+# see redfog.conf's own comment for why. /dev/uinput is group "input"-
+# accessible via the udev rule this package installs
+# (85-redfog-input.rules). Group membership alone grants nothing without
+# that rule; the rule alone grants nothing without this. Cross-session
+# visibility of the resulting device is *not* controlled here -- that's the
+# per-session BindPaths= scoping redfog-broker applies to each spawned
+# compositor, same mechanism already used for GPU render nodes.
+SupplementaryGroups=input
 ExecStart=/usr/bin/redfog-server
 Restart=on-failure
 RestartSec=2

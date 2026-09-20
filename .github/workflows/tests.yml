@@ -76,7 +76,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config cmake clang libclang-dev \
+            build-essential pkg-config cmake clang libclang-dev libevdev-dev \
             libwayland-dev wayland-protocols libxkbcommon-dev libxkbcommon-x11-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
