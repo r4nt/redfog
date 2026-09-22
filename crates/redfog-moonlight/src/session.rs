@@ -66,6 +66,14 @@ pub struct SessionConfig {
     /// per-frame video encoder logs. For diagnosing real-client mouse
     /// behavior (sensitivity, drops, event shape) without that noise.
     pub log_mouse_events: bool,
+    /// Same idea as `log_mouse_events`, for touch (Down/Motion/Up/Cancel/
+    /// CancelAll) instead — a separate flag, not reused from mouse's,
+    /// since a real touch drag/gesture is at least as high-frequency as
+    /// mouse motion (TouchMotion fires once per sample, per active
+    /// pointer). These used to log unconditionally at `info`, unlike
+    /// every mouse event above — confirmed live this really does spam a
+    /// default-level log during any sustained touch interaction.
+    pub log_touch_events: bool,
     /// Path to redfog-broker's Unix socket. When set, the User session
     /// (post-login) is spawned via the broker (`Authenticate` then
     /// `SpawnSession`/`SpawnPayload` depending on `backend`, see design.md's
@@ -3271,14 +3279,32 @@ fn scale_touch_coord(normalized: f32, dimension: u32) -> f64 {
 
 /// One touch went down at `(x, y)` (already scaled to pixel coordinates —
 /// see `scale_touch_coord`) — forwards it to `fwd`, first releasing
-/// `pointer_id`'s slot if it was already marked down (a lost Up packet,
-/// confirmed live to otherwise leave a permanently stuck touch slot in
-/// KWin). Extracted out of `on_input`'s own match arm so this bookkeeping
-/// is unit-testable without needing a full `SessionManager`/
-/// `RunningSession` (GStreamer pipelines, a real compositor, ...) just to
-/// exercise it.
+/// `pointer_id`'s slot if it was already marked down. Extracted out of
+/// `on_input`'s own match arm so this bookkeeping is unit-testable without
+/// needing a full `SessionManager`/`RunningSession` (GStreamer pipelines, a
+/// real compositor, ...) just to exercise it.
+///
+/// The "already marked down" branch logs a warning: Moonlight's touch
+/// channel is reliable and ordered (`CHANNEL_TOUCH`, `PacketKind::Reliable`
+/// in moonlight-common-rust's `ControlPacket::channel`), so a second Down
+/// for a still-active `pointer_id` shouldn't happen from ordinary wire loss
+/// — if this fires in practice it's either genuine client-side id reuse
+/// without an Up, or `active_touch_ids` having already diverged from
+/// reality for some other reason. Also worth being suspicious of on its own
+/// terms: the corrective touch_up this sends is a *real* synthetic
+/// lift-then-re-press that KWin (and whatever Wayland client has touch
+/// focus) will actually process — unlike doing nothing here, which KWin's
+/// own `FakeInputDevice::touch_down` already handles as a silent no-op for
+/// a duplicate Down on an already-active id. This log is here to find out
+/// how often (if ever) this actually fires before deciding whether the
+/// branch is worth keeping at all.
 fn touch_down(active_touch_ids: &mut HashSet<u32>, fwd: &mut dyn InputSink, pointer_id: u32, x: f64, y: f64) {
     if active_touch_ids.contains(&pointer_id) {
+        tracing::warn!(
+            "touch anomaly: Down for pointer_id={pointer_id} while still marked active — \
+             shouldn't happen on a reliable+ordered wire channel; releasing the stale slot \
+             (a synthetic Up KWin will actually process) before starting the new one"
+        );
         fwd.touch_up(pointer_id);
         fwd.touch_frame();
     }
@@ -3292,8 +3318,22 @@ fn touch_down(active_touch_ids: &mut HashSet<u32>, fwd: &mut dyn InputSink, poin
 /// motion is always valid from the forwarder's perspective. `HashSet::
 /// insert` returning `true` (newly inserted, i.e. wasn't already active)
 /// doubles as the "did we miss the Down" check.
+///
+/// Logs a warning when this fires: same reasoning as `touch_down`'s own
+/// comment — shouldn't happen on a reliable+ordered wire channel. Unlike
+/// `touch_down`'s "already active" branch, this one is genuinely
+/// load-bearing regardless of how often it fires: KWin's own
+/// `FakeInputDevice::touch_motion` handler is `if
+/// (!activeTouches.contains(id)) return;` — a *silent, permanent* no-op —
+/// so without this synthesis, a touch whose Down never registered would
+/// never work for its entire lifetime, with no way to recover.
 fn touch_motion(active_touch_ids: &mut HashSet<u32>, fwd: &mut dyn InputSink, pointer_id: u32, x: f64, y: f64) {
     if active_touch_ids.insert(pointer_id) {
+        tracing::warn!(
+            "touch anomaly: Motion for pointer_id={pointer_id} with no prior Down — \
+             shouldn't happen on a reliable+ordered wire channel; synthesizing a Down instead \
+             of forwarding a bare Motion"
+        );
         fwd.touch_down(pointer_id, x, y);
     } else {
         fwd.touch_motion(pointer_id, x, y);
@@ -3304,8 +3344,22 @@ fn touch_motion(active_touch_ids: &mut HashSet<u32>, fwd: &mut dyn InputSink, po
 /// One touch lifted or got cancelled — identical handling either way (see
 /// `on_input`'s own `TouchUp`/`TouchCancel` arms, which differ only in
 /// their log message).
+///
+/// Logs a warning if `pointer_id` wasn't actually tracked as active: same
+/// "shouldn't happen on a reliable+ordered wire channel" reasoning as
+/// `touch_down`/`touch_motion` — either a duplicate Up, or an Up for an id
+/// whose Down was never seen. Forwarded to `fwd` regardless either way:
+/// KWin's own `touch_up` handler is already a safe no-op
+/// (`if (activeTouches.remove(id)) { emit ...; }`) when the id wasn't
+/// active, so there's no harm in sending it through unconditionally.
 fn touch_up(active_touch_ids: &mut HashSet<u32>, fwd: &mut dyn InputSink, pointer_id: u32) {
-    active_touch_ids.remove(&pointer_id);
+    if !active_touch_ids.remove(&pointer_id) {
+        tracing::warn!(
+            "touch anomaly: Up for pointer_id={pointer_id} that was never marked active — \
+             shouldn't happen on a reliable+ordered wire channel; forwarding anyway (KWin's own \
+             touch_up handler is already a safe no-op for this)"
+        );
+    }
     fwd.touch_up(pointer_id);
     fwd.touch_frame();
 }
@@ -3429,25 +3483,35 @@ impl ControlEventHandler for SessionManager {
             InputEvent::TouchDown { pointer_id, x, y, .. } => {
                 let px = scale_touch_coord(x, session.width);
                 let py = scale_touch_coord(y, session.height);
-                tracing::info!("touch event: TouchDown id={pointer_id} x={px:.1} y={py:.1} (active_before={})", session.active_touch_ids.len());
+                if self.config.log_touch_events {
+                    tracing::info!("touch event: TouchDown id={pointer_id} x={px:.1} y={py:.1} (active_before={})", session.active_touch_ids.len());
+                }
                 touch_down(&mut session.active_touch_ids, fwd.as_mut(), pointer_id, px, py);
             }
             InputEvent::TouchMotion { pointer_id, x, y, .. } => {
                 let px = scale_touch_coord(x, session.width);
                 let py = scale_touch_coord(y, session.height);
-                tracing::info!("touch event: TouchMotion id={pointer_id} x={px:.1} y={py:.1}");
+                if self.config.log_touch_events {
+                    tracing::info!("touch event: TouchMotion id={pointer_id} x={px:.1} y={py:.1}");
+                }
                 touch_motion(&mut session.active_touch_ids, fwd.as_mut(), pointer_id, px, py);
             }
             InputEvent::TouchUp { pointer_id } => {
                 touch_up(&mut session.active_touch_ids, fwd.as_mut(), pointer_id);
-                tracing::info!("touch event: TouchUp id={pointer_id} (active_remaining={})", session.active_touch_ids.len());
+                if self.config.log_touch_events {
+                    tracing::info!("touch event: TouchUp id={pointer_id} (active_remaining={})", session.active_touch_ids.len());
+                }
             }
             InputEvent::TouchCancel { pointer_id } => {
                 touch_up(&mut session.active_touch_ids, fwd.as_mut(), pointer_id);
-                tracing::info!("touch event: TouchCancel id={pointer_id} (active_remaining={})", session.active_touch_ids.len());
+                if self.config.log_touch_events {
+                    tracing::info!("touch event: TouchCancel id={pointer_id} (active_remaining={})", session.active_touch_ids.len());
+                }
             }
             InputEvent::TouchCancelAll => {
-                tracing::info!("touch event: TouchCancelAll (releasing {} active touches)", session.active_touch_ids.len());
+                if self.config.log_touch_events {
+                    tracing::info!("touch event: TouchCancelAll (releasing {} active touches)", session.active_touch_ids.len());
+                }
                 release_all_touches(&mut session.active_touch_ids, fwd.as_mut());
             }
             InputEvent::GamepadState { controller_number, buttons, left_trigger, right_trigger, left_stick, right_stick } => {

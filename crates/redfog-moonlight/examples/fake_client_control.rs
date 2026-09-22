@@ -4,8 +4,10 @@
 //!
 //! Usage: cargo run --example fake_client_control -- <host:port> <rikey-hex>
 
-use std::time::Duration;
-use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode};
+use std::net::SocketAddrV4;
+use std::time::{Duration, Instant};
+
+use enet::{Address, BandwidthLimit, ChannelLimit, Enet, Event, Packet, PacketMode};
 
 const CONTROL_MSG_ENCRYPTED: u16 = 0x0001;
 const CONTROL_MSG_INPUT_DATA: u16 = 0x0206;
@@ -58,46 +60,65 @@ fn mouse_move_relative_message(dx: i16, dy: i16) -> Vec<u8> {
     message
 }
 
-#[tokio::main]
-async fn main() {
+// No tokio needed here (unlike the old tokio_enet version this replaced):
+// the real `enet` crate's API is synchronous, matching the real C
+// `libenet` it binds — see `control.rs`'s own doc comment on the
+// `use enet::...` import for why redfog's control channel uses it now.
+fn main() {
     let mut args = std::env::args().skip(1);
-    let target: std::net::SocketAddr = args.next().unwrap_or_else(|| "127.0.0.1:47999".to_string()).parse().unwrap();
+    let target_str = args.next().unwrap_or_else(|| "127.0.0.1:47999".to_string());
+    // enet-rs's own `Address` type is IPv4-only -- see `ControlServer::
+    // serve_blocking`'s own comment on the same constraint.
+    let target: SocketAddrV4 = target_str.parse().expect("expected an IPv4 host:port, e.g. 127.0.0.1:47999");
     let rikey_hex = args.next().expect("usage: fake_client_control <host:port> <rikey-hex>");
     let key: [u8; 16] = hex::decode(rikey_hex).unwrap().try_into().unwrap();
 
-    let mut host = Host::new(HostConfig::default()).expect("create enet client host");
-    let peer_id = host.connect(target, 1, 0).expect("connect");
+    let enet_ctx = Enet::new().expect("initialize libenet");
+    // `None` address + `create_host::<()>`: this is a client-only endpoint
+    // (no per-peer associated data needed, unlike the real server side).
+    let mut host = enet_ctx.create_host::<()>(None, 1, ChannelLimit::Maximum, BandwidthLimit::Unlimited, BandwidthLimit::Unlimited).expect("create enet client host");
+    let address = Address::new(*target.ip(), target.port());
+    host.connect(&address, 1, 0).expect("connect");
     println!("connecting to {target}...");
 
     let mut connected = false;
     let mut sent = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
-        if let Ok(Some(event)) = host.service(Duration::from_millis(200)).await {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    'outer: while Instant::now() < deadline {
+        // `flush()` can't be called while `event` (and the `peer` borrowed
+        // out of it) are still alive -- unlike the old tokio_enet version
+        // this replaced, `enet`'s own `Event`/`Peer` genuinely borrow from
+        // `host`, so the flush has to wait until this whole `if let`
+        // block's borrow ends.
+        let mut just_sent = false;
+        if let Ok(Some(mut event)) = host.service(200) {
             match event {
-                Event::Connect { peer_id: p, .. } if p == peer_id => {
+                Event::Connect(ref mut peer) => {
                     println!("connected, sending 20 mouse-move events...");
                     connected = true;
                     for i in 0..20u32 {
                         let msg = build_encrypted_message(&key, i, &mouse_move_relative_message(5, 0));
-                        if let Some(peer) = host.peer_mut(peer_id) {
-                            let _ = peer.send(0, Packet::new(&msg, PacketMode::ReliableSequenced));
+                        if let Ok(packet) = Packet::new(&msg, PacketMode::ReliableSequenced) {
+                            let _ = peer.send_packet(packet, 0);
                         }
                     }
-                    let _ = host.flush().await;
                     sent = true;
+                    just_sent = true;
                 }
-                Event::Disconnect { .. } => break,
+                Event::Disconnect(..) => break 'outer,
                 _ => {}
             }
+        }
+        if just_sent {
+            host.flush();
         }
     }
     // Keep servicing the connection for a few more seconds so ENet's reliable
     // retransmission actually has a chance to complete before we exit and
     // drop the socket.
-    let linger_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < linger_deadline {
-        let _ = host.service(Duration::from_millis(200)).await;
+    let linger_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < linger_deadline {
+        let _ = host.service(200);
     }
 
     if connected && sent {

@@ -291,6 +291,47 @@ against a real client).
 
 ## Recently fixed (2026-08-31, for context — not TODO items)
 
+- **Two-finger touch gestures (pinch-zoom, scroll) breaking after the first
+  successful gesture, for the rest of the session** (2026-09-22) —
+  root-caused to a real bug in `tokio-enet` (the pure-Rust ENet
+  reimplementation the control channel used), not redfog's own code, KWin,
+  or the network. Live evidence: a code-level sequence-number gap tracker
+  added to `control.rs` (checks the wire's own per-message AES-GCM nonce
+  for continuity) showed ~20 messages missing out of every ~100ms window,
+  continuously, for the entire remainder of a session, immediately after
+  the first `TouchDown` — while the reliable `PeriodicPing` (100ms
+  interval) kept arriving throughout, and `tcpdump` on both client and
+  server confirmed packets genuinely were reaching the wire. Traced into
+  `tokio-enet`'s `handle_send_unreliable` (`host.rs`): it silently drops
+  any incoming unreliable-sequenced packet whose sequence number looks
+  "older" than `Channel::incoming_unreliable_sequence_number` — standard
+  ENet behavior in principle, but something was setting that high-water
+  mark to a wrong, too-high value once (never fully isolated *why* — a
+  parsing bug in multi-command-per-datagram handling was the leading
+  candidate, since ENet bundles both fingers' independent unreliable
+  sends into one UDP datagram during a two-finger gesture specifically),
+  after which every legitimate subsequent packet looked "behind" it and
+  was silently discarded for good. Confirmed decisively (not just
+  inferred) by building a second control-channel backend using the `enet`
+  crate — real, high-level bindings over `enet-sys`'s FFI to the actual
+  canonical C `libenet` (the same one every real ENet project, including
+  `moonlight-common-c` itself, already runs on), sharing every line of
+  logic downstream of the raw wire read (`handle_message`, the gap
+  tracker, the stuck-call watchdog) with the `tokio-enet` version it was
+  built alongside — the two only differed in how bytes got pulled off the
+  socket, making this a clean, decisive A/B test, not a coincidence.
+  Switching to it made the symptom disappear entirely: pinch-zoom,
+  two-finger scroll, all confirmed working live. Given that result,
+  `tokio-enet` was removed outright rather than kept as a fallback behind
+  a flag — `enet`/`enet-sys`'s own real-world adoption (tens of thousands
+  of downloads) already dwarfed `tokio-enet`'s (low four figures) even
+  before this bug, so there was no real case for keeping the buggy,
+  less-used option around. If `tokio-enet` gets more development and
+  becomes trustworthy later, reintroducing it as an alternative is a
+  small, self-contained change (mirror `ControlServer::serve`'s current
+  structure) — see `control.rs`'s own doc comment on the `use enet::...`
+  import for the full story and exact pointers.
+
 - **NVIDIA screencast DMA-BUF negotiation always falling back to `MemPtr`/software
   encoding on a GTX 1070** (2026-09-01) — root-caused all the way down, then fixed.
   `eglQueryDmaBufModifiersEXT` (`egl_dmabuf.rs`) only ever reported

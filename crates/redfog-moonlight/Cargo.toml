@@ -36,7 +36,12 @@ form_urlencoded = "1"
 rtsp-types = "0.1"
 sdp-types = "0.1"
 
-tokio-enet = "0.1"
+# Real, high-level Rust bindings to the actual C `libenet` (via `enet-sys`
+# FFI), not a from-scratch reimplementation of the wire protocol -- used to
+# run on `tokio-enet` (pure-Rust, native-async) instead; switched away
+# entirely after live testing found a real bug there. See control.rs's own
+# doc comment on the `use enet::...` import for the full story.
+enet = "0.3"
 
 rustls = "0.23"
 tokio-rustls = "0.26"

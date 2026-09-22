@@ -3274,7 +3274,7 @@ async fn disconnecting_without_reconnecting_stops_encoding_and_sending() {
     // trivially, wrongly pass on that stale match instead of the real
     // disconnect this test triggers below -- see `wait_for_new_stdout`'s
     // own doc comment.
-    let disconnected_before = server.count_stdout("control channel: peer PeerId(0) disconnected");
+    let disconnected_before = server.count_stdout("control channel: peer disconnected");
 
     // ---- Simulate closing the window: drop the stream with no clean
     // RTSP TEARDOWN / control-channel disconnect, and (unlike the
@@ -3282,7 +3282,8 @@ async fn disconnecting_without_reconnecting_stops_encoding_and_sending() {
     // is the ENet control channel's own peer timeout. ----
     drop(stream);
 
-    // ENet's own TIMEOUT_MINIMUM is 5s (tokio-enet's peer.rs) -- generous
+    // ENet's own TIMEOUT_MINIMUM is 5s (ENET_PEER_TIMEOUT_MINIMUM, standard
+    // across every real ENet implementation) -- generous
     // margin on top for scheduling jitter, the control loop's own 100ms
     // poll granularity, and ENet's actual timeout math being a good deal
     // more involved than that one constant alone (exponential backoff
@@ -3291,7 +3292,7 @@ async fn disconnecting_without_reconnecting_stops_encoding_and_sending() {
     // keep flowing completely normally this whole time -- there's no way
     // for the server to know any sooner -- so the "before" counts below
     // are deliberately captured *after* this wait, not before it.
-    server.wait_for_new_stdout("control channel: peer PeerId(0) disconnected", disconnected_before, Duration::from_secs(90)).await;
+    server.wait_for_new_stdout("control channel: peer disconnected", disconnected_before, Duration::from_secs(90)).await;
     let audio_lines_before = server.count_stdout("audio: ");
     let video_lines_before = server.count_stdout("video: ");
 

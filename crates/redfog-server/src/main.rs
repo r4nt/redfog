@@ -124,6 +124,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let clients = Arc::new(ClientManager::new(&state_dir, identity.cert_pem.clone(), identity.private_key_pem.clone()));
 
     let log_mouse_events = std::env::var("REDFOG_LOG_MOUSE_EVENTS").is_ok_and(|v| v != "0");
+    let log_touch_events = std::env::var("REDFOG_LOG_TOUCH_EVENTS").is_ok_and(|v| v != "0");
     // Default posture: reject a second device logging in as a username
     // that's already actively attached elsewhere, rather than silently
     // spawning a second, independent desktop for the same account — see
@@ -208,6 +209,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         video_encoder,
         broker_socket_path,
         log_mouse_events,
+        log_touch_events,
         backend,
         input_backend,
         session_presets,

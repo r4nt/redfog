@@ -618,6 +618,8 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.12.1",
+ "log",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -1541,6 +1543,26 @@ checksum = "95743bef3ff70fcba3930246c4e6872882bbea0dcc6da2ca860112e0cd4bd09f"
 dependencies = [
  "az",
  "byteorder",
+]
+
+[[package]]
+name = "enet"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd5c84ebdecb28194d15e063436a4b7863546a9dea268aee131ca23dbb2a21ac"
+dependencies = [
+ "enet-sys",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "enet-sys"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc014eb33c6f3c5736183f3f379c1dad4173988409fd4a6ace58ca685bbd21fb"
+dependencies = [
+ "bindgen 0.72.1",
+ "cmake",
 ]
 
 [[package]]
@@ -4397,6 +4419,7 @@ dependencies = [
  "bytes",
  "cbc",
  "embedded-graphics",
+ "enet",
  "fec-rs",
  "form_urlencoded",
  "gethostname 0.5.0",
@@ -4430,7 +4453,6 @@ dependencies = [
  "socket2 0.6.4",
  "tiny-skia",
  "tokio",
- "tokio-enet",
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
@@ -5455,18 +5477,6 @@ dependencies = [
  "socket2 0.6.4",
  "tokio-macros",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "tokio-enet"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ede1e4e6d38df6dcd4891668f532905c6b19640caa142128a6957849cafea3d6"
-dependencies = [
- "socket2 0.6.4",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]

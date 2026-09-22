@@ -22,12 +22,47 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use tokio_enet::{Event, Host, HostConfig, PeerId};
+use enet::{Address, BandwidthLimit, ChannelLimit, Enet, Event};
 
 use crate::crypto;
+
+/// Real, high-level Rust bindings (via `enet-sys`'s FFI) to the actual,
+/// canonical C `libenet` — not a from-scratch reimplementation of the wire
+/// protocol. This control channel used to run on `tokio_enet` (a young,
+/// pure-Rust, native-async reimplementation) instead; switched away from
+/// it entirely (2026-09-22) after live testing found a real bug there:
+/// near-total, sustained loss of unreliable-sequenced touch Move packets,
+/// after an initial burst succeeded and never recovering for the rest of
+/// the session, while reliable traffic (Down/Up, the periodic ping) kept
+/// working throughout. Traced to `tokio_enet`'s own
+/// `Channel::incoming_unreliable_sequence_number` bookkeeping in
+/// `handle_send_unreliable` silently discarding every subsequent packet
+/// once that high-water mark got set wrong once (the exact trigger was
+/// never fully isolated — a parsing bug in multi-command-per-datagram
+/// handling was the leading candidate, since ENet bundles both fingers'
+/// independent unreliable sends into one UDP datagram during a two-finger
+/// gesture specifically). Confirmed decisively, not just inferred: running
+/// the exact same session against this crate instead made the symptom
+/// disappear entirely (pinch-zoom, two-finger scroll, all confirmed
+/// working live) — see `TODO.md`'s "Recently fixed" entry for the full
+/// story. `enet`/`enet-sys`'s own real-world adoption (tens of thousands
+/// of downloads) also dwarfs `tokio_enet`'s (low four figures), a reason
+/// to prefer it independent of this specific bug.
+///
+/// The real C library's own `enet_host_service()` is blocking (not
+/// async) — `ControlServer::serve`'s loop runs on a dedicated blocking
+/// thread via `tokio::task::spawn_blocking` rather than being `.await`ed
+/// inline.
+///
+/// Not vendored back in: `tokio_enet` was removed outright rather than
+/// kept as a fallback behind a flag — if it gets more development and
+/// becomes trustworthy later, reintroducing it as an alternative (mirror
+/// `serve`'s own structure, same `handle_message` reuse) is a small,
+/// self-contained change, not worth carrying the dead weight of an
+/// unused-by-default backend until then.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputEvent {
@@ -181,6 +216,25 @@ pub struct ControlServer {
 /// comment for why those can't be used to match at all).
 const PENDING_MATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Per-peer associated data for `ControlServer::serve_enet`'s real-`enet`-
+/// backed loop — see that method's own doc comment for why this lives on
+/// the peer itself rather than in a side `HashMap`.
+#[derive(Debug, Clone, Copy)]
+enum PeerRikeyState {
+    Pending { connected_at: Instant },
+    Matched { rikey: [u8; 16], epoch: u64 },
+}
+
+/// Clears `handle_message`'s stuck-call watchdog marker on the way out,
+/// panic included — see that function's own doc comment.
+struct InFlightGuard<'a>(&'a Mutex<Option<Instant>>);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = None;
+    }
+}
+
 impl ControlServer {
     /// Matches each new ENet peer to a session by *decrypting* its first
     /// matchable message against every currently-registered rikey and
@@ -191,111 +245,185 @@ impl ControlServer {
     /// concurrent clients apart when they share one (same NAT, or literally
     /// the same machine) — decrypt-based matching sidesteps that entirely,
     /// and is genuinely cryptographic besides (see `RegistryState`'s doc
-    /// comment). Once a peer matches, its rikey is cached (`peer_rikey`) so
-    /// only its *first* message ever needs the O(sessions) trial — every
-    /// later message decrypts directly against the one already-known key.
+    /// comment). Once a peer matches, its rikey is cached (on the peer
+    /// itself, via `enet`'s own per-peer associated-data mechanism,
+    /// `Peer::data`/`set_data` — see `PeerRikeyState`) so only its *first*
+    /// message ever needs the O(sessions) trial — every later message
+    /// decrypts directly against the one already-known key. Not a side
+    /// `HashMap` keyed by an opaque peer id (the way the `tokio_enet`-based
+    /// version this replaced did it, see this module's own doc comment):
+    /// `enet`'s own `Peer` can't be used as a stable, storable map key —
+    /// it's explicitly documented as "can not really be stored anywhere" —
+    /// so the association has to live on the peer itself instead.
+    ///
+    /// Runs on a dedicated blocking thread (`serve_blocking`, via
+    /// `tokio::task::spawn_blocking`): the real C library's own
+    /// `enet_host_service()` is blocking, not async.
     pub async fn serve(self, bind_addr: IpAddr) -> Result<(), String> {
-        let config = HostConfig {
-            address: Some(std::net::SocketAddr::new(bind_addr, self.port)),
-            peer_count: 4,
-            // Real clients request 48 channels (confirmed live: "channel_count=48"
-            // in the connection log) — keyboard/mouse/gamepad input each use
-            // dedicated channel indices (see moonlight-common-rust's
-            // `EnetChannel`, CHANNEL_COUNT=0x30=48), not just channel 0.
-            // Capping this at 1 silently clamps the negotiated channel count,
-            // corrupting/dropping anything sent on a channel we never set up.
-            channel_limit: 48,
-            ..Default::default()
+        tokio::task::spawn_blocking(move || self.serve_blocking(bind_addr)).await.map_err(|e| format!("control channel thread panicked: {e}"))?
+    }
+
+    fn serve_blocking(self, bind_addr: IpAddr) -> Result<(), String> {
+        let addr_v4 = match bind_addr {
+            std::net::IpAddr::V4(v4) => v4,
+            // enet-rs's own `Address` type is IPv4-only (SocketAddrV4
+            // under the hood). Not a real limitation for redfog today
+            // (Moonlight/GameStream itself is IPv4 throughout), but a
+            // real constraint worth failing loudly on rather than
+            // silently misbehaving.
+            std::net::IpAddr::V6(_) => {
+                return Err("the control channel only supports binding to an IPv4 address (enet-rs's Address type has no IPv6 support)".to_string());
+            }
         };
-        let mut host = Host::new(config).map_err(|e| format!("failed to create enet host on port {}: {e}", self.port))?;
-        // Peers matched to a rikey, and the epoch they were matched under
-        // (see `RegistryState`'s doc comment for why epoch, not rikey
-        // alone, is what decides staleness).
-        let mut peer_rikey: HashMap<PeerId, ([u8; 16], u64)> = HashMap::new();
-        // Connected but not yet matched to any rikey, with when they
-        // connected — see `PENDING_MATCH_TIMEOUT`.
-        let mut pending: HashMap<PeerId, Instant> = HashMap::new();
+
+        let enet_ctx = Enet::new().map_err(|e| format!("failed to initialize libenet: {e}"))?;
+        let address = Address::new(addr_v4, self.port);
+        // Real clients request 48 channels (confirmed live:
+        // "channel_count=48" in the connection log) — keyboard/mouse/
+        // gamepad input each use dedicated channel indices (see
+        // moonlight-common-rust's `EnetChannel`, CHANNEL_COUNT=0x30=48),
+        // not just channel 0. Capping this lower would silently clamp the
+        // negotiated channel count, corrupting/dropping anything sent on
+        // a channel we never set up.
+        let mut host = enet_ctx
+            .create_host::<PeerRikeyState>(Some(&address), 4, ChannelLimit::Maximum, BandwidthLimit::Unlimited, BandwidthLimit::Unlimited)
+            .map_err(|e| format!("failed to create enet host on port {}: {e}", self.port))?;
+
+        let mut last_handled_at = Instant::now();
+        let in_flight_since: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        {
+            let in_flight_since = Arc::clone(&in_flight_since);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    if let Some(started) = *in_flight_since.lock().unwrap() {
+                        let stuck_for = started.elapsed();
+                        if stuck_for > Duration::from_secs(1) {
+                            tracing::error!(
+                                "control channel: handle_message has been running for {stuck_for:?} \
+                                 without returning — looks genuinely stuck (deadlock, or an unbounded \
+                                 blocking call), not just slow"
+                            );
+                        }
+                    }
+                }
+            });
+        }
 
         loop {
             let regs = self.registry.snapshot();
 
-            // Disconnect any peer whose matched rikey has since been
-            // superseded (a retake re-registered it, bumping its epoch) or
-            // removed entirely (the session ended).
-            let stale: Vec<(PeerId, [u8; 16])> = peer_rikey.iter().filter(|(_, &(rikey, epoch))| regs.get(&rikey) != Some(&epoch)).map(|(&id, &(rikey, _))| (id, rikey)).collect();
-            for (peer_id, rikey) in &stale {
-                host.disconnect_now(*peer_id, 0);
-                peer_rikey.remove(peer_id);
-                // This is its own, separate disconnect path from the
-                // `Event::Disconnect` arm below -- ENet's `disconnect_now`
-                // tears the peer down immediately rather than through its
-                // own event loop, so nothing else here would ever notice
-                // this peer is gone otherwise. Confirmed live this is the
-                // path an actual reconnect-after-silent-close takes (not
-                // `Event::Disconnect`): the new `/launch` backgrounds the
-                // old session, which forgets its rikey from the registry,
-                // which is what makes it "stale" here in the first place.
-                self.handler.on_peer_disconnected(*rikey);
+            // Disconnect any matched peer whose rikey has since been
+            // superseded or removed — same reasoning as `serve`'s own
+            // stale-peer sweep, just walking `host.peers()` instead of a
+            // side map (there's no side map here).
+            let mut disconnected = 0u32;
+            for peer in host.peers() {
+                if let Some(PeerRikeyState::Matched { rikey, epoch }) = peer.data().copied() {
+                    if regs.get(&rikey) != Some(&epoch) {
+                        self.handler.on_peer_disconnected(rikey);
+                        peer.disconnect_now(0);
+                        disconnected += 1;
+                    }
+                }
             }
-            if !stale.is_empty() {
-                tracing::info!("control channel: disconnected {} stale peer(s) for session takeover", stale.len());
+            if disconnected > 0 {
+                tracing::info!("control channel: disconnected {disconnected} stale peer(s) for session takeover");
             }
 
             // Give up on any peer that's been connected too long without
-            // ever sending a message we could match (see
-            // `PENDING_MATCH_TIMEOUT`'s doc comment).
-            pending.retain(|&peer_id, &mut connected_at| {
-                if connected_at.elapsed() > PENDING_MATCH_TIMEOUT {
-                    tracing::warn!("control channel: peer {peer_id:?} never matched a session within {PENDING_MATCH_TIMEOUT:?}, disconnecting");
-                    host.disconnect_now(peer_id, 0);
-                    false
-                } else {
-                    true
+            // ever matching a registered rikey — same reasoning as
+            // `serve`'s own `PENDING_MATCH_TIMEOUT` sweep.
+            for peer in host.peers() {
+                if let Some(PeerRikeyState::Pending { connected_at }) = peer.data().copied() {
+                    if connected_at.elapsed() > PENDING_MATCH_TIMEOUT {
+                        tracing::warn!("control channel: a peer never matched a session within {PENDING_MATCH_TIMEOUT:?}, disconnecting");
+                        peer.disconnect_now(0);
+                    }
                 }
-            });
+            }
 
-            match host.service(Duration::from_millis(100)).await {
-                Ok(Some(Event::Connect { peer_id, .. })) => {
-                    tracing::info!("control channel: peer {peer_id:?} connected");
-                    pending.insert(peer_id, Instant::now());
+            match host.service(100) {
+                Ok(Some(Event::Connect(ref mut peer))) => {
+                    tracing::info!("control channel: peer connected");
+                    peer.set_data(Some(PeerRikeyState::Pending { connected_at: Instant::now() }));
                 }
-                Ok(Some(Event::Disconnect { peer_id, .. })) => {
-                    tracing::info!("control channel: peer {peer_id:?} disconnected");
-                    if let Some((rikey, _)) = peer_rikey.remove(&peer_id) {
+                Ok(Some(Event::Disconnect(ref peer, _))) => {
+                    tracing::info!("control channel: peer disconnected");
+                    if let Some(PeerRikeyState::Matched { rikey, .. }) = peer.data().copied() {
                         self.handler.on_peer_disconnected(rikey);
                     }
-                    pending.remove(&peer_id);
                 }
-                Ok(Some(Event::Receive { peer_id, packet, .. })) => {
-                    if let Some(&(rikey, _)) = peer_rikey.get(&peer_id) {
-                        self.handle_message(rikey, packet.data());
-                    } else if is_encrypted_message(packet.data()) {
+                Ok(Some(Event::Receive { ref mut sender, ref packet, .. })) => match sender.data().copied() {
+                    Some(PeerRikeyState::Matched { rikey, .. }) => {
+                        self.handle_message(rikey, packet.data(), &mut last_handled_at, &in_flight_since);
+                    }
+                    _ if is_encrypted_message(packet.data()) => {
                         match regs.iter().find(|(rikey, _)| ControlMessage::parse(packet.data(), rikey).is_ok()) {
                             Some((&rikey, &epoch)) => {
-                                tracing::info!("control channel: peer {peer_id:?} matched");
-                                peer_rikey.insert(peer_id, (rikey, epoch));
-                                pending.remove(&peer_id);
+                                tracing::info!("control channel: peer matched");
+                                sender.set_data(Some(PeerRikeyState::Matched { rikey, epoch }));
                                 self.handler.on_peer_connected(rikey);
-                                self.handle_message(rikey, packet.data());
+                                self.handle_message(rikey, packet.data(), &mut last_handled_at, &in_flight_since);
                             }
-                            None => tracing::debug!("control channel: peer {peer_id:?} sent an encrypted message that didn't authenticate against any registered session"),
+                            None => tracing::debug!("control channel: peer sent an encrypted message that didn't authenticate against any registered session"),
                         }
-                    } else {
-                        // Unencrypted messages (base-protocol keepalives
-                        // etc.) don't even read the key they're "decrypted"
-                        // with — see `is_encrypted_message`'s doc comment —
-                        // so there's nothing here to match on. Wait for a
-                        // later, actually-encrypted message instead.
-                        tracing::trace!("control channel: ignoring unencrypted message from unmatched peer {peer_id:?}");
                     }
-                }
+                    _ => {
+                        // Unencrypted messages can't be used to match (see
+                        // `is_encrypted_message`'s doc comment) -- wait for
+                        // a later, actually-encrypted one instead.
+                        tracing::trace!("control channel: ignoring unencrypted message from unmatched peer");
+                    }
+                },
                 Ok(None) => {}
-                Err(e) => tracing::warn!("control channel enet error: {e}"),
+                Err(e) => tracing::warn!("control channel error: {e}"),
             }
         }
     }
 
-    fn handle_message(&self, rikey: [u8; 16], buffer: &[u8]) {
+    /// Every call site is inline in `serve`'s own loop, *before* the next
+    /// `host.service()` call — which is what drives ENet's own internal
+    /// ack/retransmit/keepalive processing for every peer on this host, not
+    /// just `rikey`'s. Anything slow in here (most plausibly a contended
+    /// lock inside a `ControlEventHandler` callback — `SessionManager::
+    /// shared` is a plain `std::sync::Mutex`, genuinely blocking, taken by
+    /// 25+ places across session.rs) delays that, not just this one
+    /// message's own handling. ENet's reliable channels (touch input
+    /// included — see `touch_down`'s own doc comment) have a bounded
+    /// unacknowledged-packet window; if acks stop flowing promptly, a
+    /// client's own ENet stack will hold back sending further reliable
+    /// data until earlier packets are acknowledged — which would look
+    /// exactly like "input just stops arriving" with nothing wrong on the
+    /// wire at all. Logged here (rather than guessed at) so a real
+    /// occurrence shows up directly instead of being inferred after the
+    /// fact.
+    ///
+    /// `last_handled_at` (read at the very start, updated at the very end)
+    /// is the other half of the picture: the gap since the *previous* call
+    /// returned. That gap can't be blamed on this call's own work — it
+    /// hasn't started yet — it's however long the loop spent elsewhere:
+    /// genuinely idle inside `host.service()` (normal, most of the time,
+    /// up to its own 100ms timeout), or however long the *previous*
+    /// `handle_message` call actually took if `host.service()` itself
+    /// returned promptly. Together with the >20ms warning below, these
+    /// two numbers account for the entire time between one message being
+    /// handled and the next.
+    ///
+    /// `in_flight_since` marks this call as in-progress for the watchdog
+    /// task (see `serve`'s own comment) to see *while* it's still running,
+    /// not just after — guarded by `InFlightGuard` so it's always cleared
+    /// on the way out, panic included, rather than leaving the watchdog
+    /// reporting a false stuck-forever after whatever panicked has already
+    /// unwound past this call.
+    fn handle_message(&self, rikey: [u8; 16], buffer: &[u8], last_handled_at: &mut Instant, in_flight_since: &Mutex<Option<Instant>>) {
+        let start = Instant::now();
+        *in_flight_since.lock().unwrap() = Some(start);
+        let _guard = InFlightGuard(in_flight_since);
+        let gap = start.duration_since(*last_handled_at);
+        tracing::debug!("control channel: handle_message starting for rikey {rikey:02x?}, {gap:?} since the last one returned");
         match ControlMessage::parse(buffer, &rikey) {
             Ok(ControlMessage::InputData(payload)) => match decode_input_event(&payload) {
                 Some(event) => {
@@ -316,6 +444,15 @@ impl ControlServer {
             Ok(ControlMessage::Other) => {} // Ping/FrameStats/etc — ignored in v1.
             Err(e) => tracing::debug!("bad control message: {e}"),
         }
+        let elapsed = start.elapsed();
+        if elapsed > Duration::from_millis(20) {
+            tracing::warn!(
+                "control channel: handle_message for peer with rikey {rikey:02x?} took {elapsed:?} — \
+                 this blocked host.service() (and every peer's ENet ack/retransmit processing) from \
+                 running again until it returned"
+            );
+        }
+        *last_handled_at = Instant::now();
     }
 }
 
@@ -424,7 +561,46 @@ fn decrypt_wrapper(payload: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
     iv[10] = b'C';
     iv[11] = b'C';
 
-    crypto::gcm_decrypt(ciphertext, key, &iv, &tag)
+    let result = crypto::gcm_decrypt(ciphertext, key, &iv, &tag);
+    // Checked (and the tracker updated) only once decryption actually
+    // succeeds -- this function is also called speculatively, against
+    // every registered session's key in turn, while matching a not-yet-
+    // identified peer (see `serve`'s `Event::Receive` handling) — a wrong
+    // key's decrypt failing is routine and must not pollute a *different*,
+    // real session's gap tracking with a sequence number that was never
+    // actually meant for it.
+    if result.is_ok() {
+        note_sequence_number(key, sequence_number);
+    }
+    result
+}
+
+/// This client's `sequence_number` is a single counter incremented for
+/// *every* encrypted message it sends (see this module's own doc comment),
+/// across every channel/message type — not touch-specific. A gap here means
+/// *something* this client sent never reached (or never got decrypted by)
+/// this function; during a window where the client is doing nothing but a
+/// sustained touch gesture, that's overwhelmingly likely to be a touch
+/// packet specifically, but it's not a guarantee — an expected, harmless
+/// drop of an intentionally-unreliable message on a *different* channel
+/// (`LossStats`, e.g.) would also show up here. Added to directly answer
+/// "are touch Move packets actually being lost" with real data instead of
+/// inference from the protocol's own reliability flags alone.
+fn note_sequence_number(rikey: &[u8; 16], sequence_number: u32) {
+    static LAST_SEEN: OnceLock<Mutex<HashMap<[u8; 16], u32>>> = OnceLock::new();
+    let mut last_seen = LAST_SEEN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    if let Some(&previous) = last_seen.get(rikey) {
+        let expected = previous.wrapping_add(1);
+        if sequence_number != expected {
+            let missing = sequence_number.wrapping_sub(expected);
+            tracing::warn!(
+                "control channel: sequence gap for rikey {rikey:02x?} — expected {expected}, got \
+                 {sequence_number} ({missing} message(s) between them apparently never decrypted \
+                 here, whether lost in transit or otherwise)"
+            );
+        }
+    }
+    last_seen.insert(*rikey, sequence_number);
 }
 
 /// `InputData` payloads are `[u32 LE input_event_type][type-specific bytes]`.
