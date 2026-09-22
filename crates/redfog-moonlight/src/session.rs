@@ -281,10 +281,13 @@ struct RunningSession {
     compositor: Option<SpawnedCompositor>,
     input_forwarder: Box<dyn InputSink>,
     /// This session's virtual gamepad, when `config.input_backend ==
-    /// InputBackend::Inputtino` — `None` otherwise (including for
-    /// `SessionType::Login`, which never gets one, and any session using the
-    /// default `InputBackend::FakeInput`, which has no gamepad support at
-    /// all). Deliberately not part of `input_forwarder`/`InputSink` — see
+    /// InputBackend::Inputtino` (the default) and gamepad creation actually
+    /// succeeded — `None` otherwise (including for `SessionType::Login`,
+    /// which never gets one; any session using `InputBackend::FakeInput`,
+    /// which has no gamepad support at all; and an `Inputtino` session where
+    /// device creation failed and gracefully degraded — see
+    /// `spawn_user_compositor_via_broker`'s `Inputtino` arm). Deliberately
+    /// not part of `input_forwarder`/`InputSink` — see
     /// `redfog_core::InputtinoGamepad`'s own doc comment for why gamepad
     /// input never goes through the compositor.
     gamepad: Option<InputtinoGamepad>,
@@ -3365,8 +3368,9 @@ fn touch_up(active_touch_ids: &mut HashSet<u32>, fwd: &mut dyn InputSink, pointe
 }
 
 /// Applies one controller-state snapshot to this session's virtual gamepad,
-/// if it has one (`gamepad` is `None` for `InputBackend::FakeInput`, the
-/// default — see `InputtinoGamepad`'s own doc comment). `controller_number`
+/// if it has one (`gamepad` is `None` for `InputBackend::FakeInput`, or for
+/// an `Inputtino` session where device creation failed and gracefully
+/// degraded — see `InputtinoGamepad`'s own doc comment). `controller_number`
 /// beyond 0 is silently ignored: redfog only ever drives one virtual
 /// gamepad per session today, same as `decode_input_event`'s own comment on
 /// why `active_gamepad_mask` goes unused. No bookkeeping state needed here
@@ -3816,10 +3820,10 @@ mod touch_tests {
 mod gamepad_tests {
     use super::gamepad_state;
 
-    /// `None` (the default -- `InputBackend::FakeInput`, no gamepad) must be
-    /// a safe, silent no-op for every controller number -- this is the path
-    /// almost every real session actually takes, so it needs no real
-    /// `/dev/uinput` access to be worth testing thoroughly.
+    /// `None` (`InputBackend::FakeInput`, or an `Inputtino` session that
+    /// gracefully degraded because device creation failed) must be a safe,
+    /// silent no-op for every controller number -- this path still needs no
+    /// real `/dev/uinput` access to be worth testing thoroughly.
     #[test]
     fn none_gamepad_is_a_silent_no_op_for_any_controller_number() {
         for controller_number in [0, 1, 3, 255] {

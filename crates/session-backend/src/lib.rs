@@ -74,14 +74,23 @@ impl std::str::FromStr for Backend {
 /// `Backend::Kwin` path today (see `spawn_user_compositor_via_broker`'s
 /// `Inputtino` arm) — the direct/standalone dev-spawn path
 /// (`spawn_user_compositor_direct`) doesn't support gamepad at all yet.
+///
+/// `Inputtino` is the default: gamepad creation failing for any reason
+/// (uinput module not loaded yet, a permission not yet applied, no
+/// `/dev/uinput` at all) degrades that one session to no gamepad rather
+/// than failing the session outright — see the `Inputtino` arm of
+/// `spawn_user_compositor_via_broker`. `FakeInput` (no gamepad support
+/// at all) stays available as an explicit opt-out
+/// (`REDFOG_INPUT_BACKEND=fake-input`) for anyone who'd rather not touch
+/// `/dev/uinput`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputBackend {
-    /// No virtual gamepad for this session.
-    #[default]
-    FakeInput,
     /// A virtual Xbox One gamepad via `redfog_core::InputtinoGamepad` (real
     /// kernel `uinput` device).
+    #[default]
     Inputtino,
+    /// No virtual gamepad for this session.
+    FakeInput,
 }
 
 impl InputBackend {
@@ -673,15 +682,37 @@ pub async fn spawn_user_compositor_via_broker(
                     // not just distinct.
                     let label = format!("{username}-{session_id}");
                     let session_id_for_error = session_id.clone();
-                    let (gamepad, nodes) = tokio::task::spawn_blocking(move || {
+                    let result = tokio::task::spawn_blocking(move || {
                         let gamepad = redfog_core::InputtinoGamepad::new(&label)
                             .map_err(|e| format!("failed to create inputtino gamepad for session {session_id_for_error}: {e}"))?;
                         let nodes = gamepad.node_paths().map_err(|e| format!("failed to get gamepad device nodes: {e}"))?;
                         Ok::<_, String>((gamepad, nodes))
                     })
                     .await
-                    .map_err(|e| format!("gamepad creation task panicked: {e}"))??;
-                    (Some(gamepad), nodes)
+                    .map_err(|e| format!("gamepad creation task panicked: {e}"));
+                    // Degrade to no gamepad rather than fail the whole
+                    // session over this: `Inputtino` is the default (see
+                    // `InputBackend`'s own doc comment), and a session that
+                    // can't stream at all because a virtual controller
+                    // couldn't be created (uinput module not yet loaded on
+                    // a freshly-installed system before its first reboot,
+                    // a permission not yet applied, /dev/uinput missing
+                    // entirely on a kernel built without it, ...) would be
+                    // a far worse outcome than just not having a gamepad —
+                    // exactly the degradation `FakeInput` already provides
+                    // on its own. Still surfaces loudly (`warn`, not
+                    // `debug`) so a real, fixable setup problem doesn't go
+                    // unnoticed.
+                    match result.and_then(std::convert::identity) {
+                        Ok((gamepad, nodes)) => (Some(gamepad), nodes),
+                        Err(e) => {
+                            tracing::warn!(
+                                "session {session_id}: gamepad unavailable, continuing without one ({e}) — set \
+                                 REDFOG_INPUT_BACKEND=fake-input to silence this if you don't want gamepad support at all"
+                            );
+                            (None, Vec::new())
+                        }
+                    }
                 }
             };
 

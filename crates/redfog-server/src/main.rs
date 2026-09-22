@@ -145,9 +145,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Whether this session gets a virtual gamepad, independent of `backend`
     // above. Keyboard/mouse/touch always go through `Backend`'s own
     // fake_input/CustomUpstream mechanism regardless of this setting — see
-    // `InputBackend`'s own doc comment. Defaults to no gamepad at all
-    // (`fake-input`); `inputtino` is opt-in, and only actually takes effect
-    // for `Backend::Kwin`.
+    // `InputBackend`'s own doc comment. Defaults to `inputtino` (gamepad
+    // support, degrading gracefully to none if device creation fails);
+    // `fake-input` is an explicit opt-out, and `inputtino` only actually
+    // takes effect for `Backend::Kwin`.
     let input_backend = match std::env::var("REDFOG_INPUT_BACKEND") {
         Ok(s) => s.parse::<redfog_moonlight::session::InputBackend>()?,
         Err(_) => redfog_moonlight::session::InputBackend::default(),
