@@ -238,9 +238,66 @@ against a real client).
          portion of the gamepad-only rescope (re-add `InputtinoInputSink`'s
          keyboard/mouse/touch methods, wire back into `on_input`), keeping
          gamepad's current direct-evdev handling untouched either way.
-- [ ] HDR. `<IsHdrSupported>0</IsHdrSupported>` is hardcoded. Video itself
-      now does H.264, HEVC, and AV1 (see "recently fixed" below) — none of
-      it HDR/Main10, just SDR 8-bit.
+- [ ] HDR / 10-bit. `<IsHdrSupported>0</IsHdrSupported>` is hardcoded. Video
+      itself now does H.264, HEVC, and AV1 (see "recently fixed" below) —
+      none of it HDR/Main10, just SDR 8-bit. Investigated 2026-09-22:
+      blocked upstream in KWin before redfog even gets a chance — KWin
+      6.7.5's `OutputScreenCastSource::drmFormat()`
+      (`src/plugins/screencast/outputscreencastsource.cpp`) unconditionally
+      returns `DRM_FORMAT_ARGB8888`, and `ScreenCastStream`'s
+      `supportedFormats[]` table (`screencaststream.cpp`) has no 10-bit
+      DRM↔SPA mapping at all — so the PipeWire screencast redfog captures
+      from cannot produce a 10-bit surface today, full stop, regardless of
+      what redfog does on its own side. A real fix is in active
+      development upstream — KWin MR !8293 "plugins/screencast: add
+      support for HDR screencasts"
+      (https://invent.kde.org/plasma/kwin/-/merge_requests/8293, opened
+      2025-10-22, still open, last updated 2026-09-04) replaces
+      `drmFormat()` entirely with a `needsAlpha()` + `filterAndSort()`
+      scheme that picks the best available DRM format dynamically
+      (including 10-bit `..2101010` variants and an `ABGR16161616F`
+      float format), adds a `setColorDescription()` path threading BT.2020/
+      ST2084 color info through the render pipeline, and gates PQ/HDR
+      support on PipeWire >= 1.5.81. Track that MR rather than attempting
+      this from redfog's side; vendoring/patching KWin ourselves just for
+      this would be a much bigger commitment than redfog's existing
+      small-lib vendoring. (A separate, simpler attempt at the same goal,
+      MR !9843, was opened and closed without merging in September 2026 —
+      !8293 is the one actually being iterated on.) Once KWin can hand
+      over a 10-bit capture surface, redfog's own remaining pieces are
+      comparatively small: `nvenc_session.rs`'s `NV_ENC_BUFFER_FORMAT_ARGB`
+      (hardcoded 8-bit today) would need a 10-bit buffer format + the
+      HEVC/AV1 Main10 profile GUID, `pipewire_capture.rs`'s `FORMAT_MAP`
+      would need the matching 10-bit DRM formats, and `rtsp.rs`'s
+      `codec_mode_support` bitmask would need `SCM_HEVC_MAIN10`/
+      `SCM_AV1_MAIN10` OR'd in alongside flipping `IsHdrSupported`.
+
+      Same root cause blocks a related, separate win: capturing NV12
+      instead of ARGB8888 for the existing SDR path. NVENC accepts RGB
+      directly and converts internally, but ARGB is 32bpp vs NV12's
+      12bpp — feeding NV12 would cut data volume by 62.5% through every
+      step upstream of the encoder (PipeWire, DMA-BUF, CUDA import), a
+      real win at high res/fps independent of HDR. `DRM_FORMAT_NV12` is
+      currently the 9th entry in `screencaststream.cpp`'s
+      `supportedFormats[]` table (master, pre-!8293), but it's dead code
+      for our capture path: `ScreenCastStream::buildFormats()` only ever
+      offers the DMA-BUF format matching `m_drmFormat` (plus an SHM
+      ARGB8888 fallback) — it doesn't iterate the whole table — and
+      `OutputScreenCastSource::drmFormat()` (the class behind whole-
+      desktop capture, which is what we use) is unconditionally
+      `DRM_FORMAT_ARGB8888`. Note MR !8293's diff actually *removes* the
+      NV12 mapping entirely rather than making it reachable — its
+      `filterAndSort()` replacement doesn't restore it either, so even
+      once that MR lands, NV12 capture would still need its own
+      follow-up, not just ride along with the HDR work. More
+      fundamentally, KWin composites the desktop in RGB (OpenGL/Vulkan
+      framebuffers — windows, chrome, effects, cursor all blend in RGB),
+      so genuine NV12 output would need KWin to run an RGB→YUV420 pass
+      before handoff — plausible (same shape as !8293's RGB→10-bit-RGB
+      conversion), but nobody upstream is doing it. Not config-flippable
+      from redfog's side either; would need its own upstream patch,
+      separate from the HDR one despite sharing the same
+      `OutputScreenCastSource::drmFormat()` starting point.
 - [ ] HiDPI passthrough. KWin's virtual output is spawned with
       `--scale 1` hardcoded; never scales.
 - [ ] Live resolution/fps *re*negotiation (i.e. changing it mid-session,
