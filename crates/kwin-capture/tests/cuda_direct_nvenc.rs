@@ -39,6 +39,7 @@ async fn run_cuda_direct_nvenc_test(codec: VideoCodec) {
         &["glxgears".to_string()],
         WIDTH,
         HEIGHT,
+        1.0,
         FPS,
     )
     .unwrap();

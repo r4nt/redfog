@@ -252,6 +252,18 @@ struct RunningSession {
     kind: SessionType,
     width: u32,
     height: u32,
+    /// This client's configured HiDPI scale factor (see `LaunchHandler::
+    /// launch`'s doc comment) — carried across a Login->User handoff the
+    /// same way `width`/`height`/`fps` are, even though the Login stage's
+    /// own headless renderer never reads it (it's not a real KWin output
+    /// at all): `handoff_to_user` reads it back from here for the User
+    /// stage's own compositor spawn, exactly the same way it does for
+    /// those three fields. Unlike `target_bitrate_kbps`/`codec` on
+    /// `SessionOrigin`, this is fixed at compositor-spawn time and can't
+    /// be changed live on a resumed/taken-over session without respawning
+    /// it (same limitation as `width`/`height`/`fps` not changing on
+    /// resume either — see the "Live resolution/fps renegotiation" TODO).
+    scale: f64,
     /// The client's requested fps from `/launch`'s `mode=WxHxFPS` — carried
     /// across a Login->User handoff the same way `width`/`height` are (see
     /// `handoff_to_user`), so the same cap applies to both stages of one
@@ -1021,6 +1033,7 @@ impl SessionManager {
         width: u32,
         height: u32,
         fps: u32,
+        scale: f64,
         reported: &Option<PendingLoginResult>,
     ) -> Result<(SpawnedCompositor, String, Option<String>, Option<InputtinoGamepad>), String> {
         let username = reported.as_ref().map(|r| r.username.clone()).unwrap_or_else(|| "user".to_string());
@@ -1042,7 +1055,7 @@ impl SessionManager {
             // Direct/no-broker spawn never supports inputtino (no broker to
             // scope its devices into a per-session sandbox at all) — always
             // `None`, regardless of `self.config.input_backend`.
-            return session_backend::spawn_user_compositor_direct(backend, &username, &user_app, width, height, fps).map(|c| (c, username, None, None));
+            return session_backend::spawn_user_compositor_direct(backend, &username, &user_app, width, height, scale, fps).map(|c| (c, username, None, None));
         };
 
         // The one `session_id` used for this whole User-stage spawn attempt
@@ -1067,6 +1080,7 @@ impl SessionManager {
             &user_app,
             width,
             height,
+            scale,
             fps,
         )
         .await;
@@ -1680,6 +1694,7 @@ impl SessionManager {
         width: u32,
         height: u32,
         fps: u32,
+        scale: f64,
         compositor: SpawnedCompositor,
         broker_session_id: Option<String>,
         generation: u64,
@@ -1729,6 +1744,7 @@ impl SessionManager {
             kind,
             width,
             height,
+            scale,
             fps,
             codec,
             compositor: Some(compositor),
@@ -2378,7 +2394,7 @@ impl SessionManager {
                 }
             }
         };
-        let (width, height, fps) = (old_login.width, old_login.height, old_login.fps);
+        let (width, height, fps, scale) = (old_login.width, old_login.height, old_login.fps, old_login.scale);
         // Carried forward wholesale — see `SessionOrigin`'s doc comment:
         // this is the same wire-level RTSP session (crypto key, RTP
         // continuity, adaptive bitrate) regardless of whether the User
@@ -2500,7 +2516,7 @@ impl SessionManager {
             None => {
                 tracing::info!("handoff_to_user: no backgrounded session for {username}, spawning a fresh user compositor");
                 let spawn_start = std::time::Instant::now();
-                let (compositor, resolved_username, broker_session_id, gamepad) = self.spawn_user_compositor(width, height, fps, &reported).await?;
+                let (compositor, resolved_username, broker_session_id, gamepad) = self.spawn_user_compositor(width, height, fps, scale, &reported).await?;
                 tracing::info!("handoff_to_user: spawn_user_compositor for {resolved_username} finished after {:?}", spawn_start.elapsed());
                 // Spawned *after* the compositor now, not before — this
                 // used to be reversed (a deliberate hardening — nothing the
@@ -2597,7 +2613,7 @@ impl SessionManager {
                 let session = match tokio::time::timeout(
                     Duration::from_secs(30),
                     tokio::task::spawn_blocking(move || {
-                        this.spawn_session(kind, width, height, fps, compositor, broker_session_id, generation, origin, selected, audio_loopback, gamepad)
+                        this.spawn_session(kind, width, height, fps, scale, compositor, broker_session_id, generation, origin, selected, audio_loopback, gamepad)
                     }),
                 )
                 .await
@@ -2626,7 +2642,7 @@ impl SessionManager {
 }
 
 impl LaunchHandler for SessionManager {
-    fn launch(&self, width: u32, height: u32, fps: u32, rikey: RemoteInputKey, client_key: ClientKey, client_ip: IpAddr) -> Result<(), String> {
+    fn launch(&self, width: u32, height: u32, fps: u32, scale: f64, rikey: RemoteInputKey, client_key: ClientKey, client_ip: IpAddr) -> Result<(), String> {
         let taken;
         {
             let mut shared = self.shared.lock().unwrap();
@@ -2709,7 +2725,7 @@ impl LaunchHandler for SessionManager {
             // No `AudioLoopback` at all for Login — see
             // `make_silent_audio_pipeline`'s doc comment for why.
             let compositor = self.spawn_login_compositor(width, height, generation)?;
-            self.spawn_session(SessionType::Login, width, height, fps, compositor, None, generation, origin, None, None, None)
+            self.spawn_session(SessionType::Login, width, height, fps, scale, compositor, None, generation, origin, None, None, None)
         }));
         let session = match spawn_result {
             Ok(Ok(session)) => session,

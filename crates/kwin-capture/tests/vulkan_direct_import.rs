@@ -334,6 +334,7 @@ async fn vulkan_direct_import_glxgears_test() {
         &["glxgears".to_string()],
         1280,
         720,
+        1.0,
         60,
     )
     .unwrap();

@@ -35,6 +35,12 @@ pub enum BrokerRequest {
         password: String,
         width: u32,
         height: u32,
+        /// This client's configured HiDPI scale factor (`kwin_wayland
+        /// --scale`) — see `LaunchHandler::launch`'s doc comment in
+        /// `redfog-moonlight` for where this comes from (a per-paired-
+        /// device server-side setting, since the wire protocol itself
+        /// carries no live signal for it).
+        scale: f64,
         socket_name: String,
         payload: Vec<String>,
         /// `/dev/input/eventN` path(s) of the virtual gamepad the caller

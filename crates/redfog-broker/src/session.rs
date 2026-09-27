@@ -291,6 +291,7 @@ impl SessionManager {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         &self,
         session_id: &str,
@@ -298,12 +299,13 @@ impl SessionManager {
         password: &str,
         width: u32,
         height: u32,
+        scale: f64,
         socket_name: &str,
         payload: &[String],
         input_device_nodes: &[String],
     ) -> Result<SpawnResult, String> {
         if std::env::var_os("REDFOG_BROKER_FAKE_SPAWN").is_some() {
-            return self.spawn_fake(session_id, width, height, socket_name, payload).await;
+            return self.spawn_fake(session_id, width, height, scale, socket_name, payload).await;
         }
 
         // For integration testing: spawn as whatever user is actually
@@ -319,7 +321,7 @@ impl SessionManager {
             }
             Err(_) => username.to_string(),
         };
-        self.spawn_via_pam(session_id, &username, password, width, height, socket_name, payload, input_device_nodes).await
+        self.spawn_via_pam(session_id, &username, password, width, height, scale, socket_name, payload, input_device_nodes).await
     }
 
     /// Bypasses systemd entirely: spawns `kwin_wayland` directly as the
@@ -331,7 +333,7 @@ impl SessionManager {
     /// needs `sudo`. Never set this in production; it defeats both
     /// cross-user spawning and the Wayland-socket permission isolation the
     /// systemd path provides.
-    async fn spawn_fake(&self, session_id: &str, width: u32, height: u32, socket_name: &str, payload: &[String]) -> Result<SpawnResult, String> {
+    async fn spawn_fake(&self, session_id: &str, width: u32, height: u32, scale: f64, socket_name: &str, payload: &[String]) -> Result<SpawnResult, String> {
         tracing::warn!("REDFOG_BROKER_FAKE_SPAWN set — spawning kwin_wayland directly, no systemd/cross-user involved");
 
         let runtime_dir = format!("{}/session-{session_id}", default_runtime_dir());
@@ -365,7 +367,7 @@ impl SessionManager {
             .arg("--height")
             .arg(height.to_string())
             .arg("--scale")
-            .arg("1")
+            .arg(scale.to_string())
             .arg("--no-lockscreen")
             .arg("--socket")
             .arg(socket_name)
@@ -490,6 +492,7 @@ impl SessionManager {
         password: &str,
         width: u32,
         height: u32,
+        scale: f64,
         socket_name: &str,
         payload: &[String],
         input_device_nodes: &[String],
@@ -693,7 +696,7 @@ impl SessionManager {
         // own instance, from the very first PipeWire connection either one
         // makes. Runs as `username` (post-privilege-drop), not root.
         let mut exec_start = format!(
-            "{} {username} -- {} {runtime_dir} -- dbus-run-session -- {kwin_path} --virtual --width {width} --height {height} --scale 1 \
+            "{} {username} -- {} {runtime_dir} -- dbus-run-session -- {kwin_path} --virtual --width {width} --height {height} --scale {scale} \
              --no-lockscreen --wayland-fd 3 --socket {socket_name} --xwayland",
             session_init_path.display(),
             pipewire_session_path.display(),

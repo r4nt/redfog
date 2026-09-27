@@ -35,6 +35,7 @@ async fn native_capture_produces_encoded_h264() {
         &["glxgears".to_string()],
         1280,
         720,
+        1.0,
         60,
     ).unwrap();
 

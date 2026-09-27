@@ -42,7 +42,7 @@ async fn reconfigure_keeps_video_flowing() {
 
     eprintln!("Spawning KWin running glxgears...");
     let compositor =
-        session_backend::spawn_user_compositor_direct(session_backend::Backend::Kwin, "user", &["glxgears".to_string()], 1280, 720, 60).unwrap();
+        session_backend::spawn_user_compositor_direct(session_backend::Backend::Kwin, "user", &["glxgears".to_string()], 1280, 720, 1.0, 60).unwrap();
     let node_id = match compositor.video_source(None) {
         redfog_core::VideoSource::PipeWireNode(node) => node,
         _ => panic!("expected a PipeWireNode video source"),
@@ -118,7 +118,7 @@ async fn reconfigure_reuses_capture_connection() {
 
     eprintln!("Spawning KWin running glxgears...");
     let compositor =
-        session_backend::spawn_user_compositor_direct(session_backend::Backend::Kwin, "user", &["glxgears".to_string()], 1280, 720, 60).unwrap();
+        session_backend::spawn_user_compositor_direct(session_backend::Backend::Kwin, "user", &["glxgears".to_string()], 1280, 720, 1.0, 60).unwrap();
     let node_id = match compositor.video_source(None) {
         redfog_core::VideoSource::PipeWireNode(node) => node,
         _ => panic!("expected a PipeWireNode video source"),
@@ -190,7 +190,7 @@ async fn hevc_survives_many_frames_and_request_keyframe_produces_a_real_idr() {
 
     eprintln!("Spawning KWin running glxgears...");
     let compositor =
-        session_backend::spawn_user_compositor_direct(session_backend::Backend::Kwin, "user", &["glxgears".to_string()], 1280, 720, 60).unwrap();
+        session_backend::spawn_user_compositor_direct(session_backend::Backend::Kwin, "user", &["glxgears".to_string()], 1280, 720, 1.0, 60).unwrap();
     let node_id = match compositor.video_source(None) {
         redfog_core::VideoSource::PipeWireNode(node) => node,
         _ => panic!("expected a PipeWireNode video source"),
@@ -262,7 +262,7 @@ async fn av1_survives_many_frames_and_request_keyframe_produces_a_real_idr() {
 
     eprintln!("Spawning KWin running glxgears...");
     let compositor =
-        session_backend::spawn_user_compositor_direct(session_backend::Backend::Kwin, "user", &["glxgears".to_string()], 1280, 720, 60).unwrap();
+        session_backend::spawn_user_compositor_direct(session_backend::Backend::Kwin, "user", &["glxgears".to_string()], 1280, 720, 1.0, 60).unwrap();
     let node_id = match compositor.video_source(None) {
         redfog_core::VideoSource::PipeWireNode(node) => node,
         _ => panic!("expected a PipeWireNode video source"),

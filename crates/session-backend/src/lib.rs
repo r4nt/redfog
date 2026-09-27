@@ -601,11 +601,14 @@ pub fn spawn_login_compositor(login_app: &[String], width: u32, height: u32, gen
 }
 
 /// Spawns the User compositor directly (no broker) — standalone use.
-pub fn spawn_user_compositor_direct(backend: Backend, username: &str, user_app: &[String], width: u32, height: u32, fps: u32) -> Result<SpawnedCompositor, String> {
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_user_compositor_direct(backend: Backend, username: &str, user_app: &[String], width: u32, height: u32, scale: f64, fps: u32) -> Result<SpawnedCompositor, String> {
     match backend {
-        Backend::Kwin => CompositorSession::spawn(SessionType::User(username.to_string()), "redfog-user-0", width as i32, height as i32, 1.0, fps, user_app)
+        Backend::Kwin => CompositorSession::spawn(SessionType::User(username.to_string()), "redfog-user-0", width as i32, height as i32, scale, fps, user_app)
             .map(SpawnedCompositor::Kwin)
             .map_err(|e| format!("failed to spawn redfog-user-0: {e}")),
+        // GstWaylandDisplay has no HiDPI/scale concept of its own -- see
+        // `InputBackend`'s doc comment on this backend's own narrower scope.
         Backend::GstWaylandDisplay => spawn_gst_compositor(width, height, fps, "redfog-user-0"),
     }
 }
@@ -632,6 +635,7 @@ pub async fn spawn_user_compositor_via_broker(
     user_app: &[String],
     width: u32,
     height: u32,
+    scale: f64,
     fps: u32,
 ) -> Result<(SpawnedCompositor, Option<redfog_core::InputtinoGamepad>), String> {
     use redfog_broker_protocol::{read_response, write_request, BrokerRequest, BrokerResponse};
@@ -724,6 +728,7 @@ pub async fn spawn_user_compositor_via_broker(
                     password: password.to_string(),
                     width,
                     height,
+                    scale,
                     socket_name: "redfog-user-0".to_string(),
                     payload: user_app.to_vec(),
                     input_device_nodes: input_device_nodes.into_iter().map(|p| p.to_string_lossy().to_string()).collect(),
@@ -744,7 +749,7 @@ pub async fn spawn_user_compositor_via_broker(
                 PathBuf::from(wayland_socket_path),
                 width as i32,
                 height as i32,
-                1.0,
+                scale,
                 fps,
                 &pipewire_socket_path,
             )

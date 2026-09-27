@@ -198,6 +198,7 @@ async fn fresh_kwin_session_with_real_audio_producer() {
             ],
             1280,
             720,
+            1.0,
             60,
         )
         .expect("spawn_user_compositor_direct");

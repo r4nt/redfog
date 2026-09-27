@@ -39,6 +39,7 @@ async fn dmabuf_gl_upload_test() {
         &["glxgears".to_string()],
         1280,
         720,
+        1.0,
         60,
     ).unwrap();
 

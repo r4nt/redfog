@@ -85,16 +85,31 @@ pub enum ClientKey {
 /// raw `client_ip` (even when `client_key` is `Cert(..)`): a fresh session
 /// still needs it to best-effort-resolve which slot an incoming RTSP
 /// connection belongs to later (see `crate::session::resolve_client_key_by_ip`),
-/// since RTSP itself carries no certificate at all.
+/// since RTSP itself carries no certificate at all. `scale`: this device's
+/// configured HiDPI scale factor (see `ClientManager::scale_for_cert_
+/// fingerprint`'s doc comment), already resolved from `client_key` by the
+/// caller — the wire protocol itself carries no such field (there's no
+/// live signal for a client's own display scale/DPI at all), so this is
+/// entirely a per-paired-device server-side setting, not something
+/// negotiated per request.
 pub trait LaunchHandler: Send + Sync {
-    fn launch(&self, width: u32, height: u32, fps: u32, rikey: RemoteInputKey, client_key: ClientKey, client_ip: std::net::IpAddr) -> Result<(), String>;
+    fn launch(&self, width: u32, height: u32, fps: u32, scale: f64, rikey: RemoteInputKey, client_key: ClientKey, client_ip: std::net::IpAddr) -> Result<(), String>;
     fn resume(&self, client_key: ClientKey) -> Result<(), String>;
     fn cancel(&self, client_key: ClientKey) -> Result<(), String>;
 }
 
 pub struct NoopLaunchHandler;
 impl LaunchHandler for NoopLaunchHandler {
-    fn launch(&self, _width: u32, _height: u32, _fps: u32, _rikey: RemoteInputKey, _client_key: ClientKey, _client_ip: std::net::IpAddr) -> Result<(), String> {
+    fn launch(
+        &self,
+        _width: u32,
+        _height: u32,
+        _fps: u32,
+        _scale: f64,
+        _rikey: RemoteInputKey,
+        _client_key: ClientKey,
+        _client_ip: std::net::IpAddr,
+    ) -> Result<(), String> {
         Ok(())
     }
     fn resume(&self, _client_key: ClientKey) -> Result<(), String> {
@@ -261,7 +276,7 @@ impl PairingServer {
             "/serverinfo" => self.server_info(&params, https, client_cert_fingerprint.as_deref(), local_addr.ip()),
             "/applist" => self.app_list(),
             "/appasset" => self.app_asset(),
-            "/pair" => self.pair(&params).await,
+            "/pair" => self.pair(&params, peer.ip()).await,
             "/unpair" => self.unpair(&params),
             "/launch" => self.launch(&params, local_addr.ip(), client_key, peer.ip()).await,
             "/resume" => self.resume(&params, local_addr.ip(), client_key).await,
@@ -269,6 +284,7 @@ impl PairingServer {
             "/pin" => self.pin_page(&params),
             "/submit-pin" => self.submit_pin_query(&params, req.into_body()).await,
             "/pending-pairs" => self.pending_pairs(),
+            "/paired-clients" => self.paired_clients(),
             _ => not_found(),
         }
     }
@@ -379,7 +395,7 @@ impl PairingServer {
             .unwrap()
     }
 
-    async fn pair(&self, params: &HashMap<String, String>) -> Response<Full<Bytes>> {
+    async fn pair(&self, params: &HashMap<String, String>, peer_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
         if let Some(phrase) = params.get("phrase") {
             return match phrase.as_str() {
                 "getservercert" => self.pair_get_server_cert(params).await,
@@ -394,7 +410,7 @@ impl PairingServer {
             return self.pair_server_challenge_response(params, resp);
         }
         if let Some(secret) = params.get("clientpairingsecret") {
-            return self.pair_client_pairing_secret(params, secret);
+            return self.pair_client_pairing_secret(params, secret, peer_ip);
         }
         bad_request("unrecognized /pair request".to_string())
     }
@@ -469,14 +485,14 @@ impl PairingServer {
         }
     }
 
-    fn pair_client_pairing_secret(&self, params: &HashMap<String, String>, secret_hex: &str) -> Response<Full<Bytes>> {
+    fn pair_client_pairing_secret(&self, params: &HashMap<String, String>, secret_hex: &str, peer_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
         let Some(unique_id) = params.get("uniqueid") else {
             return bad_request("missing uniqueid".to_string());
         };
         let Ok(secret) = hex::decode(secret_hex) else {
             return bad_request("invalid clientpairingsecret".to_string());
         };
-        match self.clients.check_client_pairing_secret(unique_id, &secret) {
+        match self.clients.check_client_pairing_secret(unique_id, &secret, peer_ip) {
             Ok(()) => xml_response(paired_xml("")),
             Err(e) => bad_request(e),
         }
@@ -552,10 +568,31 @@ impl PairingServer {
             return bad_request("missing/invalid rikey/rikeyid".to_string());
         };
 
+        // No live signal for this on the wire at all (see `LaunchHandler::
+        // launch`'s own doc comment) — resolved from whichever paired
+        // device this request's `client_key` identifies (set once, via
+        // `redfog-pair --scale`, optionally per-resolution via
+        // `--resolution` — see `ClientManager::scale_for_cert_fingerprint`'s
+        // doc comment), defaulting to `1.0` for an unset or plain-HTTP/
+        // `ClientKey::Ip` connection.
+        let scale = match &client_key {
+            ClientKey::Cert(fingerprint) => {
+                // Piggybacked on the same lookup rather than a separate
+                // pass over `client_key` — every real `/launch` is exactly
+                // the low-frequency "this device is actually about to
+                // stream" moment `PairedEntry::last_seen_ip`'s doc comment
+                // wants (unlike `/serverinfo`, polled far too often to
+                // persist on every hit).
+                self.clients.note_seen(fingerprint, client_ip, width, height);
+                self.clients.scale_for_cert_fingerprint(fingerprint, width, height).unwrap_or(1.0)
+            }
+            ClientKey::Ip(_) => 1.0,
+        };
+
         let handler = self.launch_handler.clone();
         let result = match tokio::time::timeout(
             Duration::from_secs(30),
-            tokio::task::spawn_blocking(move || handler.launch(width, height, fps, rikey, client_key, client_ip)),
+            tokio::task::spawn_blocking(move || handler.launch(width, height, fps, scale, rikey, client_key, client_ip)),
         )
         .await
         {
@@ -644,21 +681,88 @@ impl PairingServer {
             .unwrap()
     }
 
+    /// Relays a PIN (`ClientManager::submit_pin`, always by `uniqueid` — a
+    /// device mid-handshake has no fingerprint on record yet from this
+    /// endpoint's own perspective) and/or a scale factor and/or a name,
+    /// for exactly one of `uniqueid` (a still-pending device,
+    /// `ClientManager::set_scale_for_pending`/`set_name_for_pending`) or
+    /// `fingerprint` (an already-paired one, `ClientManager::
+    /// set_scale_for_paired`/`set_name_for_paired` — see `paired_clients`/
+    /// `redfog-pair --list` for how to find it). `pin` only makes sense
+    /// with `uniqueid`: an already-paired device has nothing left to
+    /// relay a PIN for. At least one of `pin`/`scale`/`name` has to be
+    /// present, or there's nothing to do. `resolution` (`WIDTHxHEIGHT`) is
+    /// optional and only meaningful alongside `scale` — sets a
+    /// per-resolution override instead of the device's plain default (see
+    /// `PairedEntry::scale`'s doc comment).
     async fn submit_pin_query(&self, query_params: &HashMap<String, String>, body: Incoming) -> Response<Full<Bytes>> {
         let mut params = query_params.clone();
         if let Ok(collected) = body.collect().await {
             let form = parse_query(&String::from_utf8_lossy(&collected.to_bytes()));
             params.extend(form);
         }
-        let (Some(unique_id), Some(pin)) = (params.get("uniqueid"), params.get("pin")) else {
-            return bad_request("missing uniqueid/pin".to_string());
+        let unique_id = params.get("uniqueid");
+        let fingerprint = params.get("fingerprint");
+        let (unique_id, fingerprint) = match (unique_id, fingerprint) {
+            (Some(_), Some(_)) => return bad_request("pass only one of uniqueid/fingerprint, not both".to_string()),
+            (None, None) => return bad_request("missing uniqueid (a still-pending device) or fingerprint (an already-paired one)".to_string()),
+            (unique_id, fingerprint) => (unique_id, fingerprint),
         };
-        match self.clients.submit_pin(unique_id, pin) {
-            Ok(()) => Response::builder()
-                .header("Content-Type", "text/plain")
-                .body(Full::new(Bytes::from("ok")))
-                .unwrap(),
-            Err(e) => bad_request(e),
+        let pin = params.get("pin");
+        if pin.is_some() && fingerprint.is_some() {
+            return bad_request("pin only makes sense with uniqueid, not fingerprint -- an already-paired device has no PIN step left".to_string());
+        }
+        let scale_str = params.get("scale");
+        let resolution_str = params.get("resolution");
+        let name_str = params.get("name");
+        if pin.is_none() && scale_str.is_none() && name_str.is_none() {
+            return bad_request("missing pin (or scale/name, to update a device without one)".to_string());
+        }
+        if resolution_str.is_some() && scale_str.is_none() {
+            return bad_request("resolution requires scale".to_string());
+        }
+        if let Some(scale_str) = scale_str {
+            let scale = match parse_scale(scale_str) {
+                Ok(s) => s,
+                Err(e) => return bad_request(e),
+            };
+            let resolution = match resolution_str {
+                Some(r) => match parse_resolution(r) {
+                    Ok(res) => Some(res),
+                    Err(e) => return bad_request(e),
+                },
+                None => None,
+            };
+            let result = match (unique_id, fingerprint) {
+                (Some(uid), None) => self.clients.set_scale_for_pending(uid, scale, resolution),
+                (None, Some(fp)) => self.clients.set_scale_for_paired(fp, scale, resolution),
+                _ => unreachable!("exactly one of unique_id/fingerprint checked above"),
+            };
+            if let Err(e) = result {
+                return bad_request(e);
+            }
+        }
+        if let Some(name_str) = name_str {
+            let name = match parse_name(name_str) {
+                Ok(n) => n,
+                Err(e) => return bad_request(e),
+            };
+            let result = match (unique_id, fingerprint) {
+                (Some(uid), None) => self.clients.set_name_for_pending(uid, name),
+                (None, Some(fp)) => self.clients.set_name_for_paired(fp, name),
+                _ => unreachable!("exactly one of unique_id/fingerprint checked above"),
+            };
+            if let Err(e) = result {
+                return bad_request(e);
+            }
+        }
+        let ok = || Response::builder().header("Content-Type", "text/plain").body(Full::new(Bytes::from("ok"))).unwrap();
+        match (pin, unique_id) {
+            (Some(pin), Some(unique_id)) => match self.clients.submit_pin(unique_id, pin) {
+                Ok(()) => ok(),
+                Err(e) => bad_request(e),
+            },
+            _ => ok(),
         }
     }
 
@@ -673,12 +777,87 @@ impl PairingServer {
             .body(Full::new(Bytes::from(ids)))
             .unwrap()
     }
+
+    /// Not part of the Moonlight protocol — `pending_pairs`' counterpart
+    /// for devices that have actually finished pairing: a JSON array of
+    /// `ClientManager::PairedClientInfo` (see this module's own doc
+    /// comment for why fingerprint, not `uniqueid`, is the identity that's
+    /// actually usable here). JSON rather than the flatter tab-separated
+    /// shape this used at first: once resolution history and
+    /// per-resolution scale overrides joined `name`/`last_seen_ip`, a
+    /// single delimited line per device stopped being a reasonable format.
+    /// What `redfog-pair --list` shows — the answer to "how do I find this
+    /// device again later, and see what's configured/been seen for it."
+    fn paired_clients(&self) -> Response<Full<Bytes>> {
+        let body = serde_json::to_string(&self.clients.paired_clients()).unwrap_or_else(|_| "[]".to_string());
+        Response::builder()
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap()
+    }
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {
     form_urlencoded::parse(query.as_bytes())
         .into_owned()
         .collect()
+}
+
+/// Validates a `--scale`/`scale=` value before it ever reaches
+/// `ClientManager::set_scale` — rejects anything that isn't a plain,
+/// finite, positive number, and clamps the accepted range to what a real
+/// HiDPI setup would ever plausibly use (KWin's own Display settings UI
+/// tops out around 300%; 400% leaves headroom for extreme
+/// low-vision/accessibility setups without accepting outright nonsense
+/// like a negative, zero, NaN, or astronomically large value making it
+/// into a `kwin_wayland --scale` invocation).
+fn parse_scale(s: &str) -> Result<f64, String> {
+    let scale: f64 = s.parse().map_err(|_| format!("invalid scale {s:?} (expected a plain number, e.g. 1.5)"))?;
+    if !scale.is_finite() || scale < 0.25 || scale > 4.0 {
+        return Err(format!("scale {scale} out of range (expected 0.25..=4.0)"));
+    }
+    Ok(scale)
+}
+
+/// Validates a `--resolution`/`resolution=` value (`WIDTHxHEIGHT`, e.g.
+/// `1920x1080`) before it ever reaches `ClientManager::set_scale` — the
+/// same shape `/launch`'s own `mode=WxHxFPS` uses for its width/height
+/// portion (see `PairingServer::parse_mode`), just without the trailing
+/// fps component this doesn't need.
+fn parse_resolution(s: &str) -> Result<(u32, u32), String> {
+    let (width, height) = s
+        .split_once('x')
+        .ok_or_else(|| format!("invalid resolution {s:?} (expected WIDTHxHEIGHT, e.g. 1920x1080)"))?;
+    let (Ok(width), Ok(height)) = (width.parse::<u32>(), height.parse::<u32>()) else {
+        return Err(format!("invalid resolution {s:?} (expected WIDTHxHEIGHT, e.g. 1920x1080)"));
+    };
+    if width == 0 || height == 0 {
+        return Err(format!("invalid resolution {s:?} (width/height must be nonzero)"));
+    }
+    Ok((width, height))
+}
+
+/// Validates a `--name`/`name=` value before it ever reaches
+/// `ClientManager::set_name_for_pending`/`set_name_for_paired` — rejects
+/// empty/whitespace-only names (nothing useful to show in `--list`) and
+/// anything containing a tab or newline, since `/paired-clients`' own
+/// response is a plain tab-separated, newline-delimited list (see
+/// `PairingServer::paired_clients`) that a name containing either would
+/// corrupt. Trims surrounding whitespace rather than rejecting it outright
+/// — a human typing `--name "My TV"` with an accidental trailing space
+/// shouldn't have to retype the whole command.
+fn parse_name(s: &str) -> Result<String, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("name must not be empty".to_string());
+    }
+    if trimmed.contains('\t') || trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err("name must not contain tabs or newlines".to_string());
+    }
+    if trimmed.len() > 100 {
+        return Err("name must be 100 characters or fewer".to_string());
+    }
+    Ok(trimmed.to_string())
 }
 
 fn paired_xml(inner: &str) -> String {
@@ -800,5 +979,58 @@ mod tests {
             body.contains("</App></root>"),
             "found whitespace/text between </App> and </root>, which crashes real clients: {body}"
         );
+    }
+
+    #[test]
+    fn parse_scale_accepts_plain_positive_numbers_in_range() {
+        assert_eq!(parse_scale("1"), Ok(1.0));
+        assert_eq!(parse_scale("1.5"), Ok(1.5));
+        assert_eq!(parse_scale("0.25"), Ok(0.25));
+        assert_eq!(parse_scale("4"), Ok(4.0));
+    }
+
+    #[test]
+    fn parse_scale_rejects_garbage_and_out_of_range_values() {
+        assert!(parse_scale("not-a-number").is_err());
+        assert!(parse_scale("").is_err());
+        assert!(parse_scale("NaN").is_err(), "NaN parses as a float but must still be rejected");
+        assert!(parse_scale("inf").is_err());
+        assert!(parse_scale("0").is_err());
+        assert!(parse_scale("-1").is_err());
+        assert!(parse_scale("0.1").is_err(), "below the 0.25 floor");
+        assert!(parse_scale("5").is_err(), "above the 4.0 ceiling");
+    }
+
+    #[test]
+    fn parse_resolution_accepts_widthxheight() {
+        assert_eq!(parse_resolution("1920x1080"), Ok((1920, 1080)));
+        assert_eq!(parse_resolution("3840x2160"), Ok((3840, 2160)));
+    }
+
+    #[test]
+    fn parse_resolution_rejects_malformed_values() {
+        assert!(parse_resolution("1920").is_err(), "missing height");
+        assert!(parse_resolution("1920x").is_err());
+        assert!(parse_resolution("x1080").is_err());
+        assert!(parse_resolution("1920x1080x60").is_err(), "not width x height x fps");
+        assert!(parse_resolution("0x1080").is_err(), "zero width");
+        assert!(parse_resolution("1920x0").is_err(), "zero height");
+        assert!(parse_resolution("axb").is_err());
+    }
+
+    #[test]
+    fn parse_name_trims_and_accepts_reasonable_values() {
+        assert_eq!(parse_name("My TV"), Ok("My TV".to_string()));
+        assert_eq!(parse_name("  Living Room  "), Ok("Living Room".to_string()), "surrounding whitespace is trimmed, not rejected");
+    }
+
+    #[test]
+    fn parse_name_rejects_empty_and_unsafe_values() {
+        assert!(parse_name("").is_err());
+        assert!(parse_name("   ").is_err(), "whitespace-only");
+        assert!(parse_name("has\ttab").is_err(), "would corrupt /paired-clients' tab-separated format");
+        assert!(parse_name("has\nnewline").is_err(), "would corrupt /paired-clients' line-delimited format");
+        assert!(parse_name(&"x".repeat(101)).is_err(), "over the length cap");
+        assert!(parse_name(&"x".repeat(100)).is_ok(), "exactly at the length cap");
     }
 }
